@@ -240,6 +240,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- Analyze Android platform code with CLI commands and opt-in MCP tools for AIDL/HIDL implementation candidates, JNI bindings, system services, permission and broadcast literals, and Messenger, ContentProvider, and local-socket evidence.
 - **Codex and Astra read project guidance from `AGENTS.md`.** The canonical agent guide now lives in `AGENTS.md` (with a nested `docs/AGENTS.md` for long validation notes); `CLAUDE.md` is a thin `@AGENTS.md` wrapper for Claude Code. Codex/Astra no longer miss the old CLAUDE-only instructions.
 
 - **Next.js pages and their navigation are in the graph.** App Router pages (`app/(group)/blog/[slug]/page.tsx` → `/blog/:slug`) and Pages Router pages are routes bound to the component they export, and `<Link href>`, an internal `<a href>`, `router.push` / `router.replace` (`next/navigation` and `next/router`), `redirect()` / `permanentRedirect()` and the middleware's `NextResponse.redirect(…)` are `navigates` edges between them. `app/api/**/route.ts` exports (`GET`, `POST`, …) are endpoints bound to their functions, and `pages/api/*` handlers are `ANY /api/…`. Re-index after upgrading.
@@ -467,6 +468,13 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A built-in method call such as `list.map()` or `cache.get()` on an untyped value no longer links to a same-named project method, and `this.#field.method()` resolves on the field's type. Thanks @bompus for the report and @danusha2345. (#1987)
 - Python and Go methods passed as values (`executor.submit(self.store.fetch)`) now appear in callers and impact results. Thanks @JosefAschauer. (#1820)
 - Methods called by a base class outside the index (React lifecycle methods, a stream's `_transform`, NestJS hooks) are no longer reported as dead code. Thanks @inth3shadows for the report and @danusha2345. (#1973)
+
+#### Type resolution and Android source extraction
+
+- Inheritance references no longer resolve to unrelated methods with matching names.
+- Qualified nested types and C++ namespace aliases resolve more accurately across source files.
+- The portable parser preserves members and inheritance in Java anonymous classes and Kotlin object expressions for implementation searches.
+- Qualified type lookups no longer match partial identifiers from unrelated scopes.
 
 ## [1.6.0] - 2026-08-26
 
