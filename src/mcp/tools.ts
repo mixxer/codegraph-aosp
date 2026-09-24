@@ -3731,7 +3731,7 @@ export class ToolHandler {
     const result = tracePermission(cg, cg.getProjectRoot(), permission);
 
     const lines: string[] = [`**${this.sanitizeForDisplay(permission)}**`, ''];
-    lines.push(`Definitions (${result.definitions.length}):`, ...result.definitions.map((c) => `- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`));
+    lines.push(`XML matches, including uses (${result.xmlMatches.length}):`, ...result.xmlMatches.map((c) => `- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`));
     lines.push('', `Check points (${result.checkPoints.length}):`, ...result.checkPoints.map((c) => `- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`));
     lines.push('', `Enforcement (${result.enforcement.length}):`, ...result.enforcement.map((c) => `- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`));
     lines.push('', 'Evidence:', ...result.evidence.map((e) => `  - ${this.sanitizeForDisplay(e)}`));

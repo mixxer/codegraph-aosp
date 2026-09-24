@@ -112,8 +112,7 @@ export function candidateReachesPackagedSymbol(
   // the primary unresolved-extends signal (`struct DrmPlugin : public
   // IDrmPlugin`) below the `found` threshold whenever the declaration's
   // package happened to be known, which is the common case for a real
-  // `.hal`/`.aidl` file (Codex/real-hardware/interfaces-mirror finding,
-  // 2026-09-11).
+  // `.hal`/`.aidl` file.
   //
   // The first fix here was too permissive: treating EVERY non-Java/Kotlin
   // candidate as `unverifiable` let a completely unrelated same-named type
@@ -121,7 +120,7 @@ export function candidateReachesPackagedSymbol(
   // `found`, and — reproduced against the real hardware/interfaces mirror —
   // let a real HIDL 2.4 `CameraProvider` implementation satisfy an AIDL
   // `ICameraProvider` query, since both share the bare interface name across
-  // a HIDL-to-AIDL migration (Codex adversarial review, 2026-09-11, HIGH-2).
+  // a HIDL-to-AIDL migration.
   // `declarationFilePath` (the specific `.aidl`/`.hal` file this candidate is
   // being checked against, when the caller has one) lets a HAL candidate
   // additionally correlate by generation family: only when the candidate's

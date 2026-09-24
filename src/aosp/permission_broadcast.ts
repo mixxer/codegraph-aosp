@@ -22,15 +22,14 @@ export interface TextCandidate {
 
 export interface TracePermissionResult {
   permission: string;
-  definitions: TextCandidate[];
+  xmlMatches: TextCandidate[];
   checkPoints: TextCandidate[];
   enforcement: TextCandidate[];
   evidence: string[];
 }
 
 export function tracePermission(cg: CodeGraph, repoRoot: string, permission: string): TracePermissionResult {
-  const definitionHits = grepIndexedSources(cg, repoRoot, ['xml'], new RegExp(escapeRegExp(permission)), permission);
-  const definitions = definitionHits;
+  const xmlMatches = grepIndexedSources(cg, repoRoot, ['xml'], new RegExp(escapeRegExp(permission)), permission);
   // `Self` alone (Context.checkSelfPermission, the standard API 23+
   // runtime-permission check) was missing from this alternation: it matched
   // checkCallingOrSelfPermission/checkCallingPermission/checkComponentPermission
@@ -57,16 +56,16 @@ export function tracePermission(cg: CodeGraph, repoRoot: string, permission: str
   const caveat = indexingCaveat(cg);
   const evidence = [
     ...(caveat ? [caveat] : []),
-    `permission definition search (xml sources, plain text only): "${permission}" (${definitions.length} hit(s)); ` +
+    `permission XML search (plain text only): "${permission}" (${xmlMatches.length} hit(s)); ` +
       `this does not distinguish XML element kinds such as uses-permission, permission, permission-tree, or protected-broadcast`,
     `check-point search (kotlin/java): checkPermission.*${permission} (${checkPoints.length} hit(s))`,
     `enforcement search (kotlin/java): enforcePermission.*${permission} (${enforcement.length} hit(s))`,
-    ...[definitionHits, checkPointHits, enforcementHits]
+    ...[xmlMatches, checkPointHits, enforcementHits]
       .map((hits) => testPathEvidence(hits))
       .filter((note): note is string => note !== null),
   ];
 
-  return { permission, definitions, checkPoints, enforcement, evidence };
+  return { permission, xmlMatches, checkPoints, enforcement, evidence };
 }
 
 export interface TraceBroadcastResult {
