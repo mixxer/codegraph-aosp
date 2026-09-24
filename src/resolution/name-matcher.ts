@@ -5586,8 +5586,7 @@ export function matchByExactName(
  * qualifier at all — it was a C++ receiver *variable* named `a` in a
  * `a.operator+(b)` call, decoy-matching the unrelated `Aaa::operator+`
  * method instead of leaving receiver-type inference (`matchMethodCall`) to
- * find the real `V::operator+` (regression found while adding `.`-to-`::`
- * qualifier normalization below, 2026-09-11). A match only counts when the
+ * find the real `V::operator+`. A match only counts when the
  * suffix is the WHOLE qualifiedName, or the two characters immediately
  * preceding it are a real `::` separator.
  */

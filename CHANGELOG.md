@@ -61,6 +61,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Kotlin calls through a class property, a primary-constructor property, or a variable set from a function call now resolve on the declared type, and a call on a library type (such as `Regex` or a JDK class) no longer links to an unrelated project method with the same name. Chained receivers such as `engine.pump.drain()`, `this.engine.drain()` and `Mode.ON.next()` resolve the same way, as do properties inherited from a project base class and variables of the enclosing function used inside an anonymous `object : …`. Re-index Kotlin projects to pick this up.
 - Kotlin `fun interface` declarations are indexed, and no longer hide the declaration that follows them.
+- Java and Kotlin inheritance now resolves nested types more precisely, and anonymous implementations retain their members after re-indexing.
 - Kotlin calls through a class property, including a primary-constructor property, now resolve on the property's declared type instead of a same-named method on the interface or on an unrelated class. Re-index Kotlin projects to pick this up.
 #### Windows
 
