@@ -1365,7 +1365,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_trace_permission',
-    description: 'AOSP extension. Pure text-candidate search for a permission string: XML line matches (labeled "definitions" for convenience, but this is a plain text/line match, not an XML-parsed element — uses-permission, permission, permission-tree, protected-broadcast, comments, or unrelated attributes containing the string are not distinguished), checkPermission call sites, enforcePermission call sites. Reports only what matched — no found/not-found claim.',
+    description: 'AOSP extension. Pure text-candidate search for a permission string: XML line matches (including uses; not parsed into element kinds), checkPermission call sites, and enforcePermission call sites. Reports only what matched — no found/not-found claim.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1633,6 +1633,8 @@ const DEFAULT_MCP_TOOLS = new Set(['explore']);
 export class ToolHandler {
   // Cache of opened CodeGraph instances for cross-project queries
   private projectCache: Map<string, CodeGraph> = new Map();
+  private static readonly MAX_PROJECT_CACHE_ENTRIES = 20;
+  private activeOperations = 0;
   // The directory the server last searched for a default project. Surfaced in
   // the "not initialized" error so users can see why detection missed.
   private defaultProjectHint: string | null = null;
@@ -1944,12 +1946,25 @@ export class ToolHandler {
     // a changed resolution maps to a different entry instead of a stale hit.
     const cached = this.projectCache.get(resolvedRoot);
     if (cached) {
+      this.projectCache.delete(resolvedRoot);
+      this.projectCache.set(resolvedRoot, cached);
       return this.freshen(cached);
     }
 
     const cg = loadCodeGraph().openSync(resolvedRoot);
     this.projectCache.set(resolvedRoot, cg);
     return cg;
+  }
+
+  /** Close old project connections only after all calls using them finish. */
+  private trimProjectCache(): void {
+    if (this.activeOperations !== 0) return;
+    while (this.projectCache.size > ToolHandler.MAX_PROJECT_CACHE_ENTRIES) {
+      const oldestRoot = this.projectCache.keys().next().value as string;
+      const oldest = this.projectCache.get(oldestRoot)!;
+      this.projectCache.delete(oldestRoot);
+      try { oldest.close(); } catch { /* cache cleanup must not fail a tool call */ }
+    }
   }
 
   /**
@@ -2312,6 +2327,7 @@ export class ToolHandler {
     args: Record<string, unknown>,
     sessionState?: ExploreSessionState,
   ): Promise<ToolResult> {
+    this.activeOperations++;
     try {
       // Block the first tool call on the engine's post-open reconcile so we
       // never serve rows for files deleted/edited while no MCP server was
@@ -2405,6 +2421,9 @@ export class ToolHandler {
         'This is an internal codegraph error — retry the call once; if it persists, ' +
         'continue without codegraph for this task.'
       );
+    } finally {
+      this.activeOperations--;
+      this.trimProjectCache();
     }
   }
 
@@ -2473,6 +2492,7 @@ export class ToolHandler {
    * path validation already ran in {@link execute} before routing here.
    */
   async executeReadTool(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+    this.activeOperations++;
     try {
       return await this.dispatchTool(toolName, args);
     } catch (err) {
@@ -2487,6 +2507,9 @@ export class ToolHandler {
         'This is an internal codegraph error — retry the call once; if it persists, ' +
         'continue without codegraph for this task.'
       );
+    } finally {
+      this.activeOperations--;
+      this.trimProjectCache();
     }
   }
 
@@ -2994,7 +3017,7 @@ export class ToolHandler {
     const result = tracePermission(cg, cg.getProjectRoot(), permission);
 
     const lines: string[] = [`**${this.sanitizeForDisplay(permission)}**`, ''];
-    lines.push(`XML matches, including uses (${result.definitions.length}):`, ...result.definitions.map((c) => `- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`));
+    lines.push(`XML matches, including uses (${result.xmlMatches.length}):`, ...result.xmlMatches.map((c) => `- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`));
     lines.push('', `Check points (${result.checkPoints.length}):`, ...result.checkPoints.map((c) => `- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`));
     lines.push('', `Enforcement (${result.enforcement.length}):`, ...result.enforcement.map((c) => `- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`));
     lines.push('', 'Evidence:', ...result.evidence.map((e) => `  - ${this.sanitizeForDisplay(e)}`));

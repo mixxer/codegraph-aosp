@@ -50,8 +50,8 @@ describe('AOSP extension: tracePermission / traceBroadcast', () => {
     await cg.indexAll();
     const result = tracePermission(cg, dir, 'android.permission.CAMERA');
 
-    expect(result.definitions.length).toBeGreaterThan(0);
-    expect(result.definitions[0]?.filePath).toBe('AndroidManifest.xml');
+    expect(result.xmlMatches.length).toBeGreaterThan(0);
+    expect(result.xmlMatches[0]?.filePath).toBe('AndroidManifest.xml');
     expect(result.checkPoints.length).toBeGreaterThan(0);
     expect(result.enforcement.length).toBeGreaterThan(0);
   });
@@ -82,7 +82,7 @@ describe('AOSP extension: tracePermission / traceBroadcast', () => {
     await cg.indexAll();
     const result = tracePermission(cg, dir, 'android.permission.NEVER_USED');
 
-    expect(result.definitions).toHaveLength(0);
+    expect(result.xmlMatches).toHaveLength(0);
     expect(result.checkPoints).toHaveLength(0);
     expect(result.enforcement).toHaveLength(0);
     expect(result.evidence.length).toBeGreaterThan(0);
@@ -114,7 +114,7 @@ describe('AOSP extension: tracePermission / traceBroadcast', () => {
     await cg.indexAll();
     const result = tracePermission(cg, dir, 'android.permission.REMOVED');
 
-    expect(result.definitions).toHaveLength(0);
+    expect(result.xmlMatches).toHaveLength(0);
   });
 
   it('traceBroadcast finds a sendBroadcast call site', async () => {

@@ -153,8 +153,7 @@ and call paths returned by `codegraph_explore`.
   typealiases, and some fully qualified Stub expressions can be missed. Native
   and portable extraction can differ, so validate the backend used by the target
   installation. Naming searches are capped at 20 results per pattern and report
-  a warning at the limit. For `aidl-impl`, an indexed generated Stub does not
-  replace the required `.aidl` source declaration.
+  a warning at the limit.
 
 - **`hal-interface`**: Declaration discovery is restricted to
   `hardware/interfaces/` and skips symlinked discovery directories. The tool

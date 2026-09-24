@@ -2705,7 +2705,7 @@ program
  */
 program
   .command('trace-permission <permission>')
-  .description('Search for a permission\'s definition, check points, and enforcement (AOSP extension)')
+  .description('Search for permission XML matches, check points, and enforcement (AOSP extension)')
   .option('-p, --path <path>', 'Project path')
   .option('-j, --json', 'Output as JSON')
   .action(async (permission: string, options: { path?: string; json?: boolean }) => {
@@ -2727,8 +2727,8 @@ program
         return;
       }
       console.log(chalk.bold(`\n"${permission}"\n`));
-      console.log(`XML matches, including uses (${result.definitions.length}):`);
-      for (const c of result.definitions) console.log(`  ${chalk.cyan(`${c.filePath}:${c.line}`)}  ${chalk.dim(`(${c.matchedPattern})`)}`);
+      console.log(`XML matches, including uses (${result.xmlMatches.length}):`);
+      for (const c of result.xmlMatches) console.log(`  ${chalk.cyan(`${c.filePath}:${c.line}`)}  ${chalk.dim(`(${c.matchedPattern})`)}`);
       console.log(`Check points (${result.checkPoints.length}):`);
       for (const c of result.checkPoints) console.log(`  ${chalk.cyan(`${c.filePath}:${c.line}`)}  ${chalk.dim(`(${c.matchedPattern})`)}`);
       console.log(`Enforcement (${result.enforcement.length}):`);

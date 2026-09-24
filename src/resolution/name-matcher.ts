@@ -774,14 +774,7 @@ export function matchByExactName(
     // A name the file binds itself (a parameter, a const) shadows every other
     // file's symbol of that name, so a bare call has no cross-file candidate.
     .filter((n) => !(bareJs && n.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context)))
-    // An `extends`/`implements` ref names a supertype, so anything that can't
-    // BE one is not a candidate at all. This is eligibility, not
-    // ranking: kind is only a scoring bonus below (and none is awarded for
-    // inheritance refs), so without this a same-named `enum_member` outranked
-    // the real `trait`, and as the sole candidate was adopted outright by the
-    // single-match shortcut. Restricting the pool BEFORE ranking lets the
-    // legitimate supertype win instead of merely dropping the false edge.
-    // Likewise for `imports`: a member that only exists inside a type is not
+    // For `imports`, a member that only exists inside a type is not
     // importable, so it is not a candidate. Without this a `path`/`id`/`url`
     // import resolved to some interface's same-named property.
     .filter((n) => ref.referenceKind !== 'imports' || isImportableKind(n.kind));
