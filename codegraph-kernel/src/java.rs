@@ -931,8 +931,7 @@ impl<'t> Walker<'t> {
         // stripped, qualifier kept) — AOSP-style qualified-name lookups
         // (hal.ts/aidl.ts's `IFoo` / `IFoo.%` prefix match) depend on it
         // surviving. Only the anon class's own cosmetic name is truncated to
-        // the bare last segment (ts/tree-sitter.ts extractAnonymousClass,
-        // 2026-09-11 Codex-found regression — same fix, ported here).
+        // the bare last segment, matching the portable extractor.
         let full_type_name = {
             let mut n = raw_type_name.clone();
             if let Some(lt) = n.find('<') {

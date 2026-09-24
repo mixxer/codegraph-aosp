@@ -875,7 +875,7 @@ impl<'t> Walker<'t> {
             self.extract_call(node);
         } else if kind == "object_literal" {
             // Kotlin `object : IFoo.Stub() { ... }` — AIDL Stub implementation
-            // idiom (tree-sitter.ts extractKotlinObjectLiteral, 2026-09-11).
+            // idiom, matching the portable extractor.
             self.extract_kotlin_object_literal(node);
             skip_children = true;
         }

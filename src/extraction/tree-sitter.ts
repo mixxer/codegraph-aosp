@@ -5281,7 +5281,7 @@ export class TreeSitterExtractor {
     // the full dotted text surviving. Truncating this to "Stub" made a real
     // AIDL `new ICarPropertyEventListener.Stub() { ... }` field initializer
     // invisible to aidl-impl even after the anon class body itself started
-    // being extracted (Codex/real-AOSP-mirror finding, 2026-09-11).
+    // being extracted.
     // We can't tell at extraction time whether T is a class or an interface,
     // so emit `extends`. Resolution will still bind T to whatever it is, and
     // Phase 5.5 (which already handles both `extends` and `implements`) will
@@ -5306,8 +5306,7 @@ export class TreeSitterExtractor {
 
   /**
    * Extract a Kotlin anonymous object expression — `object : IFoo.Stub() { ... }`
-   * — the dominant AIDL Stub implementation idiom in this codebase's Kotlin
-   * sources. This is NOT the same AST shape as Java/C#'s
+   * — a common AIDL Stub implementation idiom. This has a different AST shape from Java/C#'s
    * `object_creation_expression`, so it cannot reuse `extractAnonymousClass`:
    *
    *   object_literal
@@ -5324,8 +5323,7 @@ export class TreeSitterExtractor {
    * INSTANTIATION_KINDS and had no anonymous-class handling at all, so this
    * idiom produced neither an `instantiates` nor an `extends` reference —
    * the interface→impl synthesizer (Phase 5.5) and aidl.ts's unresolved_refs
-   * lookup never saw these implementations (0% recall in a live audit against
-   * this codebase's real AIDL services, 2026-09-11).
+   * lookup never saw these implementations.
    */
   private extractKotlinObjectLiteral(node: SyntaxNode): void {
     if (!this.extractor) return;

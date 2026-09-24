@@ -734,29 +734,8 @@ function isLocallyBoundJsName(name: string, filePath: string, context: Resolutio
   return bound;
 }
 
-/** Node kinds eligible as targets of an extends/implements reference. */
-const TYPE_LIKE_NODE_KINDS = new Set<Node['kind']>([
-  'module',
-  'class',
-  'struct',
-  'interface',
-  'trait',
-  'protocol',
-  'enum',
-  'type_alias',
-  'union',
-]);
-
-function isInheritanceReference(ref: UnresolvedRef): boolean {
-  return ref.referenceKind === 'extends' || ref.referenceKind === 'implements';
-}
-
-function isTypeLikeNode(node: Node): boolean {
-  return TYPE_LIKE_NODE_KINDS.has(node.kind);
-}
-
 function filterCandidatesForReference(ref: UnresolvedRef, nodes: Node[]): Node[] {
-  return isInheritanceReference(ref) ? nodes.filter(isTypeLikeNode) : nodes;
+  return isInheritanceRef(ref) ? nodes.filter((node) => SUPERTYPE_TARGET_KINDS.has(node.kind)) : nodes;
 }
 
 /**
@@ -802,7 +781,6 @@ export function matchByExactName(
     // the real `trait`, and as the sole candidate was adopted outright by the
     // single-match shortcut. Restricting the pool BEFORE ranking lets the
     // legitimate supertype win instead of merely dropping the false edge.
-    .filter((n) => !isInheritanceRef(ref) || SUPERTYPE_TARGET_KINDS.has(n.kind))
     // Likewise for `imports`: a member that only exists inside a type is not
     // importable, so it is not a candidate. Without this a `path`/`id`/`url`
     // import resolved to some interface's same-named property.
@@ -859,8 +837,7 @@ export function matchByExactName(
  * qualifier at all — it was a C++ receiver *variable* named `a` in a
  * `a.operator+(b)` call, decoy-matching the unrelated `Aaa::operator+`
  * method instead of leaving receiver-type inference (`matchMethodCall`) to
- * find the real `V::operator+` (regression found while adding `.`-to-`::`
- * qualifier normalization below, 2026-09-11). A match only counts when the
+ * find the real `V::operator+`. A match only counts when the
  * suffix is the WHOLE qualifiedName, or the two characters immediately
  * preceding it are a real `::` separator.
  */
@@ -910,8 +887,7 @@ export function matchByQualifiedName(
   // (MyBatis XML statements, for one) deliberately build a MIXED
   // qualifiedName that keeps literal dots from an already-dotted Java
   // package/namespace string and adds `::` only at one specific boundary —
-  // blanket-normalizing every reference's dots to `::` mangled those
-  // (regression found and reverted to this narrower scope, 2026-09-11).
+  // blanket-normalizing every reference's dots to `::` mangled those.
   const normalizedQualifiedRef = isInheritanceRef(ref)
     ? ref.referenceName.replace(/\./g, '::')
     : ref.referenceName;
@@ -3486,7 +3462,7 @@ export function matchFuzzy(
 
   // Calls use callable kinds; inheritance is a type reference and must never
   // fall through to a same-named method/function (HIGH-1).
-  const eligibleCandidates = isInheritanceReference(ref)
+  const eligibleCandidates = isInheritanceRef(ref)
     ? filterCandidatesForReference(ref, candidates)
     : candidates.filter((n) => n.kind === 'function' || n.kind === 'method' || n.kind === 'class');
   const callableCandidates = applyLanguageGate(eligibleCandidates, ref);

@@ -2727,7 +2727,7 @@ program
         return;
       }
       console.log(chalk.bold(`\n"${permission}"\n`));
-      console.log(`Definitions (${result.definitions.length}):`);
+      console.log(`XML matches, including uses (${result.definitions.length}):`);
       for (const c of result.definitions) console.log(`  ${chalk.cyan(`${c.filePath}:${c.line}`)}  ${chalk.dim(`(${c.matchedPattern})`)}`);
       console.log(`Check points (${result.checkPoints.length}):`);
       for (const c of result.checkPoints) console.log(`  ${chalk.cyan(`${c.filePath}:${c.line}`)}  ${chalk.dim(`(${c.matchedPattern})`)}`);

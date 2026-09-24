@@ -37,6 +37,27 @@ describe('Resolution Module', () => {
   });
 
   describe('Name Matcher', () => {
+    it('accepts every supported supertype kind in exact-name inheritance matching', () => {
+      for (const kind of ['component', 'namespace'] as const) {
+        const target: Node = {
+          id: `${kind}:base`, kind, name: 'Base', qualifiedName: 'Base',
+          filePath: 'model.ts', language: 'typescript', startLine: 1, endLine: 1,
+          startColumn: 0, endColumn: 0, updatedAt: 0,
+        };
+        const context = {
+          getNodesByName: () => [target], getNodesInFile: () => [target],
+          getNodesByQualifiedName: () => [], getNodesByKind: () => [],
+          fileExists: () => true, readFile: () => null,
+          getProjectRoot: () => tempDir, getAllFiles: () => ['model.ts'],
+        } as ResolutionContext;
+        const ref: UnresolvedRef = {
+          fromNodeId: 'class:derived', referenceName: 'Base', referenceKind: 'extends',
+          filePath: 'model.ts', language: 'typescript', line: 2, column: 0,
+        };
+        expect(matchByExactName(ref, context)?.targetNodeId).toBe(target.id);
+      }
+    });
+
     it('should match exact name references', () => {
       // Create a mock context
       const mockNodes: Node[] = [

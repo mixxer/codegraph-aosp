@@ -33,6 +33,9 @@ help locate code without proving that it implements the requested service.
 
 Negative results describe what the tool found in the available source and index.
 They are not proof that an implementation does not exist elsewhere.
+In particular, `aidl-impl` requires a discoverable `.aidl` declaration.
+`declaration_not_found` can occur even when a generated `IFoo.Stub` Java class
+is indexed, as in vendor or decompiled source trees.
 
 | Tool | Negative result names |
 |------|-----------------------|
@@ -150,7 +153,8 @@ and call paths returned by `codegraph_explore`.
   typealiases, and some fully qualified Stub expressions can be missed. Native
   and portable extraction can differ, so validate the backend used by the target
   installation. Naming searches are capped at 20 results per pattern and report
-  a warning at the limit.
+  a warning at the limit. For `aidl-impl`, an indexed generated Stub does not
+  replace the required `.aidl` source declaration.
 
 - **`hal-interface`**: Declaration discovery is restricted to
   `hardware/interfaces/` and skips symlinked discovery directories. The tool
@@ -170,6 +174,7 @@ and call paths returned by `codegraph_explore`.
 
 - **`trace-permission`**: XML searches are text-based after well-formed XML comments are stripped.
   They do not distinguish permission declarations, uses, or unrelated attributes.
+  The XML matches are candidate locations, not confirmed definitions.
   Check and enforcement matches require the permission literal on the same line
   as the recognized API call. Variables and constants are not resolved.
 

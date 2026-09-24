@@ -1633,7 +1633,6 @@ const DEFAULT_MCP_TOOLS = new Set(['explore']);
 export class ToolHandler {
   // Cache of opened CodeGraph instances for cross-project queries
   private projectCache: Map<string, CodeGraph> = new Map();
-  private static readonly MAX_PROJECT_CACHE_ENTRIES = 20;
   // The directory the server last searched for a default project. Surfaced in
   // the "not initialized" error so users can see why detection missed.
   private defaultProjectHint: string | null = null;
@@ -1945,24 +1944,9 @@ export class ToolHandler {
     // a changed resolution maps to a different entry instead of a stale hit.
     const cached = this.projectCache.get(resolvedRoot);
     if (cached) {
-      // Map insertion order is our LRU order: refresh the entry on every hit.
-      this.projectCache.delete(resolvedRoot);
-      this.projectCache.set(resolvedRoot, cached);
       return this.freshen(cached);
     }
 
-    if (this.projectCache.size >= ToolHandler.MAX_PROJECT_CACHE_ENTRIES) {
-      const oldestRoot = this.projectCache.keys().next().value as string | undefined;
-      if (oldestRoot !== undefined) {
-        const oldest = this.projectCache.get(oldestRoot);
-        this.projectCache.delete(oldestRoot);
-        try {
-          oldest?.close();
-        } catch {
-          // Eviction must not make the new project query fail.
-        }
-      }
-    }
     const cg = loadCodeGraph().openSync(resolvedRoot);
     this.projectCache.set(resolvedRoot, cg);
     return cg;
@@ -3010,7 +2994,7 @@ export class ToolHandler {
     const result = tracePermission(cg, cg.getProjectRoot(), permission);
 
     const lines: string[] = [`**${this.sanitizeForDisplay(permission)}**`, ''];
-    lines.push(`Definitions (${result.definitions.length}):`, ...result.definitions.map((c) => `- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`));
+    lines.push(`XML matches, including uses (${result.definitions.length}):`, ...result.definitions.map((c) => `- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`));
     lines.push('', `Check points (${result.checkPoints.length}):`, ...result.checkPoints.map((c) => `- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`));
     lines.push('', `Enforcement (${result.enforcement.length}):`, ...result.enforcement.map((c) => `- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`));
     lines.push('', 'Evidence:', ...result.evidence.map((e) => `  - ${this.sanitizeForDisplay(e)}`));
