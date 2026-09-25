@@ -1952,18 +1952,6 @@ export class ToolHandler {
       return this.freshen(cached);
     }
 
-    if (this.projectCache.size >= ToolHandler.MAX_PROJECT_CACHE_ENTRIES) {
-      const oldestRoot = this.projectCache.keys().next().value as string | undefined;
-      if (oldestRoot !== undefined) {
-        const oldest = this.projectCache.get(oldestRoot);
-        this.projectCache.delete(oldestRoot);
-        try {
-          oldest?.close();
-        } catch {
-          // Eviction must not make the new project query fail.
-        }
-      }
-    }
     const cg = loadCodeGraph().openSync(resolvedRoot);
     this.projectCache.set(resolvedRoot, cg);
     return cg;
