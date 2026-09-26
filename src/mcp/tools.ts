@@ -1349,7 +1349,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_system_service',
-    description: 'AOSP extension. Analyze a system service\'s lifecycle: the {Name}ManagerService class, its ServiceManager.addService registration, SystemServer startup site, and getSystemService client usage. "found" requires the exact service class AND either (a) a registration/client-usage hit in the SAME FILE as that class, or (b) a startup site naming the exact class (accepted cross-file, since AOSP conventionally starts a service from SystemServer, a different file) — see the response\'s evidence for which one applied. Anything else is convention_derived_candidate.',
+    description: 'AOSP extension. Analyze a system service\'s lifecycle: the {Name}ManagerService class, its ServiceManager.addService registration, SystemServer startup site, and getSystemService client usage. "found" requires the exact service class AND either (a) a registration hit in the SAME FILE as that class, or (b) a startup site naming the exact class (accepted cross-file, since AOSP conventionally starts a service from SystemServer, a different file). Client usage is evidence only and cannot promote a candidate to "found".',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1365,7 +1365,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_trace_permission',
-    description: 'AOSP extension. Pure text-candidate search for a permission string: XML line matches (labeled "definitions" for convenience, but this is a plain text/line match, not an XML-parsed element — uses-permission, permission, permission-tree, protected-broadcast, comments, or unrelated attributes containing the string are not distinguished), checkPermission call sites, enforcePermission call sites. Reports only what matched — no found/not-found claim.',
+    description: 'AOSP extension. Pure text-candidate search for a permission string: XML line matches (including uses; not parsed into element kinds), checkPermission call sites, and enforcePermission call sites. Reports only what matched — no found/not-found claim.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2050,8 +2050,7 @@ export class ToolHandler {
    * handler that just does `args.x === 'onlyValidValue' ? 'onlyValidValue'
    * : 'defaultValue'` silently coerces every invalid/misspelled value
    * (including ones that mean the OPPOSITE of the default) to the default
-   * with no error — verified live, `--type HIDL` (capitalized) silently
-   * searched `aidl` instead (Red Team round-2 finding, 2026-09-04).
+   * with no error; `--type HIDL` (capitalized) silently searched `aidl` instead.
    */
   private validateEnum<T extends string>(
     value: unknown,
@@ -2072,8 +2071,7 @@ export class ToolHandler {
    * otherwise echoed back verbatim, indistinguishable from real tool output
    * to a downstream reader of the response (an indirect-prompt-injection
    * vector when the value originated from untrusted external text rather
-   * than the calling agent's own input — Red Team round-2 finding,
-   * 2026-09-04, verified live).
+   * than the calling agent's own input).
    */
   private sanitizeForDisplay(value: string): string {
     return value
@@ -2887,8 +2885,7 @@ export class ToolHandler {
    * Render an AospCandidate's optional packageVerified state as a trailing
    * label — 'verified'/'mismatch' both change how much weight a reader
    * should give the candidate, and both were previously visible only in the
-   * evidence text, not next to the candidate itself (#32 doc/impl parity
-   * pass, 2026-09-05). 'unverifiable' and undefined render nothing: neither
+   * evidence text, not next to the candidate itself. 'unverifiable' and undefined render nothing: neither
    * confirms nor contradicts, so no label is the accurate signal.
    */
   private packageVerifiedLabel(packageVerified: PackageReachability | undefined): string {
@@ -3008,8 +3005,7 @@ export class ToolHandler {
       // Not always "SAME FILE" — a startup site naming the exact class is
       // accepted cross-file too (see analyzeSystemService's own docstring);
       // this label previously overstated the guarantee for every "found"
-      // result, not just the same-file-correlated ones (White Hat +
-      // Red Team round-1 findings, 2026-09-04).
+      // result, not just the same-file-correlated ones.
       const label = result.status === 'found' ? 'CONFIRMED (class + same-file or exact-class-name-startup evidence — see evidence below for which)' : 'convention-derived candidate';
         lines.push(`**${this.sanitizeForDisplay(result.serviceClassName)}** — ${label}`);
       if (result.serviceClass) lines.push(`- class: ${this.sanitizeForDisplay(result.serviceClass.filePath)}:${result.serviceClass.line}`);
@@ -3033,7 +3029,7 @@ export class ToolHandler {
     const result = tracePermission(cg, cg.getProjectRoot(), permission);
 
     const lines: string[] = [`**${this.sanitizeForDisplay(permission)}**`, ''];
-    lines.push(`Definitions (${result.definitions.length}):`, ...result.definitions.map((c) => `- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`));
+    lines.push(`XML matches, including uses (${result.xmlMatches.length}):`, ...result.xmlMatches.map((c) => `- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`));
     lines.push('', `Check points (${result.checkPoints.length}):`, ...result.checkPoints.map((c) => `- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`));
     lines.push('', `Enforcement (${result.enforcement.length}):`, ...result.enforcement.map((c) => `- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`));
     lines.push('', 'Evidence:', ...result.evidence.map((e) => `  - ${this.sanitizeForDisplay(e)}`));

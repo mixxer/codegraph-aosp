@@ -1,10 +1,6 @@
 /**
  * AOSP extension — AIDL interface implementation discovery.
  *
- * Ports the Connect Built-in Apps audit's validated PoC
- * (docs/poc/find_aidl_impl_codegraph.py in the audit workspace) onto
- * CodeGraph's own indexed graph, rather than a fresh AIDL grammar.
- *
  * CodeGraph does not parse `.aidl` files (they carry no language extractor),
  * so an AIDL interface like `IFoo` never becomes a node. But when a Kotlin/Java
  * class declares `: IFoo.Stub()` or `: IFoo`, CodeGraph's extractor still
@@ -14,7 +10,7 @@
  * than name-pattern matching: it fires even when the implementing class's own
  * name carries no hint of the interface (e.g. `ValetModeLogicServiceBinder`
  * implementing `IValetModeService`), which pure substring search on `nodes.name`
- * would miss entirely (verified against a synthetic fixture during the PoC).
+ * would miss entirely.
  *
  * Naming-convention search (`{Name}.Stub`, `{Name}Impl`, ...) and an
  * `addService`-pattern scan over CodeGraph's own indexed source list are kept
@@ -32,7 +28,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type CodeGraph from '../index';
 import type { NodeKind } from '../types';
-import { grepIndexedSources, escapeRegExp, candidateReachesPackagedSymbol, stripCLikeComments, indexingCaveat, findMatchingBraceEnd, testPathEvidence } from './common';
+import { grepIndexedSources, escapeRegExp, candidateReachesPackagedSymbol, stripCLikeComments, indexingCaveat, findMatchingBraceEnd, testPathEvidence, walkDeclarationFiles, DECLARATION_WALK_MAX_DEPTH, DECLARATION_WALK_MAX_ENTRIES } from './common';
 import type { PackageReachability } from './common';
 
 export interface AidlDeclaration {
@@ -121,8 +117,7 @@ export interface FindAidlImplResult {
 // Unicode-aware identifier: AIDL/Java identifiers permit any Unicode letter,
 // not just ASCII — `\w` silently dropped every non-ASCII interface name
 // (e.g. a Korean `I가나다`) from `parseAidlDeclarations`/`AIDL_PACKAGE_RE`
-// below (self-review finding, 2026-09-05, verified live against a Korean
-// fixture). `\b` itself stays ASCII-word-boundary under the `u` flag by
+// below. `\b` itself stays ASCII-word-boundary under the `u` flag by
 // spec, which is fine here — the preceding literal `interface` keyword is
 // itself ASCII, so the boundary check still does its job.
 const AIDL_INTERFACE_RE = /\binterface\s+([\p{L}\p{N}_$]+)\s*\{/gu;
@@ -137,7 +132,7 @@ const AIDL_PACKAGE_RE = /^\s*package\s+([\p{L}\p{N}_.]+)\s*;/mu;
 // and silently excluded every vendor-tree AIDL declaration — an interface
 // that's genuinely declared and implemented under `vendor/` reported
 // `declaration_not_found`, which an agent could misread as "unused, safe to
-// delete" (Black Hat round-4 finding, 2026-09-05).
+// delete".
 //
 // This only fixes the DECLARATION side. CodeGraph's own core indexer
 // (`directory.ts`, `extraction/index.ts`) ignores `vendor/` by default for
@@ -152,53 +147,9 @@ const IGNORED_DIR_NAMES = new Set([
   'node_modules', '.git', 'build', '.codegraph', 'out', '.gradle', '.idea', 'bin', 'dist',
 ]);
 const CANDIDATE_NODE_KINDS: NodeKind[] = ['class', 'interface'];
-export const AIDL_WALK_MAX_DEPTH = 40;
-export const AIDL_WALK_MAX_ENTRIES = 200_000;
+export const AIDL_WALK_MAX_DEPTH = DECLARATION_WALK_MAX_DEPTH;
+export const AIDL_WALK_MAX_ENTRIES = DECLARATION_WALK_MAX_ENTRIES;
 export interface AidlWalkLimits { maxDepth?: number; maxEntries?: number; }
-interface AidlFileWalkResult { files: string[]; truncated: boolean; }
-
-/**
- * Walk `root` for `.aidl` files, refusing to follow symlinks — both a
- * symlinked subdirectory (a caller-supplied interface name could otherwise
- * pull in a declaration from outside the project boundary the caller asked
- * to search, Codex 3rd-pass review, 2026-09-04) and a symlinked FILE with an
- * `.aidl`-looking name (the directory check alone left the file branch
- * unguarded — a `.aidl` symlink pointing outside `root` was parsed as if it
- * were a real in-repo declaration, Red Team round-3 finding, 2026-09-05).
- * This does NOT protect against `repoRoot` itself being attacker-controlled
- * (a caller passing `../../etc` or a symlinked root) — that trust boundary
- * belongs to the CLI/MCP layer that accepts `repoRoot`/`projectPath`, not
- * to this file-discovery helper.
- */
-function findAidlFiles(root: string, limits: AidlWalkLimits = {}): AidlFileWalkResult {
-  const maxDepth = limits.maxDepth ?? AIDL_WALK_MAX_DEPTH;
-  const maxEntries = limits.maxEntries ?? AIDL_WALK_MAX_ENTRIES;
-  const results: string[] = [];
-  let visited = 0;
-  let truncated = false;
-  const walk = (dir: string, depth: number): void => {
-    if (truncated || depth > maxDepth) { truncated = true; return; }
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return; // unreadable dir — skip rather than abort the whole search
-    }
-    for (const entry of entries) {
-      if (visited >= maxEntries) { truncated = true; return; }
-      visited++;
-      if (entry.isSymbolicLink()) continue;
-      if (entry.isDirectory()) {
-        if (IGNORED_DIR_NAMES.has(entry.name)) continue;
-        walk(path.join(dir, entry.name), depth + 1);
-      } else if (entry.name.endsWith('.aidl')) {
-        results.push(path.join(dir, entry.name));
-      }
-    }
-  };
-  walk(root, 0);
-  return { files: results, truncated };
-}
 
 /**
  * Parse every `.aidl` declaration named `interfaceName` in the repo — not
@@ -207,17 +158,13 @@ function findAidlFiles(root: string, limits: AidlWalkLimits = {}): AidlFileWalkR
  * HAL directories, or an app-level AIDL happening to share a HAL's name),
  * and picking the wrong one silently compared an unrelated declaration
  * against the real implementation, producing a nonsensical "package
- * mismatch" verdict (self-review finding, 2026-09-05, following up on
- * Blue Team's 2nd-round finding). Comments are stripped before matching so
+ * mismatch" verdict. Comments are stripped before matching so
  * a documentation example or a commented-out stale declaration can never
- * be mistaken for the file's real interface (2nd self-review round:
- * `IWrongDecoy` commented out above a real `ICommented` interface returned
- * `ICommented`'s methods/line/package under `IWrongDecoy`'s name — a data
- * bleed, not just a miss).
+ * be mistaken for the file's real interface.
  */
 function parseAidlDeclarationsWithWalk(repoRoot: string, interfaceName: string, limits: AidlWalkLimits = {}): { declarations: AidlDeclaration[]; truncated: boolean } {
   const declarations: AidlDeclaration[] = [];
-  const walk = findAidlFiles(repoRoot, limits);
+  const walk = walkDeclarationFiles(repoRoot, '.aidl', IGNORED_DIR_NAMES, limits);
   for (const aidlFile of walk.files) {
     let rawText: string;
     try {
@@ -236,14 +183,11 @@ function parseAidlDeclarationsWithWalk(repoRoot: string, interfaceName: string, 
       // Scanning the whole file here (the original behavior) mixed a second
       // interface's methods into the first when a file declared more than
       // one, e.g. querying the second interface in a two-interface file
-      // returned both interfaces' method lists concatenated (self-review
-      // finding, 2026-09-05, surfaced by adding multi-declaration support
-      // above). A plain `indexOf('}', bodyStart)` (the first fix) assumed
+      // returned both interfaces' method lists concatenated. A plain `indexOf('}', bodyStart)` (the first fix) assumed
       // AIDL bodies never nest braces — but a nested `enum`/`parcelable`/
       // `union` declared inside the interface has its own `{ ... }`, and
       // that assumption truncated the body at the INNER closing brace,
-      // silently dropping every real method after it (Red Team round-4
-      // finding, 2026-09-05) — brace-depth tracking via
+      // silently dropping every real method after it — brace-depth tracking via
       // `findMatchingBraceEnd` finds the actual matching close instead.
       const bodyStart = match.index + match[0].length;
       const bodyEnd = findMatchingBraceEnd(text, bodyStart);
@@ -294,11 +238,16 @@ export function findUnresolvedExtendsCandidates(
   alternateFqcns: string[] = []
 ): AospCandidate[] {
   const candidates: AospCandidate[] = [];
-  for (const ref of cg.getUnresolvedReferencesByQualifiedName(interfaceName)) {
+  const fqcn = packageName ? `${packageName}.${interfaceName}` : null;
+  const refs = cg.getUnresolvedReferencesByQualifiedName(interfaceName);
+  if (fqcn) refs.push(...cg.getUnresolvedReferencesByQualifiedName(fqcn));
+  for (const ref of refs) {
     if (ref.referenceKind !== 'extends' && ref.referenceKind !== 'implements') continue;
     const node = cg.getNode(ref.fromNodeId);
     if (!node) continue;
-    const packageVerified = candidateReachesPackagedSymbol(cg, node.filePath, packageName, interfaceName, alternateFqcns);
+    const packageVerified = fqcn && (ref.referenceName === fqcn || ref.referenceName.startsWith(`${fqcn}.`))
+      ? 'verified'
+      : candidateReachesPackagedSymbol(cg, node.filePath, packageName, interfaceName, alternateFqcns);
     candidates.push({
       kind: ref.referenceKind === 'extends' ? 'stub_subclass' : 'impl_by_interface',
       nodeKind: node.kind,
@@ -322,18 +271,17 @@ export function findUnresolvedExtendsCandidates(
  * `cg.searchNodes()` is FTS/LIKE/fuzzy, not exact-match — a bare substring
  * hit here (e.g. `IFooImplHelper` for pattern `IFooImpl`) is not evidence of
  * an implementation. Every candidate is filtered down to `node.name ===
- * pattern` (code review finding, 2026-09-04) before being kept, matching the
+ * pattern`  before being kept, matching the
  * same exact-match discipline find_jni_bridge already applies on its native
  * side. The dotted forms (`{Name}.Stub`, `{Name}.Proxy`) are dropped
  * entirely: a top-level class can't literally be named with a dot, so they
  * never produced a real exact match — that shape is what the primary
- * unresolved_refs signal already covers (`class Foo : IBar.Stub()`).
+ * unresolved_refs signal already covers (`class Foo: IBar.Stub()`).
  *
  * Also tries the bare name with a leading `I` dropped (`IFoo` -> `FooImpl`)
  * — the AOSP convention hal.ts's native-impl search already applied, but
  * this Kotlin/Java naming-convention search never did, so `FooImpl` (far
- * more common in practice than `IFooImpl`) went entirely unmatched (Blue
- * Team 2nd-round finding, 2026-09-04, verified live).
+ * more common in practice than `IFooImpl`) went entirely unmatched.
  */
 function findNamingConventionCandidates(
   cg: CodeGraph,
@@ -346,7 +294,7 @@ function findNamingConventionCandidates(
   const candidates: AospCandidate[] = [];
   for (const pattern of patterns) {
     const results = cg.searchNodes(pattern, { kinds: CANDIDATE_NODE_KINDS, limit: 20 });
-    if (results.length === 20) evidence.push(`WARNING: searchNodes("${pattern}") 결과가 20개 제한에 도달해 추가 매치가 있을 수 있습니다`);
+    if (results.length === 20) evidence.push(`WARNING: searchNodes("${pattern}") reached the 20-result limit; more matches may exist`);
     for (const { node } of results) {
       if (node.name !== pattern) continue; // exact match only — FTS ranking is not evidence
       const key = `${node.filePath}:${node.startLine}`;
@@ -376,7 +324,7 @@ function findNamingConventionCandidates(
  * lower/camelCase (`"media.audio_flinger"`) while the interface's bare name
  * is PascalCase (`Foo` from `IFoo`) — a case-sensitive match silently
  * dropped this supplementary signal whenever the two didn't match case
- * exactly (Green Team 2nd-round finding, 2026-09-04, verified live).
+ * exactly.
  */
 function findServiceRegistrations(
   cg: CodeGraph,
@@ -409,9 +357,8 @@ function findServiceRegistrations(
 /**
  * Find who implements an AIDL interface, using CodeGraph's own symbol graph
  * as the source of truth — no generated AIDL stub sources or Gradle
- * classpath resolution required (both were shown to be unnecessary in the
- * PoC: unresolved_refs captures the extends/implements clause straight from
- * the checked-in Kotlin/Java source).
+ * classpath resolution required. `unresolved_refs` captures the
+ * extends/implements clause from the checked-in Kotlin/Java source.
  *
  * Fail-closed by design: a `.aidl` interface with genuinely no in-repo
  * implementation (e.g. the service lives in a different process/repo, or the
@@ -425,7 +372,7 @@ export function findAidlImpl(cg: CodeGraph, repoRoot: string, interfaceName: str
   const evidence: string[] = [];
   const caveat = indexingCaveat(cg);
   if (caveat) evidence.push(caveat);
-  if (parsed.truncated) evidence.push(`WARNING: 파일 순회가 상한(${AIDL_WALK_MAX_ENTRIES}개 또는 깊이 ${AIDL_WALK_MAX_DEPTH})에 도달해 중단되었습니다 - 결과가 불완전할 수 있습니다`);
+  if (parsed.truncated) evidence.push(`WARNING: declaration walk reached its limit (${AIDL_WALK_MAX_ENTRIES} entries or depth ${AIDL_WALK_MAX_DEPTH}); results may be incomplete`);
 
   if (declarations.length === 0) {
     evidence.push(`no .aidl declaration for "${interfaceName}" found under the project root`);
@@ -437,16 +384,14 @@ export function findAidlImpl(cg: CodeGraph, repoRoot: string, interfaceName: str
   // app-level AIDL sharing a HAL's name) — comparing candidates against
   // whichever declaration the file-system walk happened to hit first
   // produced a nonsensical "package mismatch" verdict against a real
-  // implementation of a DIFFERENT declaration (Blue Team 2nd-round finding,
-  // 2026-09-04, verified live). Try each declaration's package in turn.
+  // implementation of a DIFFERENT declaration. Try each declaration's package in turn.
   //
   // Priority is `verified` > `unverifiable` > "matched the most candidates"
   // — NOT just "any non-mismatch candidate", which is what the previous
   // version's `verified` variable actually checked despite its name: an
   // `unverifiable` hit (package couldn't even be parsed) satisfied that
   // filter and immediately won via `break`, so a genuinely `verified` later
-  // declaration was never even considered (Codex round-4 Blue Team finding,
-  // 2026-09-05). Only stop early once a STRICTLY verified hit is found —
+  // declaration was never even considered. Only stop early once a STRICTLY verified hit is found —
   // that's the one signal strong enough to justify not looking further.
   let declaration: AidlDeclaration = declarations[0]!;
   let unresolvedCandidates: AospCandidate[] = [];
@@ -536,8 +481,7 @@ export function findAidlImpl(cg: CodeGraph, repoRoot: string, interfaceName: str
   // CodeGraph tried and failed to resolve) AND, when the declaration's
   // package is known, at least one candidate that can actually reach it.
   // Naming-convention matches and addService registrations are real signal
-  // but not proof of implementation on their own (code review finding,
-  // 2026-09-04) — a registration line can mention the class in an unrelated
+  // but not proof of implementation on their own — a registration line can mention the class in an unrelated
   // comment, and an exact-name match on `{Name}Impl` doesn't confirm it
   // implements THIS interface. Both keep `convention_derived_candidate`
   // distinct from `found`, mirroring find_jni_bridge's status model. A
