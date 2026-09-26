@@ -1,5 +1,5 @@
 /**
- * AOSP extension — trace_permission / trace_broadcast (Phase 3).
+ * AOSP extension — permission and broadcast evidence.
  *
  * Both are pure text-candidate search with no found/not-found status — these
  * tests check that the right files/lines are returned, not a status field.
@@ -50,8 +50,8 @@ describe('AOSP extension: tracePermission / traceBroadcast', () => {
     await cg.indexAll();
     const result = tracePermission(cg, dir, 'android.permission.CAMERA');
 
-    expect(result.definitions.length).toBeGreaterThan(0);
-    expect(result.definitions[0]?.filePath).toBe('AndroidManifest.xml');
+    expect(result.xmlMatches.length).toBeGreaterThan(0);
+    expect(result.xmlMatches[0]?.filePath).toBe('AndroidManifest.xml');
     expect(result.checkPoints.length).toBeGreaterThan(0);
     expect(result.enforcement.length).toBeGreaterThan(0);
   });
@@ -82,13 +82,13 @@ describe('AOSP extension: tracePermission / traceBroadcast', () => {
     await cg.indexAll();
     const result = tracePermission(cg, dir, 'android.permission.NEVER_USED');
 
-    expect(result.definitions).toHaveLength(0);
+    expect(result.xmlMatches).toHaveLength(0);
     expect(result.checkPoints).toHaveLength(0);
     expect(result.enforcement).toHaveLength(0);
     expect(result.evidence.length).toBeGreaterThan(0);
   });
 
-  it('ignores a match inside a line comment (Codex cross-review finding, 2026-09-04: plain-text grep otherwise treats a stale comment as live evidence)', async () => {
+  it('ignores a match inside a line comment', async () => {
     write(
       'src/Old.kt',
       'package com.example\n\n' +
@@ -105,7 +105,7 @@ describe('AOSP extension: tracePermission / traceBroadcast', () => {
     expect(result.checkPoints).toHaveLength(0);
   });
 
-  it('ignores a match inside an XML comment (self-review finding, 2026-09-04: the //-only comment filter above missed XML entirely)', async () => {
+  it('ignores a match inside an XML comment', async () => {
     write(
       'AndroidManifest.xml',
       '<manifest>\n    <!-- <uses-permission android:name="android.permission.REMOVED"/> -->\n</manifest>\n'
@@ -114,7 +114,7 @@ describe('AOSP extension: tracePermission / traceBroadcast', () => {
     await cg.indexAll();
     const result = tracePermission(cg, dir, 'android.permission.REMOVED');
 
-    expect(result.definitions).toHaveLength(0);
+    expect(result.xmlMatches).toHaveLength(0);
   });
 
   it('traceBroadcast finds a sendBroadcast call site', async () => {

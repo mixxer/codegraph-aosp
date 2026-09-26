@@ -6,7 +6,7 @@
  * grep hits are real signal but not proof on their own. `found` requires the
  * exact `{Name}ManagerService` class AND one of two kinds of corroborating
  * evidence:
- *   - a registration/client-usage hit in the SAME FILE as that class (a
+ *   - a registration hit in the SAME FILE as that class (a
  *     grep hit anywhere else in the repo — a comment, an unrelated service
  *     of a similar name — does not confirm this specific service's
  *     lifecycle); or
@@ -16,8 +16,7 @@
  *     different file from the service class by design, unlike JNI's
  *     native-declaration/RegisterNatives pair which are conventionally
  *     colocated. Applying JNI's same-file rule here produced false
- *     negatives on exactly this common shape (Codex cross-review finding,
- *     2026-09-04).
+ *     negatives on exactly this common shape.
  */
 import type CodeGraph from '../index';
 import { grepIndexedSources, escapeRegExp, indexingCaveat, testPathEvidence, titleCase, appendSuffixWithoutDuplication, findClassNodeByName } from './common';
@@ -120,9 +119,8 @@ export function analyzeSystemService(cg: CodeGraph, repoRoot: string, serviceNam
   // class's own body (classNode.startLine..endLine), not merely the same
   // file: a file can hold more than one class, and same-file-only
   // correlation would let a completely unrelated class's
-  // publishBinderService call in the same file false-corroborate this one
-  // (Codex review finding, 2026-09-06). A repo-wide hit outside the class
-  // body still appears in evidence for visibility, but never counts toward
+  // publishBinderService call in the same file false-corroborate this one.
+  // A repo-wide hit outside the class body still appears in evidence for visibility, but never counts toward
   // "found".
   const publishHitsRepoWide = grepIndexedSources(
     cg, repoRoot, ['kotlin', 'java'], /publishBinderService\s*\(/, 'publishBinderService(...)'
@@ -149,8 +147,7 @@ export function analyzeSystemService(cg: CodeGraph, repoRoot: string, serviceNam
   // `startService(FooManagerService::class.java)` call, and this signal is
   // the ONE this module accepts cross-file with no same-file corroboration
   // required — a log line alone was therefore enough to earn the highest
-  // confidence tier, "found" (Blue Team round-2 finding, 2026-09-04,
-  // verified live). This narrows the false-positive surface without
+  // confidence tier, "found". This narrows the false-positive surface without
   // reintroducing the same-file requirement that produced false negatives
   // on the legitimate SystemServer-starts-it-elsewhere shape in the first
   // place — it does not eliminate every way a comment or string could still
@@ -196,7 +193,7 @@ export function analyzeSystemService(cg: CodeGraph, repoRoot: string, serviceNam
     evidence.push(
       `${startupSites.length} startup site(s) name the exact class "${serviceClassName}" ` +
         `(cross-file class-name reference — sufficient alone for "found", unlike the same-file-only ` +
-        `registration/client-usage signals which only match the bare service name)`
+        `registration signals which only match the bare service name)`
     );
   }
 
