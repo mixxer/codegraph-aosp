@@ -220,6 +220,54 @@ public class Consumer {
         c.node.qualifiedName === 'r::Impl::run' && c.edge.metadata?.synthesizedBy === 'interface-impl')).toBe(true);
     });
 
+    it('does not match a Kotlin local anonymous-object method from a sibling function', () => {
+      const node = (id: string, kind: Node['kind'], name: string, qualifiedName: string, filePath: string, startLine: number, endLine: number): Node => ({
+        id, kind, name, qualifiedName, filePath, language: 'kotlin',
+        startLine, endLine, startColumn: 0, endColumn: 0, updatedAt: 0,
+      });
+      const outer = node('outer', 'method', 'otherTest', 'ProbeTest::otherTest', 'ProbeTest.kt', 10, 20);
+      const anon = node('anon', 'class', '<Probe$anon@12:8>', 'ProbeTest::otherTest::<Probe$anon@12:8>', 'ProbeTest.kt', 12, 18);
+      const localMethod = node('local', 'method', 'probe', `${anon.qualifiedName}::probe`, 'ProbeTest.kt', 13, 17);
+      const interfaceMethod = node('interface', 'method', 'probe', 'Probe::probe', 'Probe.kt', 1, 2);
+      const nodes = [outer, anon, localMethod, interfaceMethod];
+      const context = {
+        getNodesByName: (name: string) => nodes.filter((n) => n.name === name),
+        getNodesByQualifiedName: (name: string) => nodes.filter((n) => n.qualifiedName === name),
+        getNodesInFile: (filePath: string) => nodes.filter((n) => n.filePath === filePath),
+        getNodesByKind: (kind: Node['kind']) => nodes.filter((n) => n.kind === kind),
+        fileExists: () => true, readFile: () => null,
+        getProjectRoot: () => tempDir, getAllFiles: () => ['ProbeTest.kt', 'Probe.kt'],
+      } as ResolutionContext;
+      const ref: UnresolvedRef = {
+        fromNodeId: 'testA', referenceName: 'probe.probe', referenceKind: 'calls',
+        filePath: 'ProbeTest.kt', language: 'kotlin', line: 5, column: 0,
+      };
+
+      expect(matchMethodCall(ref, context)?.targetNodeId).toBe(interfaceMethod.id);
+      expect(matchMethodCall({ ...ref, fromNodeId: outer.id, line: 15 }, context)?.targetNodeId).toBe(localMethod.id);
+    });
+
+    it('accepts every supported supertype kind in exact-name inheritance matching', () => {
+      for (const kind of ['component', 'namespace'] as const) {
+        const target: Node = {
+          id: `${kind}:base`, kind, name: 'Base', qualifiedName: 'Base',
+          filePath: 'model.ts', language: 'typescript', startLine: 1, endLine: 1,
+          startColumn: 0, endColumn: 0, updatedAt: 0,
+        };
+        const context = {
+          getNodesByName: () => [target], getNodesInFile: () => [target],
+          getNodesByQualifiedName: () => [], getNodesByKind: () => [],
+          fileExists: () => true, readFile: () => null,
+          getProjectRoot: () => tempDir, getAllFiles: () => ['model.ts'],
+        } as ResolutionContext;
+        const ref: UnresolvedRef = {
+          fromNodeId: 'class:derived', referenceName: 'Base', referenceKind: 'extends',
+          filePath: 'model.ts', language: 'typescript', line: 2, column: 0,
+        };
+        expect(matchByExactName(ref, context)?.targetNodeId).toBe(target.id);
+      }
+    });
+
     it('should match exact name references', () => {
       // Create a mock context
       const mockNodes: Node[] = [
@@ -5915,7 +5963,7 @@ in
     });
   });
 
-  describe('A dotted qualified extends/implements reference resolves to a real nested type (2026-09-11)', () => {
+  describe('A dotted qualified extends/implements reference resolves to a real nested type', () => {
     it('resolves `extends Outer.Inner` (named class) and `new Outer.Inner() { ... }` (anonymous class) to the SAME real, indexed nested type', async () => {
       // Every qualifiedName the engine builds joins scope with `::`
       // (buildQualifiedName), but a Java/C# extends clause or anonymous-class
@@ -6296,6 +6344,44 @@ class UiModeManagerService {
       // call. In particular, an absent IBar must not make `Stub` fall through to
       // the sole same-named constructor elsewhere in the project.
       expect(rows.filter((row) => row.targetKind === 'method')).toEqual([]);
+    });
+
+    it('resolves a nested Java supertype to the closest source tree', async () => {
+      for (const tree of ['framework', 'androidx']) {
+        const dir = path.join(tempDir, tree);
+        fs.mkdirSync(dir);
+        fs.writeFileSync(path.join(dir, 'RecyclerView.java'),
+          `package ${tree}; class RecyclerView { static class LayoutManager {} }`);
+      }
+      fs.writeFileSync(path.join(tempDir, 'androidx', 'LinearLayoutManager.java'),
+        'package androidx; class LinearLayoutManager extends RecyclerView.LayoutManager {}');
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+      const rows = db.getDb().prepare(
+        `select dst.file_path as targetPath from edges e
+         join nodes src on src.id = e.source
+         join nodes dst on dst.id = e.target
+         where e.kind = 'extends' and src.name = 'LinearLayoutManager'`
+      ).all() as Array<{ targetPath: string }>;
+      expect(rows.map((row) => row.targetPath)).toEqual(['androidx/RecyclerView.java']);
+    });
+
+    it('does not let Spring naming conventions invent an inheritance edge', async () => {
+      fs.writeFileSync(path.join(tempDir, 'Service.java'),
+        '@Service class Service {} class Child implements View.OnClickListener {}');
+      fs.writeFileSync(path.join(tempDir, 'OnClickListener.java'),
+        'package unrelated; class OnClickListener {}');
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+      const rows = db.getDb().prepare(
+        `select dst.qualified_name as target from edges e
+         join nodes src on src.id = e.source
+         join nodes dst on dst.id = e.target
+         where e.kind = 'implements' and src.name = 'Child'`
+      ).all() as Array<{ target: string }>;
+      expect(rows).toEqual([]);
     });
   });
 });

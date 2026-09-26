@@ -405,6 +405,8 @@ const LITERAL_RECEIVER_TYPES = new Set([
 /**
  * Languages whose member calls go through the TS/JS grammars.
  */
+/** A Kotlin receiver chain the resolver can type: `a.b`, `this.a`, up to four segments. */
+const KOTLIN_RECEIVER_CHAIN = /^(?:this|[A-Za-z_]\w*)(?:\.[A-Za-z_]\w*){1,3}$/;
 const TS_JS_CHAIN_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx']);
 
 /** Receiver node types (TS/JS grammars) that continue a member chain downward. */
@@ -4891,6 +4893,21 @@ export class TreeSitterExtractor {
               // inference (see matchGoFieldChainCall) or stay unresolved.
               calleeName = `${getNodeText(receiver, this.source).replace(/\s+/g, '')}.${methodName}`;
             } else if (
+              this.language === 'kotlin' &&
+              receiver &&
+              receiver.type === 'navigation_expression' &&
+              KOTLIN_RECEIVER_CHAIN.test(getNodeText(receiver, this.source).replace(/\s+/g, '').replace(/\?\./g, '.'))
+            ) {
+              // Kotlin call through a receiver chain — `engine.pump.drain()`,
+              // `this.engine.drain()`, `a?.b?.c()`. Keep the chain: the
+              // resolver types it segment by segment through the properties'
+              // declared types and resolves the method on that type, leaves a
+              // library type unresolved, and resolves an untyped chain as the
+              // bare method name this used to emit. Mirrored in the kernel's
+              // extract_call (kotlin.rs).
+              const chain = getNodeText(receiver, this.source).replace(/\s+/g, '').replace(/\?\./g, '.');
+              calleeName = `${chain}.${methodName}`;
+            } else if (
               TS_JS_CHAIN_LANGUAGES.has(this.language) &&
               receiver &&
               TS_JS_CHAIN_RECEIVER_TYPES.has(receiver.type) &&
@@ -5276,12 +5293,8 @@ export class TreeSitterExtractor {
     // `extends` reference itself must NOT be truncated to the bare last
     // segment the way the anon class's own name and the `instantiates` edge
     // are: a NAMED class's real `extends IFoo.Stub` clause is extracted
-    // verbatim (untruncated) precisely because AOSP-style qualified-name
-    // lookups (e.g. hal.ts/aidl.ts's `IFoo` / `IFoo.%` prefix match) depend on
-    // the full dotted text surviving. Truncating this to "Stub" made a real
-    // AIDL `new ICarPropertyEventListener.Stub() { ... }` field initializer
-    // invisible to aidl-impl even after the anon class body itself started
-    // being extracted (Codex/real-AOSP-mirror finding, 2026-09-11).
+    // verbatim (untruncated) so qualified-name resolution can find the
+    // nested type. Truncating this to "Stub" loses the enclosing interface.
     // We can't tell at extraction time whether T is a class or an interface,
     // so emit `extends`. Resolution will still bind T to whatever it is, and
     // Phase 5.5 (which already handles both `extends` and `implements`) will
@@ -5306,8 +5319,7 @@ export class TreeSitterExtractor {
 
   /**
    * Extract a Kotlin anonymous object expression — `object : IFoo.Stub() { ... }`
-   * — the dominant AIDL Stub implementation idiom in this codebase's Kotlin
-   * sources. This is NOT the same AST shape as Java/C#'s
+   * — a common AIDL Stub implementation idiom. This has a different AST shape from Java/C#'s
    * `object_creation_expression`, so it cannot reuse `extractAnonymousClass`:
    *
    *   object_literal
@@ -5323,9 +5335,7 @@ export class TreeSitterExtractor {
    * Before this function existed, `object_literal` was not in
    * INSTANTIATION_KINDS and had no anonymous-class handling at all, so this
    * idiom produced neither an `instantiates` nor an `extends` reference —
-   * the interface→impl synthesizer (Phase 5.5) and aidl.ts's unresolved_refs
-   * lookup never saw these implementations (0% recall in a live audit against
-   * this codebase's real AIDL services, 2026-09-11).
+   * the interface→impl synthesizer cannot see these implementations.
    */
   private extractKotlinObjectLiteral(node: SyntaxNode): void {
     if (!this.extractor) return;
