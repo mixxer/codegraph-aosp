@@ -213,6 +213,7 @@ pub struct Walker<'t> {
     file_path: &'t str,
     line_starts: Vec<usize>,
     arena: Arena,
+    node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
     stack: Vec<Scope>,
     node_ids: Vec<String>,
@@ -251,6 +252,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
         file_path,
         line_starts: util::line_starts(source),
         arena: Arena::default(),
+        node_id_allocator: ids::NodeIdAllocator::default(),
         tables: Tables::default(),
         stack: Vec::new(),
         node_ids: Vec::new(),
@@ -411,15 +413,14 @@ impl<'t> Walker<'t> {
             return None;
         }
         let start_line = self.line_of(node);
-        // identityName (tree-sitter.ts:1405) — members in different Kotlin
-        // anonymous objects can share both name and line; bind identity to
-        // the enclosing owner too while inside an object_literal body.
+        // Members in different anonymous objects can share a name and line.
         let identity_name = if self.kotlin_object_scope_depth > 0 && !self.stack.is_empty() {
             format!("{}::{}", self.node_ids[self.top_row() as usize], name)
         } else {
             name.to_string()
         };
-        let id = ids::node_id(self.file_path, kind, &identity_name, start_line);
+        let column = self.col_of(node);
+        let id = self.node_id_allocator.generate(self.file_path, kind, &identity_name, start_line, column);
         // endLine extension via resolveBody — LIVE for kotlin function/method
         // kinds (in-range for this grammar, so practically a no-op — but the
         // hook is part of the contract).
