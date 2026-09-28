@@ -270,6 +270,8 @@ export function gateLanguageMatch(
     context.getNodesByName(ref.referenceName).find((n) => n.id === result.targetNodeId);
   if (target && crossesCodeBoundary(ref.language, target.language) &&
       !hasBridgeEvidence(target, ref, context)) return null;
+  if (target?.language === 'java' && ref.language === 'java' &&
+      !isVisibleAcrossFiles(target, ref, context)) return null;
   return result;
 }
 
@@ -3334,6 +3336,19 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
     if (candidate.kind === 'method' && RUST_TYPED_REFS.get(context)?.has(ref) && rustTraitOf(candidate, context)?.visibility !== 'private') return true;
     const owner = rustModuleDir(candidate.filePath);
     return ref.filePath.startsWith(owner + '/');
+  }
+  if (lang === 'java') {
+    if (candidate.visibility === 'private') return false;
+    if (candidate.visibility == null) {
+      const fileNodes = context.getNodesInFile(candidate.filePath);
+      const ownerName = candidate.qualifiedName.slice(0, candidate.qualifiedName.lastIndexOf('::'));
+      const owner = fileNodes.find((node) => node.qualifiedName === ownerName);
+      if (owner?.visibility === 'public' &&
+          (owner.kind === 'interface' || (owner.kind === 'enum' && candidate.kind === 'enum_member'))) return true;
+      const packageName = (nodes: Node[]): string => nodes.find((node) => node.kind === 'namespace')?.name ?? '';
+      return packageName(fileNodes) === packageName(context.getNodesInFile(ref.filePath));
+    }
+    return true;
   }
   if (PRIVATE_IS_FILE_LOCAL.has(lang)) return candidate.visibility !== 'private';
   // An R test file runs in an environment of its own (testthat): its top-level

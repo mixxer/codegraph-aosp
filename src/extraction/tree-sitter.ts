@@ -2409,6 +2409,7 @@ export class TreeSitterExtractor {
 
     const interfaceNode = this.createNode(kind, name, node, {
       docstring,
+      visibility: this.language === 'java' ? this.extractor.getVisibility?.(node) : undefined,
       isExported,
     });
     if (!interfaceNode) return;
@@ -7398,7 +7399,9 @@ export class TreeSitterExtractor {
         const targets = typeList ? typeList.namedChildren : [child.namedChild(0)];
         for (const target of targets) {
           if (target) {
-            const name = getNodeText(target, this.source);
+            const name = this.language === 'java'
+              ? stripCppTemplateArgs(getNodeText(target, this.source))
+              : getNodeText(target, this.source);
             this.unresolvedReferences.push({
               fromNodeId: classId,
               referenceName: name,
@@ -7447,7 +7450,9 @@ export class TreeSitterExtractor {
         const targets = typeList ? typeList.namedChildren : child.namedChildren;
         for (const iface of targets) {
           if (iface) {
-            const name = getNodeText(iface, this.source);
+            const name = this.language === 'java'
+              ? stripCppTemplateArgs(getNodeText(iface, this.source))
+              : getNodeText(iface, this.source);
             this.unresolvedReferences.push({
               fromNodeId: classId,
               referenceName: name,
