@@ -42,7 +42,7 @@ import type { AospCandidate, FindAidlImplStatus, AidlDeclaration } from './aidl'
 // failed (the character right after the interface name is `e`, not `{`) —
 // the entire declaration went unmatched, not just mis-parsed.
 const HAL_INTERFACE_RE = /\binterface\s+([\p{L}\p{N}_$]+)(?:\s+extends\s+[\p{L}\p{N}_$.@:]+)?\s*\{/gu;
-const HAL_METHOD_RE = /^\s*(?:oneway\s+)?[\w<>[\],.\s]+?\s+([\p{L}\p{N}_$]+)\s*\([^;{]*\)\s*;/gmu;
+const HAL_METHOD_RE = /^\s*(?:oneway\s+)?(?:@[\w.]+(?:\([^;]*?\))?\s+)*[\w<>[\],.\s]+?\s+([\p{L}\p{N}_$]+)\s*\([^;{]*\)\s*;/gmu;
 // HIDL's package clause carries a version suffix (`package android.hardware.foo@1.0;`).
 // The bare package (with `@version` stripped) still needs to be captured for the
 // same-package-membership check, but the version itself is captured separately —
