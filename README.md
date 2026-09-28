@@ -706,7 +706,9 @@ only revives embedded git repos, not plain source):
 
 CodeGraph discovers those files off disk, overriding `.gitignore`, on index,
 sync, and watch. An explicit `exclude` still wins, and built-in skips
-(`node_modules`, `dist`, `.git`) are never re-included.
+(`node_modules`, `dist`, `.git`) are never re-included. For Android platform
+trees, `"include": ["vendor/"]` explicitly includes first-party vendor
+implementations while keeping nested dependency and build directories skipped.
 
 Sometimes a directory shouldn't leave the index — you still want to find things
 in it — it just shouldn't *outrank* your real code. A `scripts/` or
