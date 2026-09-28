@@ -122,7 +122,7 @@ export interface FindAidlImplResult {
 // itself ASCII, so the boundary check still does its job.
 const AIDL_INTERFACE_RE = /\binterface\s+([\p{L}\p{N}_$]+)\s*\{/gu;
 // AIDL method declarations: `<returnType> name(<params>);`, optional `oneway`.
-const AIDL_METHOD_RE = /^\s*(?:oneway\s+)?[\w<>[\],.\s]+?\s+([\p{L}\p{N}_$]+)\s*\([^;{]*\)\s*;/gmu;
+const AIDL_METHOD_RE = /^\s*(?:oneway\s+)?(?:@[\w.]+(?:\([^;]*?\))?\s+)*[\w<>[\],.\s]+?\s+([\p{L}\p{N}_$]+)\s*\([^;{]*\)\s*;/gmu;
 const AIDL_PACKAGE_RE = /^\s*package\s+([\p{L}\p{N}_.]+)\s*;/mu;
 // NOT a general-purpose "vendored third-party code" ignore list — this is an
 // AOSP-specific walker, and `vendor/` in an AOSP tree is a first-class,
