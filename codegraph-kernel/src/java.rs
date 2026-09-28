@@ -668,6 +668,7 @@ impl<'t> Walker<'t> {
         let name = self.extract_name(node);
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
+            visibility: self.visibility_of(node),
             ..Extra::default()
         };
         let Some(row) = self.create_node("interface", &name, node, extra) else { return };
@@ -1043,7 +1044,7 @@ impl<'t> Walker<'t> {
                         None => child.named_child(0).into_iter().collect(),
                     };
                     for target in targets {
-                        let name = self.text(target).to_string();
+                        let name = strip_java_type_args(self.text(target));
                         self.push_ref_at(class_row, &name, extends_kind, target);
                     }
                 }
@@ -1056,7 +1057,7 @@ impl<'t> Walker<'t> {
                         None => (0..child.named_child_count()).filter_map(|j| child.named_child(j)).collect(),
                     };
                     for iface in targets {
-                        let name = self.text(iface).to_string();
+                        let name = strip_java_type_args(self.text(iface));
                         self.push_ref_at(class_row, &name, implements_kind, iface);
                     }
                 }
@@ -1611,6 +1612,16 @@ fn find_anonymous_class_body(node: Node) -> Option<Node> {
         }
     }
     None
+}
+
+/// Keep every qualified segment of a Java supertype while dropping type arguments.
+fn strip_java_type_args(raw: &str) -> String {
+    let mut depth = 0;
+    raw.chars().filter(|&ch| {
+        if ch == '<' { depth += 1; return false; }
+        if ch == '>' { depth -= 1; return false; }
+        depth == 0
+    }).collect::<String>().trim().to_string()
 }
 
 /// The `new ns.Foo<T>()` name normalization shared by instantiation /

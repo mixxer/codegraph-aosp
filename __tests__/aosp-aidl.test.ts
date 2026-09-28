@@ -408,18 +408,8 @@ describe('AOSP extension: findAidlImpl', () => {
         'package com.oem.vendor;\ninterface IVendorOnly {\n    void doVendorThing();\n}\n'
       );
       write(
-        // A Kotlin/Java implementer under vendor/ is deliberately NOT part
-        // of this fixture: CodeGraph's own core indexer (directory.ts,
-        // extraction/index.ts) ignores `vendor/` by default for every
-        // language, independent of this aosp extension — a Kotlin/Java
-        // implementer placed there would never produce an `unresolved_refs`
-        // hit no matter what this file discovers, and fixing that is a core
-        // indexing-policy change outside this fork's scope, not an aosp
-        // extension bug. This test only verifies the piece this extension
-        // DOES own: `findAidlFiles` walks its OWN file-system scan of
-        // `.aidl` files (which core never indexes for any repo) and must
-        // not silently drop a real vendor-tree declaration the way the
-        // previous `IGNORED_DIR_NAMES` did.
+        // This fixture isolates declaration discovery. A separate Android
+        // coverage test opts vendor/ implementation source into the core index.
         'src/UnrelatedNonVendor.kt',
         'package com.example.other\n\nclass UnrelatedNonVendor\n'
       );
