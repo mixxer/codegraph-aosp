@@ -2522,14 +2522,11 @@ export class ToolHandler {
     await this.awaitCatchUpGate(gate);
   }
 
-  /**
-   * Never evict a graph while a tool call or its timed-out reconcile uses it.
-   * Evicts over the LRU bound, on close, and once idle past the timeout
-   * (#2087). The cache is in last-use order, so idle entries lead it.
-   */
   private pinProject(projectPath: unknown): string | null {
-    const root = typeof projectPath === 'string' ? findNearestCodeGraphRoot(projectPath) : null;
-    if (root) this.activeProjectRoots.set(root, (this.activeProjectRoots.get(root) ?? 0) + 1);
+    const resolved = typeof projectPath === 'string' ? findNearestCodeGraphRoot(projectPath) : null;
+    if (!resolved) return null;
+    const root = canonicalPath(resolved);
+    this.activeProjectRoots.set(root, (this.activeProjectRoots.get(root) ?? 0) + 1);
     return root;
   }
 
@@ -2540,6 +2537,11 @@ export class ToolHandler {
     else this.activeProjectRoots.set(root, count - 1);
   }
 
+  /**
+   * Never evict a graph while a tool call or its timed-out reconcile uses it.
+   * Evicts over the LRU bound, on close, and once idle past the timeout
+   * (#2087). The cache is in last-use order, so idle entries lead it.
+   */
   private trimProjects(): void {
     if (this.activeCalls > 0 && (this.closing || this.activeProjectRoots.size === 0)) return;
     const idleMs = resolveProjectIdleTimeoutMs();
@@ -2558,7 +2560,7 @@ export class ToolHandler {
         });
       } else cg.close();
     }
-    if (this.closing && this.projectCache.size === 0 && this.pendingCloses === 0) {
+    if (this.closing && this.projectCache.size === 0 && this.activeCalls === 0 && this.activeProjectRoots.size === 0 && this.pendingCloses === 0) {
       for (const resolve of this.closeWaiters.splice(0)) resolve();
     }
     this.scheduleIdleRelease(idleMs);
@@ -2623,7 +2625,7 @@ export class ToolHandler {
     this.idleReleaseTimer = null;
     this.nestedRepoCache.clear();
     this.trimProjects();
-    if (this.projectCache.size === 0 && this.activeCalls === 0 && this.pendingCloses === 0) return Promise.resolve();
+    if (this.projectCache.size === 0 && this.activeCalls === 0 && this.activeProjectRoots.size === 0 && this.pendingCloses === 0) return Promise.resolve();
     return new Promise((resolve) => this.closeWaiters.push(resolve));
   }
 
@@ -2951,6 +2953,7 @@ export class ToolHandler {
       if (typeof pathCheck === 'object' && pathCheck !== undefined) {
         return pathCheck;
       }
+      pinnedRoot = this.pinProject(pathCheck);
       // An explicit project gets the same first-call guarantee as the default
       // (#1835): its post-open catch-up sync finishes (time-boxed) before we
       // serve it. Resolved on the main thread so the watcher lives here even
@@ -2958,7 +2961,6 @@ export class ToolHandler {
       if (typeof pathCheck === 'string') {
         await this.awaitProjectGate(pathCheck);
       }
-      pinnedRoot = this.pinProject(pathCheck);
       // The `path` and `pattern` properties used by codegraph_files are
       // also path-shaped — apply the same cap.
       if (args.path !== undefined) {
