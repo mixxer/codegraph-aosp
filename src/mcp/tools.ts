@@ -1759,7 +1759,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_trace_permission',
-    description: 'AOSP extension. Pure text-candidate search for a permission string: XML line matches (labeled "definitions" for convenience, but this is a plain text/line match, not an XML-parsed element — uses-permission, permission, permission-tree, protected-broadcast, comments, or unrelated attributes containing the string are not distinguished), checkPermission call sites, enforcePermission call sites. Reports only what matched — no found/not-found claim.',
+    description: 'AOSP extension. Pure text-candidate search for a permission string: XML line matches (including uses; not parsed into element kinds), checkPermission call sites, and enforcePermission call sites. Reports only what matched — no found/not-found claim.',
     inputSchema: {
       type: 'object',
       properties: {

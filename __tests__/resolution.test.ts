@@ -230,7 +230,7 @@ public class Consumer {
         fs.mkdirSync(path.dirname(target), { recursive: true });
         fs.writeFileSync(target, source);
       }
-      cg = CodeGraph.initSync(tempDir, { config: { include: ['**/*.java'], exclude: [] } });
+      cg = CodeGraph.initSync(tempDir);
       await cg.indexAll();
       const targets = (method: string) => {
         const caller = cg.searchNodes(method).map(r => r.node)
@@ -276,6 +276,8 @@ public class Consumer {
       const nodes = [outer, anon, localMethod, interfaceMethod];
       const context = {
         getNodesByName: (name: string) => nodes.filter((n) => n.name === name),
+        getNodesByLowerName: (name: string) => nodes.filter((n) => n.name.toLowerCase() === name),
+        getImportMappings: () => [],
         getNodesByQualifiedName: (name: string) => nodes.filter((n) => n.qualifiedName === name),
         getNodesInFile: (filePath: string) => nodes.filter((n) => n.filePath === filePath),
         getNodesByKind: (kind: Node['kind']) => nodes.filter((n) => n.kind === kind),
@@ -300,6 +302,7 @@ public class Consumer {
         };
         const context = {
           getNodesByName: () => [target], getNodesInFile: () => [target],
+          getNodesByLowerName: () => [target], getImportMappings: () => [],
           getNodesByQualifiedName: () => [], getNodesByKind: () => [],
           fileExists: () => true, readFile: () => null,
           getProjectRoot: () => tempDir, getAllFiles: () => ['model.ts'],

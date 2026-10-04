@@ -6022,8 +6022,8 @@ export function resolveMethodOnType(
 ): ResolvedRef | null {
   // This helper resolves a receiver's invoked member, never a type/member
   // reference such as Java `class Foo extends IBar.Stub`. Keep the guard here
-  // as a backstop for every current and future caller of this call-only API.
-  if (ref.referenceKind !== 'calls') return null;
+  // as a backstop while allowing references to callable members.
+  if (ref.referenceKind !== 'calls' && ref.referenceKind !== 'function_ref') return null;
 
   // Look up methods by name and match by qualifiedName ending in
   // `<typeName>::<methodName>`. This works whether the method is defined
@@ -8942,7 +8942,7 @@ export function matchMethodCall(
         // The owner type's own name — not its namespace (`eShop.ClientApp…`
         // shares `Client` with every `httpClient`) nor the method's.
         const cut = method.qualifiedName.lastIndexOf('::');
-        const classWords = cut > 0 ? splitCamelCase(method.qualifiedName.slice(0, cut).split(/::|\./).pop()!) : [];
+        const classWords = cut > 0 ? splitCamelCase(method.qualifiedName.slice(0, cut).split(/::|\./).pop()!.replace(/^<(.+)\$anon@[^>]*>$/, '$1')) : [];
         let score = receiverWords.filter(w =>
           classWords.some(cw => cw.toLowerCase() === w.toLowerCase())
         ).length;
@@ -10424,7 +10424,9 @@ function matchReferenceInner(
   // nested `ParameterizedTypesTest.Field`).
   if ((ref.language === 'java' || ref.language === 'kotlin') && ref.referenceKind !== 'imports' &&
       isJavaOutsideImport(ref.referenceName.split('.')[0]!, ref, context)) {
-    return null;
+    // Kotlin can call an in-project extension on an imported library type.
+    return ref.language === 'kotlin' && ref.referenceKind === 'calls'
+      ? matchMethodCall(ref, context) : null;
   }
 
   // A symbolic name in a Scala type is a type (`F ~> G`) or a kind-projector
