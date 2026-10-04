@@ -7,38 +7,18 @@ env:
   CODEGRAPH_TELEMETRY: '0'
   CODEGRAPH_NO_UPDATE_CHECK: '1'
 jobs:
-  portable:
-    name: ${{ matrix.label }} / Linux Node ${{ matrix.node }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
+  windows-paths:
+    name: ${{ matrix.label }} / Windows path validation
+    runs-on: windows-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        include: [{"label": "PR 1949", "sha": "30581659913438165d6dbfa34019cb4a2dc0758b", "node": 24}, {"label": "PR 1948", "sha": "a8425277350d91ee8fcc594cdd677724046ae74f", "node": 24}, {"label": "PR 1931", "sha": "07a229bc49b58b13a989a0a35a041ee40d3ce6ad", "node": 24}, {"label": "PR 1930", "sha": "0f75b0d0e7076fb858fbbddf346cbc47a5754307", "node": 24}, {"label": "PR 1929", "sha": "7398a498102d58cff96e296e8ae6ce45e3109c5b", "node": 24}, {"label": "PR 1928", "sha": "8c53ebc7950b36825b15612949555f229c13612e", "node": 24}, {"label": "PR 1927", "sha": "fb7ff1df904955bcdec12da26cf8638060603f69", "node": 24}, {"label": "Integrated main", "sha": "ci/readiness-20261005", "node": 22}, {"label": "Integrated main", "sha": "ci/readiness-20261005", "node": 24}]
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ matrix.sha }}
-          persist-credentials: false
-      - run: git rev-parse HEAD
-      - uses: actions/setup-node@v6
-        with:
-          node-version: ${{ matrix.node }}
-          cache: npm
-      - run: npm ci
-      - run: npm run build
-      - run: mkdir -p "$HOME/.ssh"
-      - run: npm test -- --maxWorkers=2 --minWorkers=1
-        env:
-          CODEGRAPH_KERNEL: '0'
-  native:
-    name: ${{ matrix.label }} / Linux native
-    runs-on: ubuntu-22.04
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include: [{"label": "PR 1949", "sha": "30581659913438165d6dbfa34019cb4a2dc0758b"}, {"label": "PR 1927", "sha": "fb7ff1df904955bcdec12da26cf8638060603f69"}]
+        include:
+          - label: upstream
+            sha: 6560052a6f856855d3f71eee838fd66ccfa4285d
+          - label: PR 1930
+            sha: 0f75b0d0e7076fb858fbbddf346cbc47a5754307
     steps:
       - uses: actions/checkout@v6
         with:
@@ -50,9 +30,8 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - run: bash scripts/build-kernel.sh --target x86_64-unknown-linux-gnu
       - run: npm run build
-      - run: test -s codegraph-kernel/prebuilds/linux-x64/codegraph-kernel.node
-      - run: npx vitest run __tests__/kernel-*.test.ts __tests__/extraction.test.ts __tests__/resolution.test.ts --maxWorkers=2 --minWorkers=1
+      - run: New-Item -ItemType Directory -Force -Path "$HOME/.ssh"
+      - run: npx vitest run __tests__/security.test.ts -t validateProjectPath --maxWorkers=2 --minWorkers=1
         env:
-          CODEGRAPH_KERNEL_EXPECT: '1'
+          CODEGRAPH_KERNEL: '0'
