@@ -12,12 +12,15 @@ import { applyAliases } from './path-aliases';
 import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport } from './workspace-packages';
 import { stripCommentsForRegex } from './strip-comments';
+import { dartDirectiveFile } from './dart-libraries';
+import { moduleTail } from '../db/reference-tail';
 import {
   resolveMethodOnType,
   resolveObjectLiteralMember,
   resolveObjectLiteralBinding,
   localReceiverTypePatterns,
   normalizeInferredTypeName,
+  goRefQualifier,
 } from './name-matcher';
 
 /**
@@ -109,6 +112,8 @@ interface FileExportIndex {
 
 const DEFAULT_BINDING_KINDS = new Set<string>(['function', 'class', 'component', 'constant', 'variable']);
 const DEFAULT_EXPORT_BINDING_RE = /^[ \t]*export\s+default\s+([A-Za-z_$][\w$]*)\s*;?[ \t]*$/m;
+/** Any `export default …` statement: the module is an ES module with a default export. */
+const ESM_DEFAULT_EXPORT_RE = /^[ \t]*export\s+default\b/m;
 const JS_FAMILY_FILE = /\.(?:[cm]?[jt]sx?)$/;
 
 /** The identifier `export default NAME` names in a JS-family file, or null. */
@@ -175,6 +180,28 @@ function defaultExportBindingNode(filePath: string, idx: FileExportIndex, contex
             .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0] ?? null);
   }
   return idx.defaultBinding ?? undefined;
+}
+
+/**
+ * The declaration a module default-exports: the component a single-file
+ * component file is, else what an `export default NAME` statement names, else
+ * the first exported function or class (`export default class Foo`).
+ */
+function esmDefaultExport(filePath: string, idx: FileExportIndex, context: ResolutionContext): Node | undefined {
+  return idx.defaultComponent ?? defaultExportBindingNode(filePath, idx, context) ?? idx.defaultFnClass;
+}
+
+/**
+ * Whether the module has an ESM default export at all: it is a single-file
+ * component, or a JS-family file with an `export default` statement. A
+ * CommonJS module has none, though its `exports.x = function` declarations are
+ * exported and would feed the first-exported-function guess.
+ */
+function hasEsmDefaultExport(filePath: string, idx: FileExportIndex, context: ResolutionContext): boolean {
+  if (idx.defaultComponent) return true;
+  if (!JS_FAMILY_FILE.test(filePath)) return false;
+  const source = context.readFile(filePath);
+  return !!source && source.includes('default') && ESM_DEFAULT_EXPORT_RE.test(source);
 }
 
 /** What this file exports as `name`: an exported declaration, else a local export clause's binding. */
@@ -409,11 +436,17 @@ const RUST_STDLIB_ROOTS = new Set(['std', 'core', 'alloc', 'proc_macro']);
  * (tsconfig/jsconfig `paths`). Without that check, custom prefixes
  * like `@components/*` would fail the bare-specifier heuristic and
  * be classified as external before alias resolution can run.
+ *
+ * `aliasPrefixes: false` skips that check, for a caller that has already
+ * asked `resolveImportPath` whether an alias maps the specifier to a file.
+ * Matching a prefix proves nothing by itself: a catch-all `"*"` pattern
+ * (`"*": ["./typings/*"]`) has an empty prefix and matches every package.
  */
 export function isExternalImport(
   importPath: string,
   language: Language,
-  context?: ResolutionContext
+  context?: ResolutionContext,
+  options: { aliasPrefixes?: boolean } = {}
 ): boolean {
   // Relative imports are not external
   if (importPath.startsWith('.')) {
@@ -436,7 +469,7 @@ export function isExternalImport(
       return true;
     }
     // Project-defined alias prefix? Treat as local.
-    const aliases = context?.getProjectAliases?.();
+    const aliases = options.aliasPrefixes === false ? null : context?.getProjectAliases?.();
     if (aliases) {
       for (const pat of aliases.patterns) {
         if (importPath.startsWith(pat.prefix)) return false;
@@ -464,9 +497,10 @@ export function isExternalImport(
     }
     // In-module imports look like `<module-path>/sub/pkg` — local to
     // this project. Without the module-path check we'd flag every
-    // cross-package call in a Go monorepo as external (issue #388).
-    const mod = context?.getGoModule?.();
-    if (mod && (importPath === mod.modulePath || importPath.startsWith(mod.modulePath + '/'))) {
+    // cross-package call in a Go monorepo as external (issue #388) — and,
+    // for a module whose go.mod is below the root or beside other modules,
+    // every import of it (#2322).
+    if (context?.getGoPackageDir?.(importPath) != null) {
       return false;
     }
     // `internal/` packages stay local even when go.mod is missing —
@@ -891,6 +925,28 @@ export function isCobolCopybookRef(ref: UnresolvedRef): boolean {
 }
 
 /**
+ * Is this a Dart `import`, `export` or `part`? Its name is the URI, which
+ * names one file (see ./dart-libraries) or none — `dart:async`, a package from
+ * outside the project, a generated part nobody committed — and never a
+ * symbol: the name-matcher took the URI's last segment for a file name
+ * (`package:flutter/foundation.dart` went to riverpod's own foundation.dart)
+ * or bound it to the file's own `import` node.
+ */
+export function isDartImportRef(ref: UnresolvedRef): boolean {
+  return ref.language === 'dart' && ref.referenceKind === 'imports';
+}
+
+/**
+ * Is this a Lua / Luau `require`? It names a module file (see
+ * resolveLuaRequire) or a module from outside the project, never a symbol:
+ * the name-matcher bound `local lfs = require "lfs"` and `local Signal =
+ * require(script.Parent.Signal)` to the local each is assigned to.
+ */
+export function isLuaRequireRef(ref: UnresolvedRef): boolean {
+  return (ref.language === 'lua' || ref.language === 'luau') && ref.referenceKind === 'imports';
+}
+
+/**
  * Resolve a PHP include/require path to a project-relative file path.
  *
  * PHP resolves includes relative to the including file's directory (the
@@ -962,7 +1018,11 @@ function extractJSImports(content: string): ImportMapping[] {
   // type-only form, not a default import named `type` — which every such
   // line used to add, making `type.innerType()` a call on an import.
   // (`import type from './x'` still binds `type`: backtracking gives it back.)
-  const importRegex = /import\s+(?:type\s+(?=[{*]|(?!from\b)\w))?(?:(\w+)\s*,?\s*)?(?:\{([^}]+)\})?\s*(?:(\*)\s+as\s+(\w+))?\s*from\s*['"]([^'"]+)['"]/g;
+  // A binding is any JS identifier, `$` included: `\w` stops at the `$` of
+  // `import $store from './store'`, failing the whole statement. A default
+  // binding is never followed by `{`, so the `${` of a code generator's
+  // `` `import ${name} from '${src}'` `` is no binding.
+  const importRegex = /import\s+(?:type\s+(?=[{*]|(?!from(?![\w$]))[A-Za-z_$]))?(?:([A-Za-z_$][\w$]*)(?![\w${])\s*,?\s*)?(?:\{([^}]+)\})?\s*(?:(\*)\s+as\s+([A-Za-z_$][\w$]*))?\s*from\s*['"]([^'"]+)['"]/g;
 
   let match;
   while ((match = importRegex.exec(content)) !== null) {
@@ -982,15 +1042,17 @@ function extractJSImports(content: string): ImportMapping[] {
     // Named imports
     if (namedImports) {
       // `{ util, type objectUtil }`: an inline `type` modifier is not part of the name.
-      const names = namedImports.split(',').map((s) => s.trim().replace(/^type\s+(?=\w)/, ''));
+      const names = namedImports.split(',').map((s) => s.trim().replace(/^type\s+(?=[A-Za-z_$])/, ''));
       for (const name of names) {
-        const aliasMatch = name.match(/(\w+)\s+as\s+(\w+)/);
+        const aliasMatch = name.match(/([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)/);
         if (aliasMatch) {
           mappings.push({
             localName: aliasMatch[2]!,
             exportedName: aliasMatch[1]!,
             source: source!,
-            isDefault: false,
+            // `{ default as X }` is the default import spelled as a named one;
+            // no module declares an export named `default` to find.
+            isDefault: aliasMatch[1] === 'default',
             isNamespace: false,
           });
         } else if (name) {
@@ -1036,7 +1098,7 @@ function extractJSImports(content: string): ImportMapping[] {
     if (destructured) {
       const names = destructured.split(',').map((s) => s.trim());
       for (const name of names) {
-        const aliasMatch = name.match(/(\w+)\s*:\s*(\w+)/);
+        const aliasMatch = name.match(/([A-Za-z_$][\w$]*)\s*:\s*([A-Za-z_$][\w$]*)/);
         if (aliasMatch) {
           mappings.push({
             localName: aliasMatch[2]!,
@@ -1116,48 +1178,83 @@ function extractPythonImports(content: string): ImportMapping[] {
 }
 
 /**
- * Extract Go import mappings
+ * Extract Go import mappings. An import is bound to the name written before
+ * its path, or else to the name of the package it imports — which the path
+ * alone doesn't settle: `k8s.io/api/core/v1` is package `v1`, while
+ * `go.yaml.in/yaml/v3` and `gopkg.in/yaml.v3` are `yaml`, and
+ * `github.com/mattn/go-sqlite3` is `sqlite3`. So an unaliased import keeps its
+ * last path element and also takes the name goimports assumes for the path,
+ * unless another of the file's imports is bound to that name.
  */
 function extractGoImports(content: string): ImportMapping[] {
-  const mappings: ImportMapping[] = [];
+  const specs: Array<{ name: string | undefined; source: string }> = [];
+  // Only the imports, which Go puts before any other declaration, and without
+  // their comments: a word in one is no name — `"fmt" // for printing` used to
+  // name the next import `printing`. A name is on its path's own line.
+  const code = stripCommentsForRegex(content.slice(0, goImportsEnd(content)), 'go');
 
-  // import "path" or import alias "path"
-  const singleImportRegex = /import\s+(?:(\w+)\s+)?["']([^"']+)["']/g;
+  // import "path" or import name "path"
+  const singleImportRegex = /\bimport\s+(?:([A-Za-z_]\w*)[ \t]*)?["']([^"']+)["']/g;
   let match;
-
-  while ((match = singleImportRegex.exec(content)) !== null) {
-    const [, alias, source] = match;
-    const packageName = source!.split('/').pop()!;
-    mappings.push({
-      localName: alias || packageName,
-      exportedName: '*',
-      source: source!,
-      isDefault: false,
-      isNamespace: true,
-    });
+  while ((match = singleImportRegex.exec(code)) !== null) {
+    specs.push({ name: match[1], source: match[2]! });
   }
 
   // import ( ... ) block
-  const blockImportRegex = /import\s*\(\s*([^)]+)\s*\)/gs;
-  while ((match = blockImportRegex.exec(content)) !== null) {
-    const block = match[1]!;
-    const lineRegex = /(?:(\w+)\s+)?["']([^"']+)["']/g;
+  const blockImportRegex = /\bimport\s*\(\s*([^)]+)\s*\)/g;
+  while ((match = blockImportRegex.exec(code)) !== null) {
+    const lineRegex = /(?:([A-Za-z_]\w*|\.)[ \t]*)?["']([^"']+)["']/g;
     let lineMatch;
-
-    while ((lineMatch = lineRegex.exec(block)) !== null) {
-      const [, alias, source] = lineMatch;
-      const packageName = source!.split('/').pop()!;
-      mappings.push({
-        localName: alias || packageName,
-        exportedName: '*',
-        source: source!,
-        isDefault: false,
-        isNamespace: true,
-      });
+    while ((lineMatch = lineRegex.exec(match[1]!)) !== null) {
+      specs.push({ name: lineMatch[1], source: lineMatch[2]! });
     }
   }
 
+  const mapping = (localName: string, source: string): ImportMapping =>
+    ({ localName, exportedName: '*', source, isDefault: false, isNamespace: true });
+  // A dot import (`. "pkg"`) binds no name of its own; it stays listed under
+  // its last path element.
+  const mappings = specs.map(({ name, source }) =>
+    mapping(name === undefined || name === '.' ? source.split('/').pop()! : name, source));
+  const bound = new Set(mappings.map((m) => m.localName));
+  const assumed = new Map<string, string[]>();
+  for (const { name, source } of specs) {
+    if (name !== undefined) continue;
+    const assumedName = goAssumedPackageName(source);
+    if (assumedName && !bound.has(assumedName)) assumed.set(assumedName, [...(assumed.get(assumedName) ?? []), source]);
+  }
+  // Two imports that assume one name can't both be that package.
+  for (const [localName, sources] of assumed) {
+    if (sources.length === 1) mappings.push(mapping(localName, sources[0]!));
+  }
   return mappings;
+}
+
+/**
+ * Where a Go file's imports end: at its first other top-level declaration, a
+ * line opening with `func`, `type`, `var` or `const` outside a block comment.
+ */
+function goImportsEnd(content: string): number {
+  const decl = /^(?:func|type|var|const)\b/gm;
+  for (let m; (m = decl.exec(content)) !== null;) {
+    if (content.lastIndexOf('/*', m.index) <= content.lastIndexOf('*/', m.index)) return m.index;
+  }
+  return content.length;
+}
+
+/**
+ * The package name goimports assumes for an import path
+ * (ImportPathToAssumedName): its last element that isn't a major version
+ * (`go.yaml.in/yaml/v3` → `yaml`), without a `go-` prefix
+ * (`github.com/mattn/go-sqlite3` → `sqlite3`), cut where an identifier can't
+ * go on (`gopkg.in/yaml.v3` → `yaml`).
+ */
+function goAssumedPackageName(importPath: string): string {
+  const elements = importPath.split('/');
+  let base = elements[elements.length - 1]!;
+  if (elements.length > 1 && /^v\d+$/.test(base)) base = elements[elements.length - 2]!;
+  if (base.startsWith('go-')) base = base.slice(3);
+  return /^[\p{L}\p{Nd}_]*/u.exec(base)![0];
 }
 
 /**
@@ -1371,7 +1468,7 @@ export function extractReExports(content: string, language: Language): ReExport[
     for (const raw of inner.split(',')) {
       const item = raw.trim();
       if (!item) continue;
-      const aliasMatch = item.match(/^(\w+)\s+as\s+(\w+)$/);
+      const aliasMatch = item.match(/^([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)$/);
       if (aliasMatch) {
         out.push({
           kind: 'named',
@@ -1379,7 +1476,7 @@ export function extractReExports(content: string, language: Language): ReExport[
           originalName: aliasMatch[1]!,
           source,
         });
-      } else if (/^\w+$/.test(item)) {
+      } else if (/^[A-Za-z_$][\w$]*$/.test(item)) {
         out.push({
           kind: 'named',
           exportedName: item,
@@ -1632,6 +1729,14 @@ export function resolveViaImport(
     const file = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
     const fileNode = file && file !== ref.filePath ? context.getNodesInFile(file).find((n) => n.kind === 'file') : undefined;
     if (fileNode) return { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' };
+  }
+  // A Dart `import` / `export` URI names a library file, and a `part` URI one
+  // of the library's own files: `package:app/x.dart` is app's lib/x.dart, any
+  // other path is from the file the directive is in.
+  if (isDartImportRef(ref)) {
+    const file = dartDirectiveFile(ref.filePath, ref.referenceName, context);
+    const fileNode = file && file !== ref.filePath ? context.getNodesInFile(file).find((n) => n.kind === 'file') : undefined;
+    return fileNode ? { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' } : null;
   }
   // C/C++ #include references — resolve directly to the included file
   // (file→file edge), bypassing symbol lookup. The extractor emits these
@@ -2470,57 +2575,66 @@ function resolveJavaImportedReference(
 
 /**
  * Resolve a Go cross-package qualified reference (`pkga.FuncX`) by matching
- * the package alias against an in-module import, stripping the module prefix
- * to a project-relative directory, and locating the exported symbol in any
- * `.go` file under that directory. Returns `null` for stdlib / third-party
- * imports (no `go.mod`-relative match) so the rest of `resolveViaImport`
- * can still try the file-based path.
+ * the package alias against an in-project import, mapping the import to the
+ * package's project directory, and locating the exported symbol in a `.go`
+ * file directly in that directory. Returns `null` for stdlib / third-party
+ * imports (no project module declares them) so the rest of
+ * `resolveViaImport` can still try the file-based path.
  */
 function resolveGoCrossPackageReference(
   ref: UnresolvedRef,
   imports: ImportMapping[],
   context: ResolutionContext
 ): ResolvedRef | null {
-  const mod = context.getGoModule?.();
-  if (!mod) return null;
-
   // Qualified call: receiver before `.`, member after. A bare reference
-  // (no dot) is a same-file/in-package call — handled elsewhere.
+  // (no dot) is a same-package name — unless the source spells a package in
+  // front of it: `store.Manager` in a field or a signature, which the index
+  // keeps as `Manager` (#2322).
   const dotIdx = ref.referenceName.indexOf('.');
-  if (dotIdx <= 0) return null;
+  if (dotIdx <= 0) {
+    const imp = goRefQualifier(ref, context);
+    return imp ? findGoPackageMember(ref.referenceName, imp, ref, context) : null;
+  }
   const receiver = ref.referenceName.substring(0, dotIdx);
   const memberName = ref.referenceName.substring(dotIdx + 1);
   if (!memberName) return null;
+  // A parameter or local named like the import holds the call there:
+  // `store := newStore()`, then `store.Get(k)` is no call into package store.
+  if (!goRefQualifier(ref, context)) return null;
 
   for (const imp of imports) {
     if (imp.localName !== receiver) continue;
-    // Only in-module imports map to a known directory.
-    if (imp.source !== mod.modulePath && !imp.source.startsWith(mod.modulePath + '/')) {
-      continue;
-    }
-    const pkgDir = imp.source === mod.modulePath
-      ? ''
-      : imp.source.substring(mod.modulePath.length + 1);
+    const found = findGoPackageMember(memberName, imp, ref, context);
+    if (found) return found;
+  }
+  return null;
+}
 
-    // Look up the member by name and pick the candidate whose file lives
-    // directly in the package directory. Match the immediate parent dir
-    // exactly so a call to `pkga.FuncX` doesn't accidentally land on a
-    // `FuncX` declared in `pkga/subpkg/`.
-    const candidates = context.getNodesByName(memberName);
-    for (const node of candidates) {
-      if (node.language !== 'go') continue;
-      if (!node.isExported) continue;
-      const fp = node.filePath.replace(/\\/g, '/');
-      const lastSlash = fp.lastIndexOf('/');
-      const fileDir = lastSlash >= 0 ? fp.substring(0, lastSlash) : '';
-      if (fileDir === pkgDir) {
-        return {
-          original: ref,
-          targetNodeId: node.id,
-          confidence: 0.9,
-          resolvedBy: 'import',
-        };
-      }
+/**
+ * The exported `memberName` of the project package `imp` names, looked up in
+ * the package's directory: its module's directory followed by the rest of
+ * the import path (#2322). Matched on the immediate directory so `pkga.FuncX`
+ * never lands on a `FuncX` declared in `pkga/subpkg/`. Null when the import
+ * is no project package.
+ */
+function findGoPackageMember(
+  memberName: string,
+  imp: ImportMapping,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  const pkgDir = context.getGoPackageDir?.(imp.source, ref.filePath);
+  if (pkgDir == null) return null;
+  for (const node of context.getNodesByName(memberName)) {
+    if (node.language !== 'go') continue;
+    if (!node.isExported) continue;
+    if (path.posix.dirname(node.filePath.replace(/\\/g, '/')) === pkgDir) {
+      return {
+        original: ref,
+        targetNodeId: node.id,
+        confidence: 0.9,
+        resolvedBy: 'import',
+      };
     }
   }
   return null;
@@ -2603,8 +2717,7 @@ function findExportedSymbolWalk(
     // resolves and the component shows a false 0 callers (#629).
     // A component file IS its default export; otherwise the statement that
     // names the binding beats the first-exported-function guess.
-    const direct =
-      exportIndex.defaultComponent ?? defaultExportBindingNode(filePath, exportIndex, context) ?? exportIndex.defaultFnClass;
+    const direct = esmDefaultExport(filePath, exportIndex, context);
     if (direct) return direct;
     // CommonJS: `module.exports = createApplication`, or `= require('./lib/express')`.
     const commonJs = commonJsDefaultExport(filePath, context);
@@ -2623,6 +2736,22 @@ function findExportedSymbolWalk(
   } else {
     const direct = exportedByName(filePath, exportIndex, want.exportedName, context);
     if (direct) return direct;
+    // `require('./x').default` and `const { default: X } = require('./x')` read
+    // the `default` property of module.exports. A CommonJS module sets it by
+    // name (`exports.default = fn`, the dual `module.exports.default = X`),
+    // found just above. A module written as an ES module sets it to its
+    // default export, `export default class Foo`, which is no named export —
+    // the answer when the module has no such property. Only in the module
+    // asked for: `export * from` never forwards a default.
+    if (
+      depth === 0 &&
+      want.exportedName === 'default' &&
+      ESM_IMPORT_LANGUAGES.has(language) &&
+      hasEsmDefaultExport(filePath, exportIndex, context)
+    ) {
+      const esmDefault = esmDefaultExport(filePath, exportIndex, context);
+      if (esmDefault) return esmDefault;
+    }
   }
 
   // 2. Re-export hit: the file forwards the symbol to another module.
@@ -2887,3 +3016,39 @@ export function isBoundToOutOfRepoImport(
   }
   return false;
 }
+
+/**
+ * The tail a reference that failed to resolve is parked under when its name
+ * is an import binding the module it imports does not declare by that name:
+ * a default import (`import tagsController from './tag/tag.controller'`, a
+ * CommonJS `require`), a namespace import, or an aliased one (`import {
+ * Component as Wrapper }`, `{ default as X }`). Resolution reaches it through
+ * the module, so a sync's retry has to find it by the module: under the
+ * module's {@link moduleTail} ('module:tag'), the key a sync looks up for
+ * every file it adds or changes. Its own name, the default tail, is one the
+ * module never declares, so the file that appears or gains the export never
+ * found it. A sync still looks it up by that name as well: a binding its
+ * module never resolves is linked by the name alone.
+ *
+ * Only a whole-name reference to the binding — the import itself, a call,
+ * `new`, a JSX tag, a value — and only for a module of the project: a member
+ * read (`NS.member`) waits for the member's name, and a package's binding
+ * keeps its tail. Undefined for every other reference.
+ */
+export function importBindingTail(ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  if (!ESM_IMPORT_LANGUAGES.has(ref.language) || !IDENTIFIER.test(ref.referenceName)) return undefined;
+  const binding = context.getImportMappings(ref.filePath, ref.language).find((m) => m.localName === ref.referenceName);
+  if (!binding || (!binding.isDefault && !binding.isNamespace && binding.exportedName === binding.localName)) return undefined;
+  if (isExternalImport(binding.source, ref.language, context) &&
+      // A monorepo app's own tsconfig alias (`#/views/…`): isExternalImport reads the root's only.
+      !context.getNearestAliases?.(ref.filePath)?.patterns.some((p) => p.prefix !== '' && binding.source.startsWith(p.prefix))) {
+    return undefined;
+  }
+  // `..` names a folder through the importing file's own location.
+  const modulePath = binding.source.startsWith('.')
+    ? path.posix.join(path.posix.dirname(ref.filePath), binding.source)
+    : binding.source;
+  return moduleTail(modulePath) || undefined;
+}
+
+const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
