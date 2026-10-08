@@ -611,7 +611,9 @@ export function buildDefaultIgnore(rootDir: string): Ignore {
  * whose gitignore semantics their own `git ls-files` already enforced (#514).
  */
 function defaultsOnlyIgnore(allowVendor = false): Ignore {
-  return excludeBuildOutputUnderSrc(ignore().add(allowVendor ? DEFAULT_IGNORE_PATTERNS.filter((p) => p !== 'vendor/') : DEFAULT_IGNORE_PATTERNS), null);
+  // Only the project-root Android vendor tree is includable; nested vendor
+  // directories remain dependency trees at every depth.
+  return excludeBuildOutputUnderSrc(ignore().add(DEFAULT_IGNORE_PATTERNS.map((p) => allowVendor && p === 'vendor/' ? '/*/**/vendor/' : p)), null);
 }
 
 /**
@@ -4085,7 +4087,8 @@ export class ExtractionOrchestrator {
       // Git supplies candidates, never the verdict. A committed deletion may
       // have been recreated locally; a previously indexed dirty path may have
       // vanished from git status after restore. Classify current disk vs DB once.
-      const candidates = new Set([...gitChanges.deleted, ...gitChanges.modified, ...gitChanges.added, ...dirtyPaths!]);
+      const gitCandidates = new Set([...gitChanges.deleted, ...gitChanges.modified, ...gitChanges.added, ...dirtyPaths!]);
+      const candidates = new Set(gitCandidates);
       const include = loadIncludeMatcher(this.rootDir);
       if (include) {
         for (const file of collectIncludedFilesForRoot(this.rootDir)) candidates.add(file);
@@ -4101,6 +4104,18 @@ export class ExtractionOrchestrator {
         if (!isSourceFile(filePath, overrides, this.rootDir) || scope.ignores(filePath) || !fs.existsSync(fullPath)) {
           if (tracked) removed.push(filePath);
           continue;
+        }
+        // Include-only candidates can be gitignored and need a disk check, but
+        // unchanged size/mtime avoids reading all vendor source on every status.
+        // Keep hashing paths Git or the dirty ledger explicitly reported.
+        if (tracked && !gitCandidates.has(filePath)) {
+          try {
+            const stat = fs.statSync(fullPath);
+            if (stat.size === tracked.size && Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt)) continue;
+          } catch (error) {
+            logDebug('Skipping unstattable file while detecting changes', { filePath, error: String(error) });
+            continue;
+          }
         }
         let content: string | null;
         try { content = readSourceOrStamp(fullPath); }
