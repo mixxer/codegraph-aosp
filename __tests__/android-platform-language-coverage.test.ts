@@ -8,7 +8,7 @@ import { scanDirectory, buildScopeIgnore } from '../src/extraction';
 import { clearProjectConfigCache } from '../src/project-config';
 import { parseAidlDeclarations, findAidlImpl } from '../src/aosp/aidl';
 import { parseHalDeclarations } from '../src/aosp/hal';
-import { isVisibleAcrossFiles } from '../src/resolution/name-matcher';
+import { gateLanguageMatch, isVisibleAcrossFiles } from '../src/resolution/name-matcher';
 import type { ResolutionContext } from '../src/resolution';
 import type { UnresolvedRef } from '../src/resolution/types';
 
@@ -207,8 +207,13 @@ public class Caller {
     expect(callers(hidden.id)).toContain('other/Same.java');
     expect(callers(hidden.id)).not.toContain('q/Other.java');
     expect(callers(open.id)).toContain('q/Other.java');
-    const nodes = [api, ...cg.getNodesByName('Contract'), ...cg.getNodesByKind('namespace')];
-    const context = { getNodesInFile: (file: string) => nodes.filter((node) => node.filePath === file) } as ResolutionContext;
+    const nodes = [...cg.getNodesByKind('method'), ...cg.getNodesByKind('class'), ...cg.getNodesByKind('interface'), ...cg.getNodesByKind('namespace')];
+    const context = {
+      getNodesInFile: (file: string) => nodes.filter((node) => node.filePath === file),
+      getNodeById: (id: string) => nodes.find((node) => node.id === id) ?? null,
+    } as ResolutionContext;
+    const ref = { filePath: 'q/Other.java', language: 'java', referenceName: 'hidden', referenceKind: 'calls' } as UnresolvedRef;
+    expect(gateLanguageMatch({ original: ref, targetNodeId: hidden.id, confidence: 1, resolvedBy: 'import' }, ref, context)).toBeNull();
     expect(isVisibleAcrossFiles(api, { filePath: 'q/Other.java', language: 'java' } as UnresolvedRef, context)).toBe(true);
   });
 });
