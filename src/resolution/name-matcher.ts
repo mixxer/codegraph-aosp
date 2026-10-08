@@ -2808,9 +2808,17 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
     if (candidate.visibility === 'private') return false;
     if (candidate.visibility == null) {
       const fileNodes = context.getNodesInFile(candidate.filePath);
-      const ownerName = candidate.qualifiedName.slice(0, candidate.qualifiedName.lastIndexOf('::'));
-      const owner = fileNodes.find((node) => node.qualifiedName === ownerName);
-      if (owner?.visibility === 'public' &&
+      const ownerOf = (node: Node): Node | undefined => fileNodes.find((parent) =>
+        parent.qualifiedName === node.qualifiedName.split('::').slice(0, -1).join('::'));
+      // A member interface is implicitly public only through an accessible
+      // interface owner; package-private roots and private members stay closed.
+      const isPublic = (node: Node): boolean => {
+        if (node.visibility != null) return node.visibility === 'public';
+        const parent = ownerOf(node);
+        return parent?.kind === 'interface' && isPublic(parent);
+      };
+      const owner = ownerOf(candidate);
+      if (owner && isPublic(owner) &&
           (owner.kind === 'interface' || (owner.kind === 'enum' && candidate.kind === 'enum_member'))) return true;
       const packageName = (nodes: Node[]): string => nodes.find((node) => node.kind === 'namespace')?.name ?? '';
       return packageName(fileNodes) === packageName(context.getNodesInFile(ref.filePath));
