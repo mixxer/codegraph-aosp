@@ -259,6 +259,10 @@ export function gateLanguageMatch(
       }
     }
     if (language !== undefined) {
+      if (language === 'java' && ref.language === 'java') {
+        const target = context.getNodeById(result.targetNodeId);
+        if (target && !isVisibleAcrossFiles(target, ref, context)) return null;
+      }
       if (!crossesCodeBoundary(ref.language, language)) return result;
       const target = context.getNodeById(result.targetNodeId);
       return target && !hasBridgeEvidence(target, ref, context) ? null : result;
@@ -3217,7 +3221,8 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
     const owner = rustModuleDir(candidate.filePath);
     return ref.filePath.startsWith(owner + '/');
   }
-  if (lang === 'java') {
+  // Package namespaces are import targets, not access-controlled members.
+  if (lang === 'java' && candidate.kind !== 'namespace') {
     if (candidate.visibility === 'private') return false;
     if (candidate.visibility == null) {
       const fileNodes = context.getNodesInFile(candidate.filePath);
