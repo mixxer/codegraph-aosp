@@ -1,0 +1,89 @@
+name: CI
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  CODEGRAPH_TELEMETRY: '0'
+  CODEGRAPH_NO_UPDATE_CHECK: '1'
+jobs:
+  portable:
+    name: PR ${{ matrix.pr }} portable Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pr: 1927
+            sha: ca3bb2e4f7cd76f09f5d42b1db52ea7ddcbccc2f
+            node: 22
+          - pr: 1927
+            sha: ca3bb2e4f7cd76f09f5d42b1db52ea7ddcbccc2f
+            node: 24
+          - pr: 1928
+            sha: 9dcb4f9e007fb6ea03e326b1207cc0c8c9af3f04
+            node: 22
+          - pr: 1928
+            sha: 9dcb4f9e007fb6ea03e326b1207cc0c8c9af3f04
+            node: 24
+          - pr: 1948
+            sha: 3a9e74619f6955bebef38d0abe6faaaf90db6873
+            node: 22
+          - pr: 1948
+            sha: 3a9e74619f6955bebef38d0abe6faaaf90db6873
+            node: 24
+          - pr: 1949
+            sha: 33737125e7a5fd336738fcac95bd04d8443a6ba6
+            node: 22
+          - pr: 1949
+            sha: 33737125e7a5fd336738fcac95bd04d8443a6ba6
+            node: 24
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: mkdir -p "$HOME/.ssh"
+      - run: npm test -- --maxWorkers=2 --minWorkers=1
+        env:
+          CODEGRAPH_KERNEL: '0'
+  native:
+    name: PR ${{ matrix.pr }} native and language regressions
+    needs: portable
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pr: 1927
+            sha: ca3bb2e4f7cd76f09f5d42b1db52ea7ddcbccc2f
+          - pr: 1928
+            sha: 9dcb4f9e007fb6ea03e326b1207cc0c8c9af3f04
+          - pr: 1948
+            sha: 3a9e74619f6955bebef38d0abe6faaaf90db6873
+          - pr: 1949
+            sha: 33737125e7a5fd336738fcac95bd04d8443a6ba6
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: bash scripts/build-kernel.sh
+      - run: npm run build
+      - run: test -s codegraph-kernel/prebuilds/linux-x64/codegraph-kernel.node
+      - run: npx vitest run __tests__/kernel-*.test.ts __tests__/aosp-*.test.ts __tests__/kotlin-*.test.ts __tests__/extraction.test.ts __tests__/resolution.test.ts --maxWorkers=2 --minWorkers=1
+        env:
+          CODEGRAPH_KERNEL_EXPECT: '1'
