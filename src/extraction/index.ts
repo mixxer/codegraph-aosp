@@ -476,8 +476,10 @@ export function buildDefaultIgnore(rootDir: string): Ignore {
  * parent repo's own ignore rules must NOT apply — inside embedded child repos,
  * whose gitignore semantics their own `git ls-files` already enforced (#514).
  */
-function defaultsOnlyIgnore(): Ignore {
-  return ignore().add(DEFAULT_IGNORE_PATTERNS);
+function defaultsOnlyIgnore(allowVendor = false): Ignore {
+  // Only the project-root Android vendor tree is includable; nested vendor
+  // directories remain dependency trees at every depth.
+  return ignore().add(DEFAULT_IGNORE_PATTERNS.map((p) => allowVendor && p === 'vendor/' ? '/*/**/vendor/' : p));
 }
 
 /**
@@ -586,7 +588,7 @@ function collectIncludedFiles(
   overrides: Record<string, Language>,
 ): Set<string> {
   const out = new Set<string>();
-  const defaults = defaultsOnlyIgnore();
+  const defaults = defaultsOnlyIgnore(true); // Explicit `include` may select AOSP vendor source.
   const visited = new Set<string>();
 
   const consider = (abs: string, rel: string, isDir: boolean): void => {
@@ -837,6 +839,7 @@ export function preloadLanguagesForFiles(
 export class ScopeIgnore {
   private embedded: Array<{ root: string; matcher: Ignore }>;
   private defaults: Ignore = defaultsOnlyIgnore();
+  private includableDefaults: Ignore = defaultsOnlyIgnore(true);
   constructor(
     private rootMatcher: Ignore,
     embedded: Array<{ root: string; matcher: Ignore }>,
@@ -870,7 +873,7 @@ export class ScopeIgnore {
     // User `include`: force first-party source in despite `.gitignore`. Never
     // resurfaces a built-in default-ignored dir (node_modules/dist/…), so an
     // include pattern can't accidentally pull in dependency/build trees.
-    if (this.include && !this.defaults.ignores(rel)) {
+    if (this.include && !this.includableDefaults.ignores(rel)) {
       if (rel.endsWith('/')) {
         // A directory on (or leading to) an included subtree must stay walkable
         // so the watcher/walker descends to reach the forced-in files.
@@ -3591,7 +3594,15 @@ export class ExtractionOrchestrator {
       // Git supplies candidates, never the verdict. A committed deletion may
       // have been recreated locally; a previously indexed dirty path may have
       // vanished from git status after restore. Classify current disk vs DB once.
-      const candidates = new Set([...gitChanges.deleted, ...gitChanges.modified, ...gitChanges.added, ...dirtyPaths!]);
+      const gitCandidates = new Set([...gitChanges.deleted, ...gitChanges.modified, ...gitChanges.added, ...dirtyPaths!]);
+      const candidates = new Set(gitCandidates);
+      const include = loadIncludeMatcher(this.rootDir);
+      if (include) {
+        for (const file of collectIncludedFilesForRoot(this.rootDir)) candidates.add(file);
+        for (const file of this.queries.getAllFiles()) {
+          if (include.ignores(file.path)) candidates.add(file.path);
+        }
+      }
       const scope = this.scopedSyncMatcher();
       const overrides = loadExtensionOverrides(this.rootDir);
       for (const filePath of candidates) {
@@ -3600,6 +3611,18 @@ export class ExtractionOrchestrator {
         if (!isSourceFile(filePath, overrides, this.rootDir) || scope.ignores(filePath) || !fs.existsSync(fullPath)) {
           if (tracked) removed.push(filePath);
           continue;
+        }
+        // Include-only candidates can be gitignored and need a disk check, but
+        // unchanged size/mtime avoids reading all vendor source on every status.
+        // Keep hashing paths Git or the dirty ledger explicitly reported.
+        if (tracked && !gitCandidates.has(filePath)) {
+          try {
+            const stat = fs.statSync(fullPath);
+            if (stat.size === tracked.size && Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt)) continue;
+          } catch (error) {
+            logDebug('Skipping unstattable file while detecting changes', { filePath, error: String(error) });
+            continue;
+          }
         }
         let content: string | null;
         try { content = readSourceOrStamp(fullPath); }
