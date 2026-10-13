@@ -81,12 +81,16 @@ function cppTypeName(raw: string): TypeName | null {
   const parts: string[] = [];
   const templated: boolean[] = [];
   let depth = 0;
+  let parens = 0;
   let part = '';
   let args = false;
   const text = raw.replace(/\b(?:const|volatile|mutable|typename|template|class|struct|union|enum)\b/g, ' ').replace(/[&*]+/g, ' ');
   for (let i = 0; i < text.length; i++) {
     const c = text[i]!;
-    if (c === '<') {
+    // (In template arguments, a `<` or `>` in parentheses compares: `Bits<(N > 8)>`.)
+    if (depth > 0 && (c === '(' || c === ')')) parens = Math.max(0, parens + (c === '(' ? 1 : -1));
+    else if (parens > 0) continue;
+    else if (c === '<') {
       depth++;
       args = true;
     } else if (c === '>') depth = Math.max(0, depth - 1);
@@ -255,6 +259,17 @@ function localAliasLines(caller: Node, lines: readonly string[], context: Resolu
 }
 
 /**
+ * Does the function making `ref` declare, before it, an alias of the name a
+ * written type starts with — `using Map = std::map<…>;` for `Map`? Such an
+ * alias isn't indexed, so a lookup goes past it; resolveCppAliasedType reads it.
+ */
+export function cppDeclaresLocalAlias(written: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const name = cppTypeName(written);
+  return !!name && !written.trimStart().startsWith('::') &&
+    localAliasedType(name.names[0]!, context.getNodeById?.(ref.fromNodeId), ref, context) !== undefined;
+}
+
+/**
  * The type an alias declared earlier in the calling function names, as
  * written. Those aliases are not indexed, so the function's own lines are
  * read, from the call back to the function's first line.
@@ -349,7 +364,10 @@ export function clearCppTypeAliasMemos(context: ResolutionContext): void {
 function collectTemplateHeader(lines: readonly string[], startLine: number, startColumn: number, names: Set<string>): void {
   const before = [...lines.slice(Math.max(0, startLine - 4), startLine - 1), (lines[startLine - 1] ?? '').slice(0, startColumn)].join('\n');
   const at = before.lastIndexOf('template');
-  const header = at < 0 ? null : /^template\s*<([\s\S]*)>\s*$/.exec(before.slice(at));
+  // Specifiers, attributes and macros may come between the header and where
+  // the declaration starts: protobuf's `template <typename T, typename...
+  // Args>` / `PROTOBUF_NDEBUG_INLINE static T* Create(…)`.
+  const header = at < 0 ? null : /^template\s*<([\s\S]*)>(?:\s*(?:\[\[[^\]]*\]\]|(?:static|inline|constexpr|consteval|virtual|explicit|friend|extern)\b|[A-Z][A-Z0-9]*_[A-Z0-9_]*\b(?:\s*\([^()]*\))?))*\s*$/.exec(before.slice(at));
   if (!header) return;
   for (const item of splitTopLevel(header[1]!)) {
     // `typename T = int`, `template <typename> class Policy`, `typename... Ts`, `int N`.
