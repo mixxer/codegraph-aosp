@@ -1,8 +1,8 @@
 /**
  * Cross-call source dedup (CG-18).
  *
- * A later `codegraph_explore` call in a session must not re-send source an
- * earlier call already delivered — but every byte it withholds has to be
+ * A later `codegraph_explore` call in a session must not re-send substantial
+ * source spans an earlier call delivered — but every byte it withholds has to be
  * replaced by a POINTER, never a silence. That asymmetry is what this suite
  * guards, because the two failure directions cost wildly different amounts: a
  * duplicate range wastes a few thousand chars, while a response that reads as
@@ -252,7 +252,7 @@ describe('a second call against a real index', () => {
     return out;
   }
 
-  it('never re-sends a line it already sent, and points at every line it withholds', async () => {
+  it('never re-sends a substantial span it already sent, and points at every span it withholds', async () => {
     const session = new ExploreSessionState();
     const first = await explore(QUERY, session);
     const second = await explore(QUERY, session);
@@ -265,11 +265,19 @@ describe('a second call against a real index', () => {
     // the pointer names it.
     expect(second).toContain(POINTER);
     for (const [file, lines] of before) {
-      const repeated = [...(after.get(file) ?? [])].filter((n) => lines.has(n));
-      if (repeated.length === 0) continue;
-      // The only sanctioned repeat is the anti-abandonment restore, which fires
-      // ONLY when the call found nothing new to say — and this one did.
-      throw new Error(`call 2 re-sent ${file} lines ${repeated.slice(0, 5).join(',')}`);
+      const repeated = [...(after.get(file) ?? [])].filter((n) => lines.has(n)).sort((a, b) => a - b);
+      // The range algebra deliberately keeps overlaps shorter than a useful
+      // back-reference (MIN_COVERED_LINES), including context padding around a
+      // different selection of symbols. Check actual response lines against
+      // that same policy; a substantial span must still never come back here.
+      let previous = -1;
+      let run = 0;
+      for (const line of repeated) {
+        run = line === previous + 1 ? run + 1 : 1;
+        expect(run, `call 2 re-sent ${file} a run ending at L${line}`)
+          .toBeLessThan(EXPLORE_DEDUP.MIN_COVERED_LINES);
+        previous = line;
+      }
     }
   }, 120_000);
 
