@@ -153,7 +153,10 @@ describe('Android source coverage', () => {
     opened.mockClear();
     expect(cg.getChangedFiles().modified).toEqual([]);
     expect(sourceOpens()).toHaveLength(1);
-    write(file, source.replace('run()', 'stop()')); // Same size, new mtime.
+    const sameSizeChange = source.replace('run()', 'end()');
+    expect(sameSizeChange).not.toBe(source);
+    expect(Buffer.byteLength(sameSizeChange)).toBe(stat.size);
+    write(file, sameSizeChange); // Same size, new mtime.
     fs.utimesSync(path.join(dir, file), stat.atime, new Date(stat.mtimeMs + 4000));
     expect(cg.getChangedFiles().modified).toEqual([file]);
     await cg.sync();
