@@ -164,6 +164,8 @@ export interface SyncResult {
    * nothing downstream.
    */
   definitionDelta?: string[];
+  /** Tracked files this sync found gone and deleted from the index. */
+  removedFilePaths?: string[];
 }
 
 /**
@@ -290,18 +292,22 @@ const DEFAULT_IGNORE_PATTERNS: string[] = [
   // Keep JVM packages named `build` (#1642). Unignore only the directory, not
   // its subtree: other defaults still apply.
   ...JVM_BUILD_PACKAGE_DIRS.map((d) => `!${d}`),
-  // Walk a `build` folder below `src/` too: a JS/TS app can keep a whole
-  // feature there. Only its hand-written source files are indexed — see
-  // buildOutputFolderUnderSrc. Other defaults still apply inside it.
+  // Walk a `build` folder below `src/` too: a project can keep a whole
+  // feature or module there. Only its hand-written source files are indexed
+  // — see buildOutputFolderUnderSrc. Other defaults still apply inside it.
   '!**/src/**/build/',
 ];
 
 /**
- * Source files no compiler or bundler writes: TypeScript (with its module and
- * ArkTS variants), JSX, and Vue, Svelte and Astro components. Build steps emit
- * JavaScript, declarations, CSS, HTML and source maps instead.
+ * Source files no compiler or bundler writes into a build folder: TypeScript
+ * (with its module and ArkTS variants), JSX, and Vue, Svelte and Astro
+ * components, whose builds emit JavaScript, declarations, CSS, HTML and
+ * source maps instead; and Go, C# and Rust, whose toolchains write elsewhere
+ * (Go's binaries, .NET's `bin/` and `obj/`, Cargo's `target/`). Python, C and
+ * C++, PHP and Java are left out: setuptools and frozen apps copy `.py` into
+ * `build/`, CMake generates C and C++ there, WordPress builds `build/*.php`.
  */
-const HAND_WRITTEN_SOURCE = /\.(?:[mc]?ts|tsx|ets|jsx|vue|svelte|astro)$/i;
+const HAND_WRITTEN_SOURCE = /\.(?:[mc]?ts|tsx|ets|jsx|vue|svelte|astro|go|cs|rs)$/i;
 /** TypeScript declarations, which `tsc` writes beside its JavaScript. */
 const DECLARATION_FILE = /\.d\.(?:[mc]?ts|ets)$/i;
 /** Matches the JVM packages named `build`, whose whole subtree stays indexed. */
@@ -332,11 +338,12 @@ function srcBuildFolderOf(rel: string): string | null {
  * When `rel` is a file in a `build` folder below `src/` that a build step could
  * have written, that folder (see {@link srcBuildFolderOf}); otherwise null.
  *
- * The folder itself is walked: JS/TS apps keep real source there (luci-go
- * milo's whole `src/build/` feature). But an output tree built or copied into
- * `src/` — a nested CRA app's `build/`, a vendored pdf.js, a Laravel
- * `public/build` — holds JavaScript, CSS, HTML and maps, never TypeScript, JSX
- * or components, so only those hand-written types are indexed from it. Paths
+ * The folder itself is walked: projects keep real source there (luci-go
+ * milo's whole `src/build/` feature, Go's `src/go/build`, a .NET solution's
+ * `src/Build/` project). But an output tree built or copied into `src/` — a
+ * nested CRA app's `build/`, a vendored pdf.js, a Laravel `public/build` —
+ * holds JavaScript, CSS, HTML and maps, never {@link HAND_WRITTEN_SOURCE}, so
+ * only those hand-written types are indexed from it. Paths
  * without an extension are left alone: they are directories (a watcher event
  * for a removed folder carries no trailing slash), never files a build writes.
  */
@@ -3333,6 +3340,130 @@ export class ExtractionOrchestrator {
   }
 
   /**
+   * Re-open resolution edges whose answer was READ from a file this sync
+   * touched, although neither end of the edge changed: a python attribute typed
+   * through a factory or a base class in another file records those files as
+   * `metadata.typeFrom`. The definition delta cannot see these — editing what a
+   * factory returns, or what a base `__init__` assigns, adds or removes no
+   * definition — so without this a synced index keeps the old type forever.
+   * The edges go back to pending refs; returns the files they come from, whose
+   * pending rows the caller resolves.
+   */
+  resurrectTypeDependentEdges(touchedPaths: string[], changedFilePaths: string[]): string[] {
+    const touched = new Set(touchedPaths.filter((p) => /\.pyi?$/.test(p)));
+    if (touched.size === 0) return [];
+    const alreadyFresh = new Set(changedFilePaths);
+
+    const edgeIds: number[] = [];
+    const refs: UnresolvedReference[] = [];
+    const files = new Set<string>();
+    for (const e of this.queries.getEdgesWithTypeFrom()) {
+      if (alreadyFresh.has(e.sourceFilePath)) continue;
+      const from = e.metadata?.typeFrom;
+      if (!Array.isArray(from) || !from.some((f) => typeof f === 'string' && touched.has(f))) continue;
+      const ref = resurrectRefFromDroppedEdge(e);
+      if (!ref) continue;
+      edgeIds.push(e.edgeId);
+      refs.push(ref);
+      files.add(e.sourceFilePath);
+    }
+    if (refs.length === 0) return [];
+    this.queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
+    return [...files];
+  }
+
+  /**
+   * Re-open every resolution a language made, for the sync's sweep to redo
+   * against the current graph — the answer when an input to that language's
+   * resolution changed project-wide rather than per definition. Python
+   * package roots are that kind of input: an added `__init__.py` or an edited
+   * `pyproject.toml` moves where modules start for importers in files the
+   * sync never touched, and CG-33's per-name rebind can't see it. Parked
+   * failures are re-queued too, since some of them now resolve. Same
+   * conservatism as {@link resurrectStaleResolutionEdges}: an edge without a
+   * refName stamp is never deleted.
+   */
+  resurrectResolutionEdgesForLanguage(language: Language): number {
+    return (
+      this.reopenEdges(this.queries.getResolutionEdgesBySourceLanguage(language)) +
+      this.queries.requeueFailedReferencesByLanguage(language)
+    );
+  }
+
+  /**
+   * The narrow form, for modules or packages that appeared or vanished below
+   * an unchanged set of roots: re-open the edges whose target lies in
+   * `targetFiles` or whose source lies under `sourceDirs`, and re-queue the
+   * parked failures naming one of `moduleLeaves`. Returns the files whose
+   * references were re-opened.
+   */
+  resurrectResolutionEdgesTouching(
+    language: Language,
+    scope: { targetFiles: string[]; sourceDirs: string[]; moduleLeaves: string[] }
+  ): string[] {
+    const files = new Set<string>();
+    const edges = this.queries.getResolutionEdgesTouchingFiles(language, scope.targetFiles, scope.sourceDirs, scope.moduleLeaves);
+    for (const e of edges) files.add(e.sourceFilePath);
+    this.reopenEdges(edges);
+    this.queries.requeueFailedReferencesByLanguage(language, scope.moduleLeaves, files);
+    return [...files];
+  }
+
+  /**
+   * Re-open what importers bound from a Python package whose `__init__.py`
+   * was edited: in each importing file, the edges and parked failures whose
+   * reference starts with a name bound from that package (`N`, `N.run`,
+   * `pkg.N`). A def or re-export added, removed or repointed there moves
+   * exactly those answers — `from pkg import N` prefers what `__init__.py`
+   * binds over a submodule `pkg/N` — and nothing in the importer's other
+   * references. A name whose import edge already lands where the package
+   * binds it now is left alone, so an edit that moves nothing re-resolves
+   * nothing. Returns the files whose references were re-opened.
+   */
+  resurrectPythonPackageImporters(bindings: Map<string, Map<string, string | null>>): string[] {
+    if (bindings.size === 0) return [];
+    const edges = this.queries.getResolutionEdgesFromFiles('python', [...bindings.keys()]);
+    const refHead = (e: { metadata?: Record<string, unknown> }): string | null => {
+      const refName = e.metadata?.refName;
+      return typeof refName === 'string' ? refName.split('.')[0]! : null;
+    };
+    // Where each bound name's own import edge lands today.
+    const bindsNow = new Map<string, string>();
+    for (const e of edges) {
+      const refName = e.metadata?.refName;
+      if (e.kind !== 'imports' || typeof refName !== 'string' || refName.includes('.')) continue;
+      const target = this.queries.getNodeById(e.target);
+      if (target) bindsNow.set(`${e.sourceFilePath}\0${refName}`, `${target.filePath}\0${target.kind === 'file' ? '' : target.name}`);
+    }
+    const moved = new Map<string, Set<string>>();
+    for (const [file, names] of bindings) {
+      for (const [name, binding] of names) {
+        if (binding !== null && bindsNow.get(`${file}\0${name}`) === binding) continue;
+        let set = moved.get(file);
+        if (!set) moved.set(file, (set = new Set()));
+        set.add(name);
+      }
+    }
+    if (moved.size === 0) return [];
+    this.reopenEdges(edges.filter((e) => moved.get(e.sourceFilePath)?.has(refHead(e) ?? '') === true));
+    this.queries.requeueFailedReferencesBinding('python', moved);
+    return [...moved.keys()];
+  }
+
+  private reopenEdges(edges: Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }>): number {
+    const edgeIds: number[] = [];
+    const refs: UnresolvedReference[] = [];
+    for (const e of edges) {
+      const ref = resurrectRefFromDroppedEdge(e);
+      if (!ref) continue;
+      edgeIds.push(e.edgeId);
+      refs.push(ref);
+    }
+    if (refs.length > 0) this.queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
+    return refs.length;
+  }
+
+  /**
    * Sync the index with the current file state.
    *
    * Change detection is filesystem-based, never git: a (size, mtime) stat
@@ -3370,6 +3501,7 @@ export class ExtractionOrchestrator {
     let nodesUpdated = 0;
     const changedFilePaths: string[] = [];
     const addedFilePaths: string[] = [];
+    const removedFilePaths: string[] = [];
     // `file\0name` definition pairs for the files this sync touches, sampled
     // BEFORE their nodes are replaced/deleted. Compared against the post-store
     // pairs below to derive `definitionDelta` (CG-33).
@@ -3479,6 +3611,7 @@ export class ExtractionOrchestrator {
       }
       onFileChange?.(tracked.path);
       this.queries.deleteFile(tracked.path);
+      removedFilePaths.push(tracked.path);
       filesRemoved++;
     };
     const removed: FileRecord[] = [];
@@ -3639,6 +3772,7 @@ export class ExtractionOrchestrator {
       ...(addedFilePaths.length > 0 ? { addedFilePaths } : {}),
       ...(failedFilePaths.length > 0 ? { failedFilePaths } : {}),
       definitionDelta: definitionDelta.length > 0 ? definitionDelta : undefined,
+      ...(removedFilePaths.length > 0 ? { removedFilePaths } : {}),
     };
   }
 

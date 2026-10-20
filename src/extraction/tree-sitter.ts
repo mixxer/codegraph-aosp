@@ -24,7 +24,7 @@ import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs, isCppConstructorDeclaration, cDeclaratorIdentifier, isClassLikeDefinition } from './languages/c-cpp';
 import { NestedIntervals, scanCppBraceScopes, type CppBraceScopes } from './languages/cpp-brace-scopes';
 import { appendCppMacroMethods } from './languages/cpp-macro-methods';
-import { rustImplTypeName } from './languages/rust';
+import { rustImplItemOwner, rustImplTypeName } from './languages/rust';
 import { goAliasTypeNames, goEmbeddedTypeName, goInterfaceMethodTypeNames, goStructFieldTypeNames } from './languages/go';
 import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeRefs } from './languages/dart';
 import { LiquidExtractor } from './liquid-extractor';
@@ -533,6 +533,21 @@ const TS_JS_TRANSPARENT_RECEIVER_TYPES = new Set([
 ]);
 
 /**
+ * tree-sitter-typescript parses `await f<T>(x)` as a call whose callee is
+ * `await f` (#2586); the call is to `f`. Peels every `await`, skipping a
+ * comment written after one. Mirrored in the kernel (tsjs/extractors.rs).
+ */
+function peelTsAwaitCallee(node: SyntaxNode): SyntaxNode {
+  let cur = node;
+  while (cur.type === 'await_expression') {
+    const inner = cur.namedChildren.find((c: SyntaxNode) => c.type !== 'comment');
+    if (!inner) break;
+    cur = inner;
+  }
+  return cur;
+}
+
+/**
  * Strip {@link TS_JS_TRANSPARENT_RECEIVER_TYPES} wrappers off a receiver.
  * tree-sitter-typescript parses `a && b!.c()` as `(a && b)!.c()`; the `!`
  * belongs to the right operand, so a non-null over a binary expression peels
@@ -638,12 +653,16 @@ export class TreeSitterExtractor {
   private cppBraceScopes: CppBraceScopes | null = null;
   private cppClassScopes = new NestedIntervals<string>();
   private cppClassScopeIds = new Set<string>();
-  // C/C++: whether a class, struct, union or enum defined in the type of a
-  // declaration outside any body is walked (see visitNode). Not in a C++ file
-  // whose tree has errors and whose braces don't balance: error recovery can
-  // close a namespace or a class at the wrong `}`, or run a class past its
-  // own, and with no brace scopes to correct it the walked class would land
-  // in the wrong scope.
+  // C, C++ and Objective-C: whether a class, struct, union or enum defined in
+  // the type of a declaration outside any body is walked (see visitNode). Not
+  // in a C++ file whose tree has errors and whose braces don't balance: error
+  // recovery can close a namespace or a class at the wrong `}`, or run a class
+  // past its own, and with no brace scopes to correct it the walked class
+  // would land in the wrong scope. C and Objective-C files take the walk even
+  // with errors: neither grammar has a namespace or a class written as a type
+  // (an @interface or @implementation is not one), and a struct, union or
+  // enum body holds fields and enumerators, not functions. Most Objective-C
+  // trees have errors; a macro such as `NS_ASSUME_NONNULL_BEGIN` is enough.
   private walkDeclaredTypes = false;
   // C++ local function-pointer bindings, per enclosing symbol:
   // `auto kernel = &flash_fwd_kernel<…>;` recorded as callerId → kernel →
@@ -747,6 +766,7 @@ export class TreeSitterExtractor {
       }
       this.walkDeclaredTypes =
         this.language === 'c' ||
+        this.language === 'objc' ||
         (this.language === 'cpp' && (!this.tree.rootNode.hasError || this.cppBraceScopes !== null));
 
       // Create file node representing the source file
@@ -1386,6 +1406,12 @@ export class TreeSitterExtractor {
         skipChildren = true; // extractFunction visits children via visitFunctionBody
       }
     }
+    // A bodiless function that no implementation follows: a TypeScript
+    // `declare function`, a `.d.ts` file's own or its `declare module` body's.
+    else if (nodeType === 'function_signature' && this.extractor.isAmbientFunction?.(node, this.filePath)) {
+      this.extractFunction(node);
+      skipChildren = true;
+    }
     // Check for class declarations
     else if (this.extractor.classTypes.includes(nodeType)) {
       // Some languages reuse class_declaration for structs/enums (e.g. Swift)
@@ -1513,18 +1539,24 @@ export class TreeSitterExtractor {
     // languages) keep almost exclusively inside a class/module. A Ruby `CONST =
     // …` has a `constant`-typed LHS; other languages don't put one here, so this
     // is effectively Ruby-only and doesn't disturb their class-internal locals.
+    // An Objective-C declaration written in an `@implementation`
+    // (`static NSString *const kKey = @"…";`) is file-scope C, though it sits
+    // between `@implementation` and `@end`.
     else if (
       this.extractor.variableTypes.includes(nodeType) &&
-      (!this.isInsideClassLikeNode() || this.isClassScopeConstantAssignment(node))
+      (!this.isInsideClassLikeNode() ||
+        this.isClassScopeConstantAssignment(node) ||
+        (this.language === 'objc' && node.parent?.type === 'implementation_definition'))
     ) {
-      // C/C++: a class, struct, union or enum defined in the declaration's
-      // type (`struct Foo { … } foo;`, `static struct { … } SPT;`) is a
-      // definition like one written on its own, and the variables keep their
-      // nodes beside it. So is a class the tree reads as a declaration's type
-      // in a file walked in brace scopes (`class X {…}` glued to the tokens
-      // after it by error recovery). In a class or function body the children
-      // walk reaches it; here, this branch skips that walk. Mirrored in the
-      // kernel (ccpp/mod.rs visit_node).
+      // C, C++ and Objective-C: a class, struct, union or enum defined in the
+      // declaration's type (`struct Foo { … } foo;`, `static struct { … }
+      // SPT;`) is a definition like one written on its own, and the variables
+      // keep their nodes beside it. So is a class the tree reads as a
+      // declaration's type in a file walked in brace scopes (`class X {…}`
+      // glued to the tokens after it by error recovery). In a class or
+      // function body the children walk reaches it; here, this branch skips
+      // that walk. Mirrored in the kernel (ccpp/mod.rs visit_node), which has
+      // no Objective-C walker.
       const declaredType = this.walkDeclaredTypes ? getChildByField(node, 'type') : null;
       const definedType = declaredType && isClassLikeDefinition(declaredType) ? declaredType : null;
       if (definedType) this.visitNode(definedType);
@@ -3714,8 +3746,8 @@ export class TreeSitterExtractor {
         const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
         this.createNode(kind, target.name, nameNode, { docstring, signature: initSignature, isExported });
       });
-    } else if (this.language === 'c') {
-      // C: a `declaration` node's name nests inside the `declarator` field —
+    } else if (this.language === 'c' || this.language === 'objc') {
+      // C and Objective-C: a `declaration` node's name nests inside the `declarator` field —
       // `init_declarator` (with value) or bare/pointer/array declarators (no
       // value); a `function_declarator` is a prototype, not a variable. The
       // generic fallback below only finds a *direct* identifier child, which C
@@ -3738,11 +3770,15 @@ export class TreeSitterExtractor {
           // a spurious type-named global for every macro-prefixed prototype in a
           // header. Those misparses are always bare identifiers; real
           // consts/tables always carry an initializer. The only legit loss is
-          // uninitialized scalar globals (`static int g;`).
+          // uninitialized scalar globals (`static int g;`). Objective-C keeps
+          // them, as it did before it shared this branch: until then it read
+          // nothing but bare identifiers, and missed every
+          // `NSString *const kKey = @"…";`.
           if (
             child.type !== 'init_declarator' &&
             child.type !== 'pointer_declarator' &&
-            child.type !== 'array_declarator'
+            child.type !== 'array_declarator' &&
+            !(this.language === 'objc' && child.type === 'identifier')
           ) {
             continue;
           }
@@ -3775,6 +3811,8 @@ export class TreeSitterExtractor {
       // Generic fallback for other languages
       // Try to find identifier children
       const nameField = getChildByField(node, 'name');
+      // A Rust impl's associated const is its type's (`Limits::MAX`), as its methods are.
+      const owner = this.language === 'rust' ? rustImplItemOwner(node, this.source) : undefined;
       let declared: Node | null = null;
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
@@ -3787,6 +3825,7 @@ export class TreeSitterExtractor {
             const created = this.createNode(kind, name, child, {
               docstring,
               isExported,
+              ...(owner !== undefined ? { qualifiedName: `${owner}::${name}` } : {}),
             });
             if (created && nameField && child.startIndex === nameField.startIndex) {
               declared = created;
@@ -3982,9 +4021,16 @@ export class TreeSitterExtractor {
       return true;
     }
 
+    const owner = this.language === 'rust' ? rustImplItemOwner(node, this.source) : undefined;
     const typeAliasNode = this.createNode('type_alias', name, node, {
       docstring,
       isExported,
+      // A Rust alias is private to its module unless `pub` (any form): the
+      // resolver keeps a private one to its own module (isRustNameInScope).
+      ...(this.language === 'rust' ? { visibility: this.extractor.getVisibility?.(node) } : {}),
+      // An impl's associated type is its type's (`ValueHint::Err`), named only
+      // through a path, never bare (isRustAssociatedItem).
+      ...(owner !== undefined ? { qualifiedName: `${owner}::${name}` } : {}),
     });
 
     // Extract type references from the alias value (e.g., `type X = ITextModel | null`)
@@ -5230,6 +5276,10 @@ export class TreeSitterExtractor {
 
     // Get the function/method being called
     let calleeName = '';
+    // Where the call's reference sits: the call itself, or the callee an
+    // `await` was peeled off (`await f<T>(x)` starts at `await`; the call to
+    // `f` starts where `f` does, as in `await f(x)`).
+    let refStart = node.startPosition;
 
     // Java/Kotlin method_invocation has 'object' + 'name' fields instead of 'function'
     // PHP member_call_expression has 'object' + 'name', scoped_call_expression has 'scope' + 'name'
@@ -5410,6 +5460,11 @@ export class TreeSitterExtractor {
       }
     } else {
       let func = getChildByField(node, 'function') || node.namedChild(0);
+      if (func && (this.language === 'typescript' || this.language === 'tsx' || this.language === 'arkts')) {
+        const peeled = peelTsAwaitCallee(func);
+        if (peeled !== func) refStart = peeled.startPosition;
+        func = peeled;
+      }
 
       if (func && this.language === 'swift') {
         // `-(a + b)`: an operator token applied to a parenthesized value
@@ -5696,7 +5751,8 @@ export class TreeSitterExtractor {
               // static receiver at all — emit nothing: a silent miss, never a
               // wrong edge. The inner call is visited on its own either way.
               // Mirrored in the kernel (tsjs/extractors.rs, python.rs).
-              const innerFn = getChildByField(receiver, 'function');
+              let innerFn = getChildByField(receiver, 'function');
+              if (innerFn && (this.language === 'typescript' || this.language === 'tsx')) innerFn = peelTsAwaitCallee(innerFn);
               const innerCallee = innerFn ? getNodeText(innerFn, this.source).replace(/\s+/g, '') : '';
               if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(innerCallee)) return;
               calleeName = `${innerCallee}().${methodName}`;
@@ -5755,6 +5811,21 @@ export class TreeSitterExtractor {
               // Emit nothing: a silent miss, never a wrong edge. Mirrored in
               // the kernel's extract_call (tsjs/extractors.rs).
               return;
+            } else if (this.language === 'python' && receiver) {
+              // Any receiver shape the branches above do not claim — attribute
+              // chain (`self.data.append`) and subscript (`d[k].append`). The
+              // call-chain shape (`rows.setdefault(k, []).append(x)`) is taken
+              // by the `<inner>().<method>` branch above (#1748), which runs
+              // first. These previously fell through to a bare methodName. A
+              // bare name matching a common
+              // list/dict/str method (`append`, `get`, `update`, ...) can exact-match
+              // an unrelated top-level project function sharing that name, fabricating
+              // a call edge (#66, same class as #1230/#1276). Keep the receiver's
+              // source text as a qualifier so the ref can only resolve through
+              // import/module-member resolution, never the bare-name fallback; an
+              // unresolvable qualifier is a silent miss, never a wrong edge.
+              const receiverText = getNodeText(receiver, this.source).replace(/\s+/g, ' ').trim();
+              calleeName = receiverText ? `${receiverText}.${methodName}` : methodName;
             } else {
               calleeName = methodName;
             }
@@ -5837,8 +5908,8 @@ export class TreeSitterExtractor {
         fromNodeId: callerId,
         referenceName: calleeName,
         referenceKind: 'calls',
-        line: node.startPosition.row + 1,
-        column: node.startPosition.column,
+        line: refStart.row + 1,
+        column: refStart.column,
       });
     }
   }
