@@ -669,6 +669,29 @@ function includeStaticRoots(patterns: string[]): string[] {
   return all.filter((r) => !all.some((other) => other !== r && r.startsWith(other)));
 }
 
+interface VendorInclude {
+  matcher: Ignore;
+  roots: string[];
+}
+
+/** Broad includes do not opt dependency trees in; root vendor source needs its own pattern. */
+function buildVendorInclude(patterns: string[]): VendorInclude | null {
+  const rooted = patterns.filter((p) => /^\/*vendor(?:\/|$)/i.test(p));
+  if (rooted.length === 0) return null;
+  return {
+    matcher: ignore().add(patterns.filter((p) => p.startsWith('!') || rooted.includes(p))),
+    roots: includeStaticRoots(rooted),
+  };
+}
+
+function permitsVendorInclude(rel: string, vendor: VendorInclude | null): boolean {
+  if (!/^vendor(?:\/|$)/i.test(rel)) return true;
+  if (!vendor) return false;
+  return rel.endsWith('/')
+    ? vendor.roots.some((root) => root.startsWith(rel) || rel.startsWith(root))
+    : vendor.matcher.ignores(rel);
+}
+
 /**
  * Actively discover the source files an `include` whitelist forces in. `git
  * ls-files` never lists gitignored files, so a filtered filesystem walk of just
@@ -685,16 +708,17 @@ function collectIncludedFiles(
   rootDir: string,
   include: Ignore,
   exclude: Ignore | null,
-  roots: string[],
+  patterns: string[],
   overrides: Record<string, Language>,
 ): Set<string> {
   const out = new Set<string>();
   const defaults = defaultsOnlyIgnore(true); // Explicit `include` may select AOSP vendor source.
+  const vendor = buildVendorInclude(patterns);
   const visited = new Set<string>();
 
   const consider = (abs: string, rel: string, isDir: boolean): void => {
     if (isDir) {
-      if (defaults.ignores(rel + '/')) return; // never node_modules/dist/… via include
+      if (defaults.ignores(rel + '/') || !permitsVendorInclude(rel + '/', vendor)) return;
       // An explicit `exclude` always wins over `include`; prune the whole subtree
       // here so a large excluded dir (a committed frontend's own vendored deps,
       // build output, …) is never walked — the per-file guard below still catches
@@ -702,7 +726,7 @@ function collectIncludedFiles(
       if (exclude && exclude.ignores(rel + '/')) return;
       walk(abs);
     } else {
-      if (defaults.ignores(rel)) return;
+      if (defaults.ignores(rel) || !permitsVendorInclude(rel, vendor)) return;
       if (!include.ignores(rel)) return;
       if (exclude && exclude.ignores(rel)) return;
       if (!isSourceFile(rel, overrides, rootDir)) return;
@@ -744,7 +768,7 @@ function collectIncludedFiles(
     }
   }
 
-  for (const root of roots) {
+  for (const root of includeStaticRoots(patterns)) {
     walk(root === '' ? rootDir : path.join(rootDir, root));
   }
   return out;
@@ -759,8 +783,7 @@ function collectIncludedFiles(
 function collectIncludedFilesForRoot(rootDir: string): Set<string> {
   const include = loadIncludeMatcher(rootDir);
   if (!include) return new Set();
-  const roots = includeStaticRoots(loadIncludePatterns(rootDir));
-  return collectIncludedFiles(rootDir, include, loadExcludeMatcher(rootDir), roots, loadExtensionOverrides(rootDir));
+  return collectIncludedFiles(rootDir, include, loadExcludeMatcher(rootDir), loadIncludePatterns(rootDir), loadExtensionOverrides(rootDir));
 }
 
 /**
@@ -961,6 +984,7 @@ export class ScopeIgnore {
      */
     private include: Ignore | null = null,
     private includeRoots: string[] = [],
+    private vendorInclude: VendorInclude | null = null,
   ) {
     // Longest root first so paths in nested embedded repos hit the innermost matcher.
     this.embedded = [...embedded].sort((a, b) => b.root.length - a.root.length);
@@ -974,7 +998,7 @@ export class ScopeIgnore {
     // User `include`: force first-party source in despite `.gitignore`. Never
     // resurfaces a built-in default-ignored dir (node_modules/dist/…), so an
     // include pattern can't accidentally pull in dependency/build trees.
-    if (this.include && !this.includableDefaults.ignores(rel)) {
+    if (this.include && !this.includableDefaults.ignores(rel) && permitsVendorInclude(rel, this.vendorInclude)) {
       if (rel.endsWith('/')) {
         // A directory on (or leading to) an included subtree must stay walkable
         // so the watcher/walker descends to reach the forced-in files.
@@ -1022,6 +1046,7 @@ export function buildScopeIgnore(rootDir: string, embeddedRoots?: Iterable<strin
     loadExcludeMatcher(rootDir),
     include,
     include ? includeStaticRoots(loadIncludePatterns(rootDir)) : [],
+    include ? buildVendorInclude(loadIncludePatterns(rootDir)) : null,
   );
 }
 
