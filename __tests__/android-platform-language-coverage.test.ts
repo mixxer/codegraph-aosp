@@ -4,7 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { CodeGraph } from '../src';
-import { scanDirectory, buildScopeIgnore } from '../src/extraction';
+import { scanDirectory, scanDirectoryAsync, buildScopeIgnore } from '../src/extraction';
 import { clearProjectConfigCache } from '../src/project-config';
 import { parseAidlDeclarations, findAidlImpl } from '../src/aosp/aidl';
 import { parseHalDeclarations } from '../src/aosp/hal';
@@ -127,6 +127,42 @@ describe('Android source coverage', () => {
     expect(cg.getNodesByName('VendorFeature')).toHaveLength(1);
     expect(cg.getNodesByName('Device')).toHaveLength(1);
     expect(cg.getNodesByName('noise')).toHaveLength(0);
+  });
+
+  it.each(['filesystem', 'git'])('admits vendor files only through their own vendor-rooted include (%s)', async (mode) => {
+    write('src/Main.go', 'package main; func Main() {}');
+    write('vendor/oem/Thing.java', 'package oem; public class Thing {}');
+    const excluded = ['vendor/dep/X.go', 'vendor/oem/Unexpected.go', 'vendor/oem/excluded/Hidden.java'];
+    for (const file of excluded) write(file, 'package noise;');
+    write('.gitignore', 'vendor/\n');
+    if (mode === 'git') {
+      execFileSync('git', ['init', '-q'], { cwd: dir });
+      execFileSync('git', ['add', '-A'], { cwd: dir });
+      // Tracked dependencies must respect the same include policy as ignored files.
+      execFileSync('git', ['add', '-f', 'vendor'], { cwd: dir });
+      execFileSync('git', ['-c', 'user.email=a@b.c', '-c', 'user.name=t', 'commit', '-qm', 'base'], { cwd: dir });
+    }
+    for (const include of [
+      ['**/*.go'],
+      ['vendor/oem/**/*.java', '**/*.go', '!vendor/oem/excluded/**'],
+      ['**/*.go', '/vendor/oem/**/*.java', '!vendor/oem/excluded/**'],
+    ]) {
+      write('codegraph.json', JSON.stringify({ include }));
+      clearProjectConfigCache();
+      const scope = buildScopeIgnore(dir);
+      const vendorOptIn = include.length > 1;
+      expect(scope.ignores('vendor/')).toBe(!vendorOptIn);
+      expect(scope.ignores('vendor/dep/')).toBe(true);
+      expect(scope.ignores('vendor/oem/Thing.java')).toBe(!vendorOptIn);
+      for (const files of [scanDirectory(dir), await scanDirectoryAsync(dir)]) {
+        expect(files).toContain('src/Main.go');
+        expect(files.includes('vendor/oem/Thing.java')).toBe(vendorOptIn);
+        for (const file of excluded) {
+          expect(files).not.toContain(file);
+          expect(scope.ignores(file)).toBe(true);
+        }
+      }
+    }
   });
 
   it('does not read unchanged included source during git status checks', async () => {
@@ -257,5 +293,28 @@ public class Caller {
     const ref = { filePath: 'q/Other.java', language: 'java', referenceName: 'hidden', referenceKind: 'calls' } as UnresolvedRef;
     expect(gateLanguageMatch({ original: ref, targetNodeId: hidden.id, confidence: 1, resolvedBy: 'import' }, ref, context)).toBeNull();
     expect(isVisibleAcrossFiles(api, { filePath: 'q/Other.java', language: 'java' } as UnresolvedRef, context)).toBe(true);
+  });
+
+  it('keeps private Java overloads inaccessible from another file', async () => {
+    write('p/Utility.java', `package p;
+public class Utility {
+  public static void pick() {}
+  private static void pick(String value) {}
+  public static void inside() { pick("ok"); }
+}`);
+    write('q/Caller.java', `package q;
+import p.Utility;
+public class Caller {
+  void invalid() { Utility.pick("hidden"); }
+  void valid() { Utility.pick(); }
+}`);
+    cg = await CodeGraph.init(dir, { index: true });
+    const methods = cg.getNodesInFile('p/Utility.java').filter((n) => n.name === 'pick');
+    const hidden = methods.find((n) => n.visibility === 'private')!;
+    expect(hidden).toBeDefined();
+    expect(cg.getCallers(hidden.id).map((c) => c.node.filePath)).toContain('p/Utility.java');
+    expect(cg.getCallers(hidden.id).map((c) => c.node.filePath)).not.toContain('q/Caller.java');
+    const publicOverload = methods.find((n) => n.visibility === 'public')!;
+    expect(cg.getCallers(publicOverload.id).map((c) => c.node.name)).toContain('valid');
   });
 });
