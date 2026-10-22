@@ -45,6 +45,7 @@ jobs:
         run: npm test -- --maxWorkers=2 --minWorkers=1
 
   kernel:
+    needs: test
     name: Native kernel and AOSP
     runs-on: ubuntu-22.04
     timeout-minutes: 45

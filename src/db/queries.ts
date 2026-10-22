@@ -23,6 +23,7 @@ import { parseQuery, boundedEditDistance } from '../search/query-parser';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { splitIdentifierSegments } from '../search/identifier-segments';
 import { isModuleKey, referenceNameTail, MEMBER_TAIL_SQL, MODULE_PARKED_SQL } from './reference-tail';
+import { NAME_SUBSTRING_KINDS, buildNameSubstringIndex, searchNameSubstring, type NameSubstringIndex, type ScanOrder } from './name-substring-index';
 
 /**
  * Files that should not be candidates for "dominant file" detection: tests,
@@ -106,6 +107,15 @@ const THROUGH_NAMES = (column: string): string => `(
  * the invariant. Pinned by a test.
  */
 export const DEPRIORITIZED_NAME_BONUS_SCALE = 0.75;
+
+/**
+ * A `deprioritize` path predicate (#982) that can also hand out a copy with
+ * the project's patterns read once, for loops over many paths (#2620).
+ */
+export interface DeprioritizedPathMatcher {
+  (filePath: string): boolean;
+  snapshot?: () => (filePath: string) => boolean;
+}
 
 /**
  * The fields that tell one node of a file from another across a re-index of
@@ -257,6 +267,12 @@ function rowToFileRecord(row: FileRow): FileRecord {
  * under-count nodes per file and pick that plan, and a few huge files (a
  * generated R.java) then cost ~100 s (#2571). Ties go to the path, so the
  * plan never decides between equal counts.
+ *
+ * Every file, not a top-N window: the test and generated files the caller
+ * drops can fill any window, and then the real dominant file, or its
+ * runner-up, was never among the rows (#2578). The window saved nothing
+ * either: ORDER BY needs every group, so the aggregate runs to the end
+ * whatever the LIMIT; only the rows handed back differ, one per file.
  */
 export const DOMINANT_FILE_SQL = `
   SELECT n.file_path AS file_path, COUNT(*) AS edge_count
@@ -266,8 +282,14 @@ export const DOMINANT_FILE_SQL = `
   WHERE n.file_path = m.file_path
   GROUP BY n.file_path
   ORDER BY edge_count DESC, n.file_path
-  LIMIT 20
 `;
+
+/**
+ * Ranked candidates the low-value filter is asked about at a time, in
+ * `computeDominantFile`: the generated flag is a database lookup, so it is
+ * made per batch rather than for every file with an in-file edge.
+ */
+const DOMINANT_FILE_BATCH = 20;
 
 /**
  * Query builder for the knowledge graph database
@@ -295,6 +317,12 @@ export class QueryBuilder {
   private dominantFileMemo:
     | { stamp: string; value: { filePath: string; edgeCount: number; nextEdgeCount: number } | null }
     | undefined;
+
+  // Query-independent reads that a search repeats for every word of its query
+  // — the name list the fuzzy fallback scans, the name-substring index — each
+  // tagged with the change stamp it was read under, like dominantFileMemo
+  // (#2620). See memoizedRead().
+  private readMemos = new Map<string, { stamp: string; value: unknown }>();
 
   // Prepared statements (lazily initialized)
   private stmts: {
@@ -349,6 +377,7 @@ export class QueryBuilder {
     getDominantFile?: SqliteStatement;
     getChangeStamp?: SqliteStatement;
     getTopRouteFile?: SqliteStatement;
+    unseenName?: SqliteStatement;
     getRoutingManifest?: SqliteStatement;
     insertNameSegment?: SqliteStatement;
   } = {};
@@ -437,6 +466,26 @@ export class QueryBuilder {
     // different databases report the same one — the memo goes with the old
     // connection, or a worker following a rebuilt index keeps its answer (#1864).
     this.dominantFileMemo = undefined;
+    this.readMemos.clear();
+  }
+
+  /**
+   * `compute()`'s answer, reused until the database changes (see
+   * getChangeStamp), or null inside a transaction, where a rollback could
+   * leave a stale answer under an unchanged stamp: the caller then reads the
+   * database directly, as it did before the memo.
+   */
+  private memoizedRead<T>(key: string, compute: () => T): T | null {
+    if (this.db.inTransaction !== false) {
+      this.readMemos.delete(key);
+      return null;
+    }
+    const stamp = this.getChangeStamp();
+    const memo = this.readMemos.get(key);
+    if (memo?.stamp === stamp) return memo.value as T;
+    const value = compute();
+    this.readMemos.set(key, { stamp, value });
+    return value;
   }
 
   private edgeKindStmt(sql: string): SqliteStatement {
@@ -473,6 +522,17 @@ export class QueryBuilder {
   /** The `deprioritize` predicate (#982), so other rankers apply the same lever. */
   getDeprioritizedPathMatcher(): ((filePath: string) => boolean) | undefined {
     return this.isDeprioritizedPath;
+  }
+
+  /**
+   * The `deprioritize` predicate with the project's patterns read once, for a
+   * loop that asks about many paths. The plain predicate re-checks
+   * `codegraph.json` on every call, which a long query's candidate loops made
+   * hundreds of thousands of times (#2620).
+   */
+  getDeprioritizedPathSnapshot(): ((filePath: string) => boolean) | undefined {
+    const matcher = this.isDeprioritizedPath as DeprioritizedPathMatcher | undefined;
+    return matcher?.snapshot ? matcher.snapshot() : matcher;
   }
 
   // ===========================================================================
@@ -1191,8 +1251,8 @@ export class QueryBuilder {
 
   private computeDominantFile(): { filePath: string; edgeCount: number; nextEdgeCount: number } | null {
     if (!this.stmts.getDominantFile) {
-      // Pull top 20 candidates; we then filter out test/generated files
-      // in code (regex-grade matching that SQL LIKE can't express). The
+      // Every file ranked; test/generated files are then filtered out in
+      // code (regex-grade matching that SQL LIKE can't express). The
       // generated-file filter is critical — without it, etcd's
       // `api/etcdserverpb/rpc.pb.go` (1916 in-file edges, generated
       // protobuf stub) outranks the real `server/etcdserver/server.go`
@@ -1202,13 +1262,26 @@ export class QueryBuilder {
       this.stmts.getDominantFile = this.db.prepare(DOMINANT_FILE_SQL);
     }
     const rows = this.stmts.getDominantFile.all() as Array<{ file_path: string; edge_count: number }>;
-    const generated = this.getGeneratedPathsAmong(rows.map(r => r.file_path));
-    const filtered = rows.filter(r => !isLowValueFile(r.file_path, generated));
-    if (filtered.length === 0 || filtered[0]!.edge_count < 20) return null;
+    // The first two files the filter keeps, in rank order: the dominant file
+    // and its runner-up. Filtering a 20-row window instead returned null once
+    // 20 test files outranked the real code, and an understated runner-up
+    // (0) once 19 did, which passes the caller's "3x the next file" test for
+    // a file that is not dominant at all (#2578).
+    const kept: Array<{ file_path: string; edge_count: number }> = [];
+    for (let i = 0; i < rows.length && kept.length < 2; i += DOMINANT_FILE_BATCH) {
+      const batch = rows.slice(i, i + DOMINANT_FILE_BATCH);
+      const generated = this.getGeneratedPathsAmong(batch.map(r => r.file_path));
+      for (const r of batch) {
+        if (isLowValueFile(r.file_path, generated)) continue;
+        kept.push(r);
+        if (kept.length === 2) break;
+      }
+    }
+    if (kept.length === 0 || kept[0]!.edge_count < 20) return null;
     return {
-      filePath: filtered[0]!.file_path,
-      edgeCount: filtered[0]!.edge_count,
-      nextEdgeCount: filtered[1]?.edge_count ?? 0,
+      filePath: kept[0]!.file_path,
+      edgeCount: kept[0]!.edge_count,
+      nextEdgeCount: kept[1]?.edge_count ?? 0,
     };
   }
 
@@ -1223,6 +1296,12 @@ export class QueryBuilder {
    * Excludes test/generated files from candidacy. Returns null if there
    * are fewer than 3 non-test routes total, or if no file holds at least
    * 30% of them (diffuse routing → no single answer file).
+   *
+   * Every route file is counted. A 20-row window, filtered afterwards,
+   * returned null once 20 test files held more routes than the app's own,
+   * and measured the 30% share against the routes of those 20 files rather
+   * than of the project (#2578). One row per file that has a route, so the
+   * window saved next to nothing.
    */
   getTopRouteFile(): { filePath: string; routeCount: number; totalRoutes: number } | null {
     if (!this.stmts.getTopRouteFile) {
@@ -1231,8 +1310,7 @@ export class QueryBuilder {
         FROM nodes
         WHERE kind = 'route'
         GROUP BY file_path
-        ORDER BY cnt DESC
-        LIMIT 20
+        ORDER BY cnt DESC, file_path
       `);
     }
     const rows = this.stmts.getTopRouteFile.all() as Array<{ file_path: string; cnt: number }>;
@@ -1669,6 +1747,7 @@ export class QueryBuilder {
     // Apply multi-signal scoring
     if (results.length > 0 && (text || query)) {
       const scoringQuery = text || query;
+      const isDeprioritizedPath = this.getDeprioritizedPathSnapshot();
       results = results.map(r => {
         // A path the project de-prioritized is saying its symbol NAMES are not
         // the answer, so the exact-name bonus has to be damped too. The -15 path
@@ -1676,8 +1755,9 @@ export class QueryBuilder {
         // on #982's repro, a `usage()` helper sat at 74.8 vs 51.2 for the top
         // product symbol — -15 lands at 59.8, still ahead). Damped, not zeroed,
         // so the tree stays findable when it genuinely is what you asked for.
-        // Evaluated once and reused: the predicate stats the config file.
-        const deprioritized = this.isDeprioritizedPath?.(r.node.filePath) ?? false;
+        // Evaluated once per result and reused, from a snapshot that read the
+        // config once for the whole loop.
+        const deprioritized = isDeprioritizedPath?.(r.node.filePath) ?? false;
         const nameBonus = nameMatchBonus(r.node.name, scoringQuery);
         return {
           ...r,
@@ -1760,15 +1840,20 @@ export class QueryBuilder {
     const lowered = text.toLowerCase();
     const maxDist = lowered.length <= 4 ? 1 : 2;
 
-    // Pull the distinct name list once. The set is cached on QueryBuilder
-    // by getAllNodeNames(); even on a 200k-node project the distinct
-    // name set is typically O(10k) because most names repeat. The
-    // candidate-cap below bounds memory regardless.
-    const allNames = this.getAllNodeNames();
+    // The distinct name list, lowercased, read once until the database
+    // changes: this fallback runs for every query word that FTS and LIKE both
+    // miss, which is most words of a pasted log, and the DISTINCT scan alone
+    // took ~150 ms a call on a 560k-node index (#2620). Inside a transaction
+    // it is read fresh, as before.
+    const { names, lowered: loweredNames, starts } = this.fuzzyNames();
     const candidates: Array<{ name: string; dist: number }> = [];
-    for (const name of allNames) {
-      const dist = boundedEditDistance(name.toLowerCase(), lowered, maxDist);
-      if (dist <= maxDist) candidates.push({ name, dist });
+    for (let i = 0; i < names.length; i++) {
+      // An edit distance is at least the length difference, so a name outside
+      // this window could never pass the bound: skipping it changes nothing.
+      const end = starts[i + 1]! - 1;
+      if (Math.abs(end - starts[i]! - lowered.length) > maxDist) continue;
+      const dist = boundedEditDistance(loweredNames.slice(starts[i]!, end), lowered, maxDist);
+      if (dist <= maxDist) candidates.push({ name: names[i]!, dist });
     }
     candidates.sort((a, b) => a.dist - b.dist);
 
@@ -1854,6 +1939,42 @@ export class QueryBuilder {
   }
 
   /**
+   * Which of `names` the index has never seen: no node is called that, in any
+   * case, and no indexed name, qualified name, signature or docstring has a
+   * word starting with it. A file's path is its qualified name, so a folder or
+   * file named that counts as seen too. Explore uses this to say plainly that
+   * a name the query spelled is not in the index (#2462).
+   *
+   * A qualified name (`app.handle`, `pkg::run`) is asked about by its last
+   * segment: the index does not always record the receiver it was written on
+   * — express's `app.handle = function handle(…)` is indexed as `handle` — so
+   * only a member it has never seen makes the whole name unseen.
+   *
+   * Bounded like `getExploreMissDiagnostics`: two index probes per name (the
+   * lower(name) index and FTS postings), never a source scan, at most 16 names.
+   */
+  getUnseenNames(names: readonly string[]): string[] {
+    const checked = [...new Set(names)].filter((n) => n.length > 0 && n.length <= 128).slice(0, 16);
+    if (checked.length === 0) return [];
+    if (!this.stmts.unseenName) {
+      this.stmts.unseenName = this.db.prepare(`
+        SELECT EXISTS (SELECT 1 FROM nodes WHERE lower(name) = lower(?))
+          OR EXISTS (SELECT 1 FROM nodes_fts WHERE nodes_fts MATCH ?) AS seen
+      `);
+    }
+    const stmt = this.stmts.unseenName;
+    return checked.filter((name) => {
+      const member = name.split(/::|\./).pop()!;
+      // FTS splits the phrase on everything but letters and digits, so a
+      // snake_case name is matched as the words it is made of.
+      const phrase = member.replace(/"/g, '');
+      if (phrase.length === 0) return false;
+      const row = stmt.get(member, `{name qualified_name signature docstring} : "${phrase}"*`) as { seen: number };
+      return !row.seen;
+    });
+  }
+
+  /**
    * FTS5 search with prefix matching
    */
   private searchNodesFTS(query: string, options: SearchOptions): SearchResult[] {
@@ -1887,10 +2008,18 @@ export class QueryBuilder {
     // nameMatchBonus) can promote results that BM25 alone undervalues.
     const ftsLimit = Math.max(limit * 5, 100);
 
+    // Joined on rowid: nodes_fts is external-content over nodes with
+    // content_rowid='rowid', so its `id` column is read back from the very row
+    // the rowid names. The integer key gives the same rows without a lookup
+    // through the TEXT id index for each match, which roughly halves this
+    // query on a large index, where explore runs it once or twice for every
+    // query word (#2620). CROSS JOIN keeps nodes_fts the outer loop, as it was:
+    // on a small index the planner would otherwise scan nodes and probe FTS
+    // once per node.
     let sql = `
       SELECT nodes.*, bm25(nodes_fts, 0, 20, 5, 1, 2) as score
       FROM nodes_fts
-      JOIN nodes ON nodes_fts.id = nodes.id
+      CROSS JOIN nodes ON nodes.rowid = nodes_fts.rowid
       WHERE nodes_fts MATCH ?
     `;
 
@@ -1927,6 +2056,21 @@ export class QueryBuilder {
    */
   private searchNodesLike(query: string, options: SearchOptions): SearchResult[] {
     const { kinds, languages, limit = 100, offset = 0 } = options;
+
+    // This runs when FTS found nothing, and a word FTS can't find is usually
+    // in no name at all: most words of a pasted log or document. Each scan
+    // read every node, about 120 ms on a 560k-node index (#2620). A word of
+    // ASCII letters and digits can only match inside a name, or inside one
+    // run of such characters in a qualified name, and lowercasing keeps those
+    // runs whole, so when neither lowercased list holds it there is nothing
+    // to find. Any other word is scanned as before.
+    if (/^[A-Za-z0-9]+$/.test(query)) {
+      const runs = this.memoizedRead('qualifiedNameRuns', () => this.readQualifiedNameRuns());
+      if (runs !== null) {
+        const word = query.toLowerCase();
+        if (!this.fuzzyNames().lowered.includes(word) && !runs.includes(word)) return [];
+      }
+    }
 
     let sql = `
       SELECT nodes.*,
@@ -2118,11 +2262,97 @@ export class QueryBuilder {
     sql += ' ORDER BY length(name) ASC LIMIT ?';
     params.push(limit);
 
+    // Explore asks this four times for every word of its query, and the
+    // leading `%` makes each one a scan of every node of those kinds (#2620).
+    // The in-memory index answers with the same rows in the same order: ties
+    // in length come out in the order SQLite's plan for this very statement
+    // reads rows, the kind index's or the table's. Anything it can't answer
+    // exactly (no kind filter, a language filter, a `%` in the word, another
+    // plan, a transaction) is asked of SQLite.
+    if (kinds && kinds.length > 0 && !(languages && languages.length > 0)) {
+      const index = this.memoizedRead('nameSubstringIndex', () => this.readNameSubstringIndex());
+      const order = index ? this.substringScanOrder(index, sql, params, excludePrefix ? 2 : 1) : null;
+      const rowids = order ? searchNameSubstring(index!.index, substring, kinds, excludePrefix === true, limit, order) : null;
+      if (rowids) {
+        return this.getNodeRowsByRowid(rowids).map((row) => ({ node: rowToNode(row), score: 1.0 }));
+      }
+    }
+
     const rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
     return rows.map((row) => ({
       node: rowToNode(row),
       score: row.score,
     }));
+  }
+
+  /**
+   * The order SQLite's plan for a substring lookup reads candidate rows in,
+   * which is the order its ORDER BY leaves ties of equal length in: the kind
+   * index's (kind, file_path, start_line, id), or the table's (rowid). Which
+   * one depends on the statistics — a small index is scanned whole — so it is
+   * asked of SQLite once per statement shape. Null for any other plan.
+   */
+  private substringScanOrder(
+    memo: { index: NameSubstringIndex; plans: Map<string, ScanOrder | null> },
+    sql: string,
+    params: readonly (string | number)[],
+    patternCount: number,
+  ): ScanOrder | null {
+    // The patterns (the first `patternCount` parameters) can't change the
+    // plan, since a leading `%` uses no index; the kinds and the limit can.
+    const key = `${sql}\u0000${params.slice(patternCount).join('\u0000')}`;
+    let order = memo.plans.get(key);
+    if (order === undefined) {
+      order = null;
+      try {
+        const details = (this.db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as Array<{ detail: string }>)
+          .map((row) => row.detail)
+          .filter((detail) => /^(SCAN|SEARCH) (TABLE )?nodes\b/.test(detail));
+        if (details.length === 1) {
+          if (/^SEARCH (TABLE )?nodes USING (COVERING )?INDEX idx_nodes_kind \(/.test(details[0]!)) order = 'index';
+          else if (/^SCAN (TABLE )?nodes$/.test(details[0]!)) order = 'rowid';
+        }
+      } catch {
+        order = null;
+      }
+      memo.plans.set(key, order);
+    }
+    return order;
+  }
+
+  /**
+   * Every node of the kinds the name-substring index holds, read in
+   * idx_nodes_kind order (kind, file_path, start_line, id): the order its
+   * results break length ties by.
+   */
+  private readNameSubstringIndex(): { index: NameSubstringIndex; plans: Map<string, ScanOrder | null> } | null {
+    const rows = this.db
+      .prepare(
+        `SELECT rowid AS rowid, kind, name FROM nodes WHERE kind IN (${NAME_SUBSTRING_KINDS.map(() => '?').join(',')})`
+        + ' ORDER BY kind, file_path, start_line, id'
+      )
+      .all(...NAME_SUBSTRING_KINDS) as Array<{ rowid: number; kind: string; name: string }>;
+    const index = buildNameSubstringIndex(rows);
+    return index ? { index, plans: new Map() } : null;
+  }
+
+  /** Whole node rows for `rowids`, in that order; a rowid no longer present is skipped. */
+  private getNodeRowsByRowid(rowids: readonly number[]): NodeRow[] {
+    if (rowids.length === 0) return [];
+    const byRowid = new Map<number, NodeRow>();
+    for (let i = 0; i < rowids.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = rowids.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const rows = this.db
+        .prepare(`SELECT rowid AS rowid_, nodes.* FROM nodes WHERE rowid IN (${chunk.map(() => '?').join(',')})`)
+        .all(...chunk) as Array<NodeRow & { rowid_: number }>;
+      for (const row of rows) byRowid.set(row.rowid_, row);
+    }
+    const out: NodeRow[] = [];
+    for (const rowid of rowids) {
+      const row = byRowid.get(rowid);
+      if (row) out.push(row);
+    }
+    return out;
   }
 
   // ===========================================================================
@@ -3339,6 +3569,37 @@ export class QueryBuilder {
   }
 
   /**
+   * The module edges (`imports` edges into a file node) into any file under
+   * the folder `dir` (projectRoot-relative, no trailing slash), with the
+   * source file and language a resurrection needs: where an import of a
+   * package by its name can land, whichever file of the package its manifest
+   * or the folder's index makes the entry.
+   */
+  getModuleImportsUnder(
+    dir: string
+  ): Array<Edge & { edgeId: number; targetFilePath: string; sourceFilePath: string; sourceLanguage: Language }> {
+    // `dir/` up to `dir0` ('0' is the byte after '/').
+    const rows = this.db
+      .prepare(
+        `SELECT e.*, tgt.file_path AS target_file_path, src.file_path AS source_file_path, src.language AS source_language
+           FROM nodes tgt
+           JOIN edges e ON e.target = tgt.id AND e.kind = 'imports'
+           JOIN nodes src ON src.id = e.source
+          WHERE tgt.kind = 'file' AND tgt.file_path >= ? AND tgt.file_path < ?`
+      )
+      .all(`${dir}/`, `${dir}0`) as Array<
+        EdgeRow & { target_file_path: string; source_file_path: string; source_language: Language }
+      >;
+    return rows.map((row) => ({
+      ...rowToEdge(row),
+      edgeId: row.id,
+      targetFilePath: row.target_file_path,
+      sourceFilePath: row.source_file_path,
+      sourceLanguage: row.source_language,
+    }));
+  }
+
+  /**
    * The module edges (`imports` edges into a file node) into the files an
    * import of `dir/name` can find instead of a file added there: `dir/name.*`
    * under another extension, and the folder's own entry, `dir/name/index.*`
@@ -3457,11 +3718,12 @@ export class QueryBuilder {
   /**
    * Which of `filePaths` the index flagged as tool-generated (schema v9+).
    *
-   * Bounded-lookup by design: every consumer already holds a short candidate
-   * list (a ranked file group, an FTS result page, a LIMIT-20 aggregate), so
-   * this stays a partial-index probe over a handful of paths — no whole-repo
-   * set to materialize, and no cache to invalidate, which means a ranking call
-   * can never serve a verdict the last sync already replaced.
+   * Bounded-lookup by design: every consumer already holds a candidate list
+   * (a ranked file group, an FTS result page, a batch of the dominant-file
+   * ranking, the files that hold a route), so this stays a partial-index
+   * probe over those paths — no whole-repo set to materialize, and no cache
+   * to invalidate, which means a ranking call can never serve a verdict the
+   * last sync already replaced.
    *
    * Returns ONLY the content/index signal; callers union it with
    * {@link isGeneratedFile} so pre-v9 databases (column present, all zeros
@@ -4043,6 +4305,49 @@ export class QueryBuilder {
       this.stmts.getAllNodeNames = this.db.prepare('SELECT DISTINCT name FROM nodes');
     }
     const rows = this.stmts.getAllNodeNames.all() as Array<{ name: string }>;
+    return rows.map((r) => r.name);
+  }
+
+  /**
+   * The distinct node names, in {@link getAllNodeNames} order, and the same
+   * names lowercased and newline-joined: name `i` lowercased is
+   * `lowered.slice(starts[i], starts[i + 1] - 1)`. Read once until the
+   * database changes (fresh inside a transaction). The fuzzy fallback compares
+   * against it, and the LIKE fallback asks it whether any name holds a word.
+   */
+  private fuzzyNames(): { names: string[]; lowered: string; starts: Int32Array } {
+    const read = (): { names: string[]; lowered: string; starts: Int32Array } => {
+      const names = this.getAllNodeNames();
+      const lowered = names.map((name) => name.toLowerCase());
+      const starts = new Int32Array(names.length + 1);
+      for (let i = 0; i < lowered.length; i++) starts[i + 1] = starts[i]! + lowered[i]!.length + 1;
+      return { names, lowered: lowered.join('\n') + '\n', starts };
+    };
+    return this.memoizedRead('fuzzyNames', read) ?? read();
+  }
+
+  /**
+   * The runs of ASCII letters and digits in the distinct qualified names,
+   * lowercased and newline-joined: where a word LIKE could find in a
+   * qualified name has to be.
+   */
+  private readQualifiedNameRuns(): string {
+    const runs = new Set<string>();
+    const rows = this.db.prepare('SELECT DISTINCT qualified_name AS name FROM nodes').all() as Array<{ name: string }>;
+    for (const row of rows) {
+      for (const run of row.name.toLowerCase().split(/[^a-z0-9]+/)) {
+        if (run) runs.add(run);
+      }
+    }
+    return [...runs].join('\n');
+  }
+
+  /** The names of a language's nodes of the given kinds (repeats included), decoding nothing else. */
+  getNodeNamesOfKinds(language: Language, kinds: readonly NodeKind[]): string[] {
+    // `+language`: the kind index narrows further than the language one.
+    const rows = this.db
+      .prepare(`SELECT name FROM nodes WHERE kind IN (${kinds.map(() => '?').join(', ')}) AND +language = ?`)
+      .all(...kinds, language) as Array<{ name: string }>;
     return rows.map((r) => r.name);
   }
 
