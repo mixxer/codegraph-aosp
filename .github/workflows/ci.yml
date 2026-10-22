@@ -7,107 +7,68 @@ env:
   CODEGRAPH_TELEMETRY: '0'
   CODEGRAPH_NO_UPDATE_CHECK: '1'
 jobs:
-  verified:
-    name: Verify published heads and full validation evidence
+  portable:
+    name: ${{ matrix.target }} portable Node ${{ matrix.node }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Check exact published refs and prior full portable/native results
-        run: |
-          python3 - <<'PY'
-          import json, urllib.request
-
-          def read(path):
-              with urllib.request.urlopen('https://api.github.com/repos/mixxer/codegraph-aosp/' + path, timeout=30) as response:
-                  return json.load(response)
-          run = read('actions/runs/39723739080')
-          assert run['head_sha'] == '4af17366fccc9c571f5bfada9cd5492dbdba1740' and run['conclusion'] == 'success'
-          jobs = read('actions/runs/39723739080/jobs?per_page=100')['jobs']
-          assert len(jobs) == 26 and all(job['conclusion'] == 'success' for job in jobs)
-          with urllib.request.urlopen('https://api.github.com/repos/colbymchenry/codegraph/branches/main', timeout=30) as response:
-              upstream = json.load(response)['commit']['sha']
-          assert upstream == '88ebefa1353806a48f914d6d66807b24dfa235e6', ('Upstream advanced during validation', upstream)
-          refs = {'fix/java-kotlin-inheritance': '403ffda0f062ecf2bece391ddc31539743e507e9', 'feat/android-platform-tools': 'efce7949aa3e87d67176159c628da7a3502aff3f', 'fix/mcp-project-cache-lifetime': 'b3ddd7687e4379c8dc0d900c127d93294ec7d514', 'fix/project-path-realpath': '1f2df4e22c3a3b476bb23122488055437aa7069f', 'docs/contributing-guide': 'dc0b41cba2b68a223cd16d75a285400fad806ec0', 'fix/kotlin-imported-type-calls': 'c13fc80ca1741ecb0f351d9a6748409b234a643a', 'fix/java-static-field-calls': 'e8893dda30ba51bdca9191cf0282332ec814e3b2', 'main': '6dde0e8b4568ab6797da34b33250cb994ac198e8', 'fix/android-platform-language-coverage': 'd1e05ef4d039bbbecc8e96cd8a8e1e31277b9b6c'}
-          actual_heads = {item['ref'].removeprefix('refs/heads/'): item['object']['sha'] for item in read('git/matching-refs/heads')}
-          for branch, sha in refs.items():
-              assert actual_heads.get(branch) == sha, (branch, sha, actual_heads.get(branch))
-              print(branch, sha)
-          tags = {'refs/tags/backup/upstream-pr1927-before-rebase-20261022-73a9bea3': '73a9bea3c027d92aba19c76cca2dc82a5ed6ed24', 'refs/tags/backup/upstream-pr1927-before-rebase-20261022-3bfb25c0': '3bfb25c07ef5d41df097e861786042b920c71927', 'refs/tags/backup/upstream-pr1928-before-rebase-20261022-a252a722': 'a252a722a6b2d3a18f0b9b4725ab5e57ea6ca191', 'refs/tags/backup/upstream-pr1928-before-rebase-20261022-9dcb4f9e': '9dcb4f9e007fb6ea03e326b1207cc0c8c9af3f04', 'refs/tags/backup/upstream-pr1929-before-rebase-20261022-19fbbbad': '19fbbbadf78614a6ec0085dab88583e46b277017', 'refs/tags/backup/upstream-pr1929-before-rebase-20261022-7398a498': '7398a498102d58cff96e296e8ae6ce45e3109c5b', 'refs/tags/backup/upstream-pr1930-before-rebase-20261022-3be0f559': '3be0f5597778f2e76a912e2a5937bd72f5d41b76', 'refs/tags/backup/upstream-pr1930-before-rebase-20261022-0f75b0d0': '0f75b0d0e7076fb858fbbddf346cbc47a5754307', 'refs/tags/backup/upstream-pr1931-before-rebase-20261022-72fd8142': '72fd8142e7266dc590cc5772b9753486d97f9583', 'refs/tags/backup/upstream-pr1931-before-rebase-20261022-07a229bc': '07a229bc49b58b13a989a0a35a041ee40d3ce6ad', 'refs/tags/backup/upstream-pr1948-before-rebase-20261022-2633f50c': '2633f50cef50bda70aa8ab555377d65c075d2f3a', 'refs/tags/backup/upstream-pr1948-before-rebase-20261022-3a9e7461': '3a9e74619f6955bebef38d0abe6faaaf90db6873', 'refs/tags/backup/upstream-pr1949-before-rebase-20261022-25208eea': '25208eea6e12db8cb05efddf58ae09ca6e8020e3', 'refs/tags/backup/upstream-pr1949-before-rebase-20261022-33737125': '33737125e7a5fd336738fcac95bd04d8443a6ba6'}
-          actual_tags = {item['ref']: item['object']['sha'] for item in read('git/matching-refs/tags/backup/upstream-pr')}
-          assert all(actual_tags.get(ref) == sha for ref, sha in tags.items())
-          print('Verified latest upstream base, both generations of backup tags and exact published heads with full portable/native success.')
-          PY
-  published:
-    name: ${{ matrix.target }} published Node ${{ matrix.node }}
-    needs: verified
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         include:
+          - target: "baseline"
+            sha: 0c3e12ddbbcc467b595ca994941151a7dc60db23
+            node: 22
+          - target: "baseline"
+            sha: 0c3e12ddbbcc467b595ca994941151a7dc60db23
+            node: 24
           - target: "1927"
-            sha: 403ffda0f062ecf2bece391ddc31539743e507e9
+            sha: 0057f90b074b26f2f9d44336cb204e3df48f0249
             node: 22
-            tests: "__tests__/pascal-for-in-var.test.ts __tests__/pascal-param-attributes.test.ts"
           - target: "1927"
-            sha: 403ffda0f062ecf2bece391ddc31539743e507e9
+            sha: 0057f90b074b26f2f9d44336cb204e3df48f0249
             node: 24
-            tests: "__tests__/pascal-for-in-var.test.ts __tests__/pascal-param-attributes.test.ts"
           - target: "1928"
-            sha: efce7949aa3e87d67176159c628da7a3502aff3f
+            sha: 878c3ae577e6cd26fdf7f5b2a25b8e89ca6bd3b4
             node: 22
-            tests: "__tests__/pascal-for-in-var.test.ts __tests__/pascal-param-attributes.test.ts"
           - target: "1928"
-            sha: efce7949aa3e87d67176159c628da7a3502aff3f
+            sha: 878c3ae577e6cd26fdf7f5b2a25b8e89ca6bd3b4
             node: 24
-            tests: "__tests__/pascal-for-in-var.test.ts __tests__/pascal-param-attributes.test.ts"
           - target: "1929"
-            sha: b3ddd7687e4379c8dc0d900c127d93294ec7d514
+            sha: 206dee62acf5009b502052cb947358c8b669c075
             node: 22
-            tests: "__tests__/pascal-for-in-var.test.ts __tests__/pascal-param-attributes.test.ts"
           - target: "1929"
-            sha: b3ddd7687e4379c8dc0d900c127d93294ec7d514
+            sha: 206dee62acf5009b502052cb947358c8b669c075
             node: 24
-            tests: "__tests__/pascal-for-in-var.test.ts __tests__/pascal-param-attributes.test.ts"
           - target: "1930"
-            sha: 1f2df4e22c3a3b476bb23122488055437aa7069f
+            sha: 576f387e6670b347915a7245f53d253f839c6964
             node: 22
-            tests: "__tests__/pascal-for-in-var.test.ts __tests__/pascal-param-attributes.test.ts"
           - target: "1930"
-            sha: 1f2df4e22c3a3b476bb23122488055437aa7069f
+            sha: 576f387e6670b347915a7245f53d253f839c6964
             node: 24
-            tests: "__tests__/pascal-for-in-var.test.ts __tests__/pascal-param-attributes.test.ts"
           - target: "1931"
-            sha: dc0b41cba2b68a223cd16d75a285400fad806ec0
+            sha: 852174294f1cc1f07cf1f38a714aa6736c5cfcba
             node: 22
-            tests: "__tests__/pascal-for-in-var.test.ts __tests__/pascal-param-attributes.test.ts"
           - target: "1931"
-            sha: dc0b41cba2b68a223cd16d75a285400fad806ec0
+            sha: 852174294f1cc1f07cf1f38a714aa6736c5cfcba
             node: 24
-            tests: "__tests__/pascal-for-in-var.test.ts __tests__/pascal-param-attributes.test.ts"
           - target: "1948"
-            sha: c13fc80ca1741ecb0f351d9a6748409b234a643a
+            sha: 24ecca1ac17df6b9535ddaec1eaabcc5c4a6bedd
             node: 22
-            tests: "__tests__/pascal-for-in-var.test.ts __tests__/pascal-param-attributes.test.ts"
           - target: "1948"
-            sha: c13fc80ca1741ecb0f351d9a6748409b234a643a
+            sha: 24ecca1ac17df6b9535ddaec1eaabcc5c4a6bedd
             node: 24
-            tests: "__tests__/pascal-for-in-var.test.ts __tests__/pascal-param-attributes.test.ts"
           - target: "1949"
-            sha: e8893dda30ba51bdca9191cf0282332ec814e3b2
+            sha: 84504b80fddf2f686f9dcf5de1d73a04026db120
             node: 22
-            tests: "__tests__/pascal-for-in-var.test.ts __tests__/pascal-param-attributes.test.ts"
           - target: "1949"
-            sha: e8893dda30ba51bdca9191cf0282332ec814e3b2
+            sha: 84504b80fddf2f686f9dcf5de1d73a04026db120
             node: 24
-            tests: "__tests__/pascal-for-in-var.test.ts __tests__/pascal-param-attributes.test.ts"
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ matrix.sha }}
           persist-credentials: false
-      - name: Verify exact published commit
+      - name: Verify exact target commit
         run: test "$(git rev-parse HEAD)" = "${{ matrix.sha }}"
       - uses: actions/setup-node@v6
         with:
@@ -116,36 +77,123 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: mkdir -p "$HOME/.ssh"
-      - name: Focused portable regressions on published commit
+      - name: Full portable suite
+        run: |
+          portable_workers=$(node -p 'const n = require("node:os").availableParallelism(); Math.min(n, Math.min(4, Math.max(2, n - 1)))')
+          npm test -- --maxWorkers="$portable_workers" --minWorkers=1
+        env:
+          CODEGRAPH_KERNEL: '0'
+  windows:
+    name: ${{ matrix.target }} Windows ${{ matrix.focus }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: "baseline"
+            sha: 0c3e12ddbbcc467b595ca994941151a7dc60db23
+            focus: security
+            tests: __tests__/security.test.ts -t validateProjectPath
+          - target: "1930"
+            sha: 576f387e6670b347915a7245f53d253f839c6964
+            focus: security
+            tests: __tests__/security.test.ts -t validateProjectPath
+          - target: "1928"
+            sha: 878c3ae577e6cd26fdf7f5b2a25b8e89ca6bd3b4
+            focus: MCP
+            tests: __tests__/mcp-initialize.test.ts __tests__/mcp-roots.test.ts __tests__/mcp-tool-allowlist.test.ts
+          - target: "1929"
+            sha: 206dee62acf5009b502052cb947358c8b669c075
+            focus: MCP
+            tests: __tests__/mcp-project-cache.test.ts __tests__/mcp-initialize.test.ts __tests__/mcp-roots.test.ts
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+      - name: Verify exact target commit
+        shell: pwsh
+        run: if ((git rev-parse HEAD).Trim() -ne '${{ matrix.sha }}') { throw 'Unexpected target SHA' }
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - shell: pwsh
+        run: New-Item -ItemType Directory -Force (Join-Path $HOME '.ssh') | Out-Null
+      - name: Windows platform regressions
         run: npx vitest run ${{ matrix.tests }} --maxWorkers=2 --minWorkers=1
         env:
           CODEGRAPH_KERNEL: '0'
-      - name: Check contribution documentation links
-        if: matrix.target == '1931'
-        run: |
-          node <<'JS'
-          const fs = require('fs'), path = require('path');
-          for (const file of ['CONTRIBUTING.md', 'README.md', 'docs/README.md']) {
-            const body = fs.readFileSync(file, 'utf8');
-            for (const match of body.matchAll(/\]\(([^)]+)\)/g)) {
-              const link = match[1];
-              if (link.includes('://') || link.startsWith('#') || link.startsWith('mailto:')) continue;
-              const target = path.resolve(path.dirname(file), link.split(/[?#]/)[0]);
-              if (!fs.existsSync(target)) throw new Error(file + ': broken link ' + link);
-            }
-          }
-          console.log('All relative contribution documentation links resolve.');
-          JS
+  native:
+    name: ${{ matrix.target }} native kernel and language regressions
+    needs: [portable, windows]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: "baseline"
+            sha: 0c3e12ddbbcc467b595ca994941151a7dc60db23
+          - target: "1927"
+            sha: 0057f90b074b26f2f9d44336cb204e3df48f0249
+          - target: "1928"
+            sha: 878c3ae577e6cd26fdf7f5b2a25b8e89ca6bd3b4
+          - target: "1948"
+            sha: 24ecca1ac17df6b9535ddaec1eaabcc5c4a6bedd
+          - target: "1949"
+            sha: 84504b80fddf2f686f9dcf5de1d73a04026db120
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+      - name: Verify exact target commit
+        run: test "$(git rev-parse HEAD)" = "${{ matrix.sha }}"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Build native kernel after portable suites
+        run: bash scripts/build-kernel.sh --target x86_64-unknown-linux-gnu
+      - run: npm run build
+      - run: test -s codegraph-kernel/prebuilds/linux-x64/codegraph-kernel.node
+      - name: Native parity, language and Android regressions
+        run: >-
+          npx vitest run
+          __tests__/kernel-*.test.ts
+          __tests__/pascal-param-attributes.test.ts
+          __tests__/pascal-for-in-var.test.ts
+          __tests__/go-shadowed-function-value.test.ts
+          __tests__/go-chained-receivers.test.ts
+          __tests__/kotlin-*.test.ts
+          __tests__/aosp-*.test.ts
+          __tests__/extraction.test.ts
+          __tests__/resolution.test.ts
+          __tests__/function-ref*.test.ts
+          __tests__/qualified-name-boundary.test.ts
+          __tests__/cpp-specialization*.test.ts
+          __tests__/expo-modules.test.ts
+          --maxWorkers=2 --minWorkers=1
+        env:
+          CODEGRAPH_KERNEL_EXPECT: '1'
   checks:
-    name: Published contribution verification complete
+    name: Seven PR validation complete
     if: always()
-    needs: [verified, published]
+    needs: [portable, windows, native]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - env:
-          PROOF_RESULT: ${{ needs.verified.result }}
-          PUBLISHED_RESULT: ${{ needs.published.result }}
+      - name: Require every validation job to pass
+        env:
+          PORTABLE_RESULT: ${{ needs.portable.result }}
+          WINDOWS_RESULT: ${{ needs.windows.result }}
+          NATIVE_RESULT: ${{ needs.native.result }}
         run: |
-          test "$PROOF_RESULT" = success
-          test "$PUBLISHED_RESULT" = success
+          test "$PORTABLE_RESULT" = success
+          test "$WINDOWS_RESULT" = success
+          test "$NATIVE_RESULT" = success
