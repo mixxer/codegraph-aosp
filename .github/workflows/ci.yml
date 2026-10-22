@@ -10,23 +10,30 @@ jobs:
   previous:
     name: Require unchanged target validation
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
     steps:
       - name: Require seventeen unchanged portable and Windows jobs
         run: |
-          curl --fail --silent --show-error 'https://api.github.com/repos/mixxer/codegraph-aosp/actions/runs/39714365273/jobs?per_page=100' > previous-jobs.json
           python3 - <<'PY'
-          import json
-          data = json.load(open('previous-jobs.json'))['jobs']
+          import json, time, urllib.request
           expected = {f'{target} portable Node {node}' for target in ['baseline', '1927', '1929', '1930', '1931', '1948', '1949'] for node in [22, 24]}
           expected.update(['baseline Windows security', '1930 Windows security', '1929 Windows MCP'])
-          actual = {job['name']: job for job in data}
-          assert len(expected) == 17 and expected <= actual.keys()
-          assert all(actual[name]['conclusion'] == 'success' for name in expected)
-          print('All seventeen unchanged target jobs passed at their pinned commits.')
+          for attempt in range(20):
+              with urllib.request.urlopen('https://api.github.com/repos/mixxer/codegraph-aosp/actions/runs/39714365273/jobs?per_page=100', timeout=30) as response:
+                  actual = {job['name']: job for job in json.load(response)['jobs']}
+              assert len(expected) == 17 and expected <= actual.keys()
+              failed = [name for name in expected if actual[name]['conclusion'] in ['failure', 'cancelled', 'timed_out']]
+              assert not failed, failed
+              pending = [name for name in expected if actual[name]['conclusion'] != 'success']
+              if not pending:
+                  print('All seventeen unchanged target jobs passed at their pinned commits.')
+                  break
+              print('Waiting for unchanged targets:', pending, flush=True)
+              time.sleep(45)
+          else:
+              raise RuntimeError('Unchanged target validation did not finish in time')
           PY
   portable:
-    needs: previous
     name: ${{ matrix.target }} portable Node ${{ matrix.node }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -59,7 +66,6 @@ jobs:
         env:
           CODEGRAPH_KERNEL: '0'
   windows:
-    needs: previous
     name: ${{ matrix.target }} Windows ${{ matrix.focus }}
     runs-on: windows-latest
     timeout-minutes: 30
@@ -93,7 +99,7 @@ jobs:
           CODEGRAPH_KERNEL: '0'
   native:
     name: ${{ matrix.target }} native kernel and language regressions
-    needs: [portable, windows]
+    needs: [previous, portable, windows]
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     strategy:
