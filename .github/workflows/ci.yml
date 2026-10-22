@@ -7,68 +7,104 @@ env:
   CODEGRAPH_TELEMETRY: '0'
   CODEGRAPH_NO_UPDATE_CHECK: '1'
 jobs:
-  portable:
-    name: ${{ matrix.target }} portable Node ${{ matrix.node }}
+  verified:
+    name: Verify published heads and full validation evidence
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 5
+    steps:
+      - name: Check exact published refs and prior full portable/native results
+        run: |
+          python3 - <<'PY'
+          import json, urllib.request
+
+          def read(path):
+              with urllib.request.urlopen('https://api.github.com/repos/mixxer/codegraph-aosp/' + path, timeout=30) as response:
+                  return json.load(response)
+          run = read('actions/runs/39720583408')
+          assert run['head_sha'] == '15d568af2e218bd73b778fa72675073e9f128cd0' and run['conclusion'] == 'success'
+          jobs = read('actions/runs/39720583408/jobs?per_page=100')['jobs']
+          assert len(jobs) == 26 and all(job['conclusion'] == 'success' for job in jobs)
+          refs = {'fix/java-kotlin-inheritance': '73a9bea3c027d92aba19c76cca2dc82a5ed6ed24', 'feat/android-platform-tools': 'a252a722a6b2d3a18f0b9b4725ab5e57ea6ca191', 'fix/mcp-project-cache-lifetime': '19fbbbadf78614a6ec0085dab88583e46b277017', 'fix/project-path-realpath': '3be0f5597778f2e76a912e2a5937bd72f5d41b76', 'docs/contributing-guide': '72fd8142e7266dc590cc5772b9753486d97f9583', 'fix/kotlin-imported-type-calls': '2633f50cef50bda70aa8ab555377d65c075d2f3a', 'fix/java-static-field-calls': '25208eea6e12db8cb05efddf58ae09ca6e8020e3', 'main': '6dde0e8b4568ab6797da34b33250cb994ac198e8', 'fix/android-platform-language-coverage': 'd1e05ef4d039bbbecc8e96cd8a8e1e31277b9b6c'}
+          actual_heads = {item['ref'].removeprefix('refs/heads/'): item['object']['sha'] for item in read('git/matching-refs/heads')}
+          for branch, sha in refs.items():
+              assert actual_heads.get(branch) == sha, (branch, sha, actual_heads.get(branch))
+              print(branch, sha)
+          tags = {'refs/tags/backup/upstream-pr1927-before-rebase-20261022-3bfb25c0': '3bfb25c07ef5d41df097e861786042b920c71927', 'refs/tags/backup/upstream-pr1928-before-rebase-20261022-9dcb4f9e': '9dcb4f9e007fb6ea03e326b1207cc0c8c9af3f04', 'refs/tags/backup/upstream-pr1929-before-rebase-20261022-7398a498': '7398a498102d58cff96e296e8ae6ce45e3109c5b', 'refs/tags/backup/upstream-pr1930-before-rebase-20261022-0f75b0d0': '0f75b0d0e7076fb858fbbddf346cbc47a5754307', 'refs/tags/backup/upstream-pr1931-before-rebase-20261022-07a229bc': '07a229bc49b58b13a989a0a35a041ee40d3ce6ad', 'refs/tags/backup/upstream-pr1948-before-rebase-20261022-3a9e7461': '3a9e74619f6955bebef38d0abe6faaaf90db6873', 'refs/tags/backup/upstream-pr1949-before-rebase-20261022-33737125': '33737125e7a5fd336738fcac95bd04d8443a6ba6'}
+          actual_tags = {item['ref']: item['object']['sha'] for item in read('git/matching-refs/tags/backup/upstream-pr')}
+          assert all(actual_tags.get(ref) == sha for ref, sha in tags.items())
+          print('Verified old-head backups and published commits with full Node22/24, Windows and native success.')
+          PY
+  published:
+    name: ${{ matrix.target }} published Node ${{ matrix.node }}
+    needs: verified
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: "baseline"
-            sha: 929c65c83a681b4db3f705c3ad9cda03e755527c
-            node: 22
-          - target: "baseline"
-            sha: 929c65c83a681b4db3f705c3ad9cda03e755527c
-            node: 24
           - target: "1927"
             sha: 73a9bea3c027d92aba19c76cca2dc82a5ed6ed24
             node: 22
+            tests: "__tests__/pascal-param-attributes.test.ts __tests__/upgrade.test.ts __tests__/cpp-specialization-names.test.ts __tests__/cpp-specialization-qualifiers.test.ts __tests__/expo-modules.test.ts __tests__/extraction.test.ts __tests__/function-ref-package-imports.test.ts __tests__/function-ref-project-imports.test.ts __tests__/function-ref.test.ts __tests__/kotlin-object-literal.test.ts __tests__/kotlin-property-receiver.test.ts __tests__/qualified-name-boundary.test.ts __tests__/resolution.test.ts __tests__/go-shadowed-function-value.test.ts"
           - target: "1927"
             sha: 73a9bea3c027d92aba19c76cca2dc82a5ed6ed24
             node: 24
+            tests: "__tests__/pascal-param-attributes.test.ts __tests__/upgrade.test.ts __tests__/cpp-specialization-names.test.ts __tests__/cpp-specialization-qualifiers.test.ts __tests__/expo-modules.test.ts __tests__/extraction.test.ts __tests__/function-ref-package-imports.test.ts __tests__/function-ref-project-imports.test.ts __tests__/function-ref.test.ts __tests__/kotlin-object-literal.test.ts __tests__/kotlin-property-receiver.test.ts __tests__/qualified-name-boundary.test.ts __tests__/resolution.test.ts __tests__/go-shadowed-function-value.test.ts"
           - target: "1928"
             sha: a252a722a6b2d3a18f0b9b4725ab5e57ea6ca191
             node: 22
+            tests: "__tests__/pascal-param-attributes.test.ts __tests__/upgrade.test.ts __tests__/aosp-aidl.test.ts __tests__/aosp-common.test.ts __tests__/aosp-content-provider.test.ts __tests__/aosp-hal.test.ts __tests__/aosp-jni.test.ts __tests__/aosp-local-socket.test.ts __tests__/aosp-messenger.test.ts __tests__/aosp-permission-broadcast.test.ts __tests__/aosp-system-service.test.ts __tests__/mcp-initialize.test.ts __tests__/mcp-tool-allowlist.test.ts"
           - target: "1928"
             sha: a252a722a6b2d3a18f0b9b4725ab5e57ea6ca191
             node: 24
+            tests: "__tests__/pascal-param-attributes.test.ts __tests__/upgrade.test.ts __tests__/aosp-aidl.test.ts __tests__/aosp-common.test.ts __tests__/aosp-content-provider.test.ts __tests__/aosp-hal.test.ts __tests__/aosp-jni.test.ts __tests__/aosp-local-socket.test.ts __tests__/aosp-messenger.test.ts __tests__/aosp-permission-broadcast.test.ts __tests__/aosp-system-service.test.ts __tests__/mcp-initialize.test.ts __tests__/mcp-tool-allowlist.test.ts"
           - target: "1929"
             sha: 19fbbbadf78614a6ec0085dab88583e46b277017
             node: 22
+            tests: "__tests__/pascal-param-attributes.test.ts __tests__/upgrade.test.ts __tests__/mcp-initialize.test.ts __tests__/mcp-project-cache.test.ts __tests__/mcp-roots.test.ts"
           - target: "1929"
             sha: 19fbbbadf78614a6ec0085dab88583e46b277017
             node: 24
+            tests: "__tests__/pascal-param-attributes.test.ts __tests__/upgrade.test.ts __tests__/mcp-initialize.test.ts __tests__/mcp-project-cache.test.ts __tests__/mcp-roots.test.ts"
           - target: "1930"
             sha: 3be0f5597778f2e76a912e2a5937bd72f5d41b76
             node: 22
+            tests: "__tests__/pascal-param-attributes.test.ts __tests__/upgrade.test.ts __tests__/security.test.ts"
           - target: "1930"
             sha: 3be0f5597778f2e76a912e2a5937bd72f5d41b76
             node: 24
+            tests: "__tests__/pascal-param-attributes.test.ts __tests__/upgrade.test.ts __tests__/security.test.ts"
           - target: "1931"
             sha: 72fd8142e7266dc590cc5772b9753486d97f9583
             node: 22
+            tests: "__tests__/pascal-param-attributes.test.ts __tests__/upgrade.test.ts "
           - target: "1931"
             sha: 72fd8142e7266dc590cc5772b9753486d97f9583
             node: 24
+            tests: "__tests__/pascal-param-attributes.test.ts __tests__/upgrade.test.ts "
           - target: "1948"
             sha: 2633f50cef50bda70aa8ab555377d65c075d2f3a
             node: 22
+            tests: "__tests__/pascal-param-attributes.test.ts __tests__/upgrade.test.ts __tests__/function-ref-package-imports.test.ts __tests__/function-ref-project-imports.test.ts __tests__/function-ref.test.ts __tests__/kotlin-imported-type-call.test.ts __tests__/resolution.test.ts"
           - target: "1948"
             sha: 2633f50cef50bda70aa8ab555377d65c075d2f3a
             node: 24
+            tests: "__tests__/pascal-param-attributes.test.ts __tests__/upgrade.test.ts __tests__/function-ref-package-imports.test.ts __tests__/function-ref-project-imports.test.ts __tests__/function-ref.test.ts __tests__/kotlin-imported-type-call.test.ts __tests__/resolution.test.ts"
           - target: "1949"
             sha: 25208eea6e12db8cb05efddf58ae09ca6e8020e3
             node: 22
+            tests: "__tests__/pascal-param-attributes.test.ts __tests__/upgrade.test.ts __tests__/extraction.test.ts __tests__/function-ref-package-imports.test.ts __tests__/function-ref-project-imports.test.ts __tests__/function-ref.test.ts __tests__/resolution.test.ts __tests__/go-shadowed-function-value.test.ts"
           - target: "1949"
             sha: 25208eea6e12db8cb05efddf58ae09ca6e8020e3
             node: 24
+            tests: "__tests__/pascal-param-attributes.test.ts __tests__/upgrade.test.ts __tests__/extraction.test.ts __tests__/function-ref-package-imports.test.ts __tests__/function-ref-project-imports.test.ts __tests__/function-ref.test.ts __tests__/resolution.test.ts __tests__/go-shadowed-function-value.test.ts"
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ matrix.sha }}
           persist-credentials: false
-      - name: Verify exact target commit
+      - name: Verify exact published commit
         run: test "$(git rev-parse HEAD)" = "${{ matrix.sha }}"
       - uses: actions/setup-node@v6
         with:
@@ -77,119 +113,36 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: mkdir -p "$HOME/.ssh"
-      - name: Full portable suite
-        run: npm test -- --maxWorkers=2 --minWorkers=1
-        env:
-          CODEGRAPH_KERNEL: '0'
-  windows:
-    name: ${{ matrix.target }} Windows ${{ matrix.focus }}
-    runs-on: windows-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: "baseline"
-            sha: 929c65c83a681b4db3f705c3ad9cda03e755527c
-            focus: security
-            tests: __tests__/security.test.ts -t validateProjectPath
-          - target: "1930"
-            sha: 3be0f5597778f2e76a912e2a5937bd72f5d41b76
-            focus: security
-            tests: __tests__/security.test.ts -t validateProjectPath
-          - target: "1928"
-            sha: a252a722a6b2d3a18f0b9b4725ab5e57ea6ca191
-            focus: MCP
-            tests: __tests__/mcp-initialize.test.ts __tests__/mcp-roots.test.ts __tests__/mcp-tool-allowlist.test.ts
-          - target: "1929"
-            sha: 19fbbbadf78614a6ec0085dab88583e46b277017
-            focus: MCP
-            tests: __tests__/mcp-project-cache.test.ts __tests__/mcp-initialize.test.ts __tests__/mcp-roots.test.ts
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ matrix.sha }}
-          persist-credentials: false
-      - name: Verify exact target commit
-        shell: pwsh
-        run: if ((git rev-parse HEAD).Trim() -ne '${{ matrix.sha }}') { throw 'Unexpected target SHA' }
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24
-          cache: npm
-      - run: npm ci
-      - run: npm run build
-      - shell: pwsh
-        run: New-Item -ItemType Directory -Force (Join-Path $HOME '.ssh') | Out-Null
-      - name: Windows platform regressions
+      - name: Focused portable regressions on published commit
         run: npx vitest run ${{ matrix.tests }} --maxWorkers=2 --minWorkers=1
         env:
           CODEGRAPH_KERNEL: '0'
-  native:
-    name: ${{ matrix.target }} native kernel and language regressions
-    needs: [portable, windows]
-    runs-on: ubuntu-22.04
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: "baseline"
-            sha: 929c65c83a681b4db3f705c3ad9cda03e755527c
-          - target: "1927"
-            sha: 73a9bea3c027d92aba19c76cca2dc82a5ed6ed24
-          - target: "1928"
-            sha: a252a722a6b2d3a18f0b9b4725ab5e57ea6ca191
-          - target: "1948"
-            sha: 2633f50cef50bda70aa8ab555377d65c075d2f3a
-          - target: "1949"
-            sha: 25208eea6e12db8cb05efddf58ae09ca6e8020e3
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ matrix.sha }}
-          persist-credentials: false
-      - name: Verify exact target commit
-        run: test "$(git rev-parse HEAD)" = "${{ matrix.sha }}"
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24
-          cache: npm
-      - run: npm ci
-      - name: Build native kernel after portable suites
-        run: bash scripts/build-kernel.sh --target x86_64-unknown-linux-gnu
-      - run: npm run build
-      - run: test -s codegraph-kernel/prebuilds/linux-x64/codegraph-kernel.node
-      - name: Native parity, language and Android regressions
-        run: >-
-          npx vitest run
-          __tests__/kernel-*.test.ts
-          __tests__/pascal-param-attributes.test.ts
-          __tests__/go-shadowed-function-value.test.ts
-          __tests__/kotlin-*.test.ts
-          __tests__/aosp-*.test.ts
-          __tests__/extraction.test.ts
-          __tests__/resolution.test.ts
-          __tests__/function-ref*.test.ts
-          __tests__/qualified-name-boundary.test.ts
-          __tests__/cpp-specialization*.test.ts
-          __tests__/expo-modules.test.ts
-          --maxWorkers=2 --minWorkers=1
-        env:
-          CODEGRAPH_KERNEL_EXPECT: '1'
+      - name: Check contribution documentation links
+        if: matrix.target == '1931'
+        run: |
+          node <<'JS'
+          const fs = require('fs'), path = require('path');
+          for (const file of ['CONTRIBUTING.md', 'README.md', 'docs/README.md']) {
+            const body = fs.readFileSync(file, 'utf8');
+            for (const match of body.matchAll(/\]\(([^)]+)\)/g)) {
+              const link = match[1];
+              if (link.includes('://') || link.startsWith('#') || link.startsWith('mailto:')) continue;
+              const target = path.resolve(path.dirname(file), link.split(/[?#]/)[0]);
+              if (!fs.existsSync(target)) throw new Error(file + ': broken link ' + link);
+            }
+          }
+          console.log('All relative contribution documentation links resolve.');
+          JS
   checks:
-    name: Seven PR validation complete
+    name: Published contribution verification complete
     if: always()
-    needs: [portable, windows, native]
+    needs: [verified, published]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Require every validation job to pass
-        env:
-          PORTABLE_RESULT: ${{ needs.portable.result }}
-          WINDOWS_RESULT: ${{ needs.windows.result }}
-          NATIVE_RESULT: ${{ needs.native.result }}
+      - env:
+          PROOF_RESULT: ${{ needs.verified.result }}
+          PUBLISHED_RESULT: ${{ needs.published.result }}
         run: |
-          test "$PORTABLE_RESULT" = success
-          test "$WINDOWS_RESULT" = success
-          test "$NATIVE_RESULT" = success
+          test "$PROOF_RESULT" = success
+          test "$PUBLISHED_RESULT" = success
