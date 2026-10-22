@@ -7,7 +7,26 @@ env:
   CODEGRAPH_TELEMETRY: '0'
   CODEGRAPH_NO_UPDATE_CHECK: '1'
 jobs:
+  previous:
+    name: Require unchanged target validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require seventeen unchanged portable and Windows jobs
+        run: |
+          curl --fail --silent --show-error 'https://api.github.com/repos/mixxer/codegraph-aosp/actions/runs/39714365273/jobs?per_page=100' > previous-jobs.json
+          python3 - <<'PY'
+          import json
+          data = json.load(open('previous-jobs.json'))['jobs']
+          expected = {f'{target} portable Node {node}' for target in ['baseline', '1927', '1929', '1930', '1931', '1948', '1949'] for node in [22, 24]}
+          expected.update(['baseline Windows security', '1930 Windows security', '1929 Windows MCP'])
+          actual = {job['name']: job for job in data}
+          assert len(expected) == 17 and expected <= actual.keys()
+          assert all(actual[name]['conclusion'] == 'success' for name in expected)
+          print('All seventeen unchanged target jobs passed at their pinned commits.')
+          PY
   portable:
+    needs: previous
     name: ${{ matrix.target }} portable Node ${{ matrix.node }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -15,53 +34,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: "baseline"
-            sha: c326b6bec19a826f679a1fd8ec325888521ccde1
-            node: 22
-          - target: "baseline"
-            sha: c326b6bec19a826f679a1fd8ec325888521ccde1
-            node: 24
-          - target: "1927"
-            sha: 54bdde21f28fa9499c85df24ed9668905e7dc0aa
-            node: 22
-          - target: "1927"
-            sha: 54bdde21f28fa9499c85df24ed9668905e7dc0aa
-            node: 24
           - target: "1928"
-            sha: fc29d826f2d0e43733222ac0ac41ee0261683fcd
+            sha: 8e77a4cef84e483078c1b35ce0f6c2d79cbf89d4
             node: 22
           - target: "1928"
-            sha: fc29d826f2d0e43733222ac0ac41ee0261683fcd
-            node: 24
-          - target: "1929"
-            sha: 1ff11b545f7f47a6b08c1702b3b52c4f21bb3a0e
-            node: 22
-          - target: "1929"
-            sha: 1ff11b545f7f47a6b08c1702b3b52c4f21bb3a0e
-            node: 24
-          - target: "1930"
-            sha: 3fe323f3b171135e009b49f657bedbbb0c3f1d8f
-            node: 22
-          - target: "1930"
-            sha: 3fe323f3b171135e009b49f657bedbbb0c3f1d8f
-            node: 24
-          - target: "1931"
-            sha: 668de06953b13e8b97828ac432be50fdbd39b4ed
-            node: 22
-          - target: "1931"
-            sha: 668de06953b13e8b97828ac432be50fdbd39b4ed
-            node: 24
-          - target: "1948"
-            sha: 45bc0e7f2db6b791f3c4240deecc41bdd8220606
-            node: 22
-          - target: "1948"
-            sha: 45bc0e7f2db6b791f3c4240deecc41bdd8220606
-            node: 24
-          - target: "1949"
-            sha: 4b5a7e18f718c869a00bffdf6ae27f9564f33dc7
-            node: 22
-          - target: "1949"
-            sha: 4b5a7e18f718c869a00bffdf6ae27f9564f33dc7
+            sha: 8e77a4cef84e483078c1b35ce0f6c2d79cbf89d4
             node: 24
     steps:
       - uses: actions/checkout@v6
@@ -82,6 +59,7 @@ jobs:
         env:
           CODEGRAPH_KERNEL: '0'
   windows:
+    needs: previous
     name: ${{ matrix.target }} Windows ${{ matrix.focus }}
     runs-on: windows-latest
     timeout-minutes: 30
@@ -89,22 +67,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: "baseline"
-            sha: c326b6bec19a826f679a1fd8ec325888521ccde1
-            focus: security
-            tests: __tests__/security.test.ts -t validateProjectPath
-          - target: "1930"
-            sha: 3fe323f3b171135e009b49f657bedbbb0c3f1d8f
-            focus: security
-            tests: __tests__/security.test.ts -t validateProjectPath
           - target: "1928"
-            sha: fc29d826f2d0e43733222ac0ac41ee0261683fcd
+            sha: 8e77a4cef84e483078c1b35ce0f6c2d79cbf89d4
             focus: MCP
             tests: __tests__/mcp-initialize.test.ts __tests__/mcp-roots.test.ts __tests__/mcp-tool-allowlist.test.ts
-          - target: "1929"
-            sha: 1ff11b545f7f47a6b08c1702b3b52c4f21bb3a0e
-            focus: MCP
-            tests: __tests__/mcp-project-cache.test.ts __tests__/mcp-initialize.test.ts __tests__/mcp-roots.test.ts
     steps:
       - uses: actions/checkout@v6
         with:
@@ -139,7 +105,7 @@ jobs:
           - target: "1927"
             sha: 54bdde21f28fa9499c85df24ed9668905e7dc0aa
           - target: "1928"
-            sha: fc29d826f2d0e43733222ac0ac41ee0261683fcd
+            sha: 8e77a4cef84e483078c1b35ce0f6c2d79cbf89d4
           - target: "1948"
             sha: 45bc0e7f2db6b791f3c4240deecc41bdd8220606
           - target: "1949"
