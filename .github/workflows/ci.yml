@@ -1,90 +1,193 @@
 name: CI
-
 on:
-  pull_request:
-  push:
-    branches: ["**"]
-  merge_group:
   workflow_dispatch:
-
 permissions:
   contents: read
-
-concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
 env:
   CODEGRAPH_TELEMETRY: '0'
   CODEGRAPH_NO_UPDATE_CHECK: '1'
-
 jobs:
-  test:
-    name: Build and test (Node ${{ matrix.node }})
+  portable:
+    name: ${{ matrix.target }} portable Node ${{ matrix.node }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
-        node: [22, 24]
+        include:
+          - target: "baseline"
+            sha: c326b6bec19a826f679a1fd8ec325888521ccde1
+            node: 22
+          - target: "baseline"
+            sha: c326b6bec19a826f679a1fd8ec325888521ccde1
+            node: 24
+          - target: "1927"
+            sha: 54bdde21f28fa9499c85df24ed9668905e7dc0aa
+            node: 22
+          - target: "1927"
+            sha: 54bdde21f28fa9499c85df24ed9668905e7dc0aa
+            node: 24
+          - target: "1928"
+            sha: fc29d826f2d0e43733222ac0ac41ee0261683fcd
+            node: 22
+          - target: "1928"
+            sha: fc29d826f2d0e43733222ac0ac41ee0261683fcd
+            node: 24
+          - target: "1929"
+            sha: 1ff11b545f7f47a6b08c1702b3b52c4f21bb3a0e
+            node: 22
+          - target: "1929"
+            sha: 1ff11b545f7f47a6b08c1702b3b52c4f21bb3a0e
+            node: 24
+          - target: "1930"
+            sha: 3fe323f3b171135e009b49f657bedbbb0c3f1d8f
+            node: 22
+          - target: "1930"
+            sha: 3fe323f3b171135e009b49f657bedbbb0c3f1d8f
+            node: 24
+          - target: "1931"
+            sha: 668de06953b13e8b97828ac432be50fdbd39b4ed
+            node: 22
+          - target: "1931"
+            sha: 668de06953b13e8b97828ac432be50fdbd39b4ed
+            node: 24
+          - target: "1948"
+            sha: 45bc0e7f2db6b791f3c4240deecc41bdd8220606
+            node: 22
+          - target: "1948"
+            sha: 45bc0e7f2db6b791f3c4240deecc41bdd8220606
+            node: 24
+          - target: "1949"
+            sha: 4b5a7e18f718c869a00bffdf6ae27f9564f33dc7
+            node: 22
+          - target: "1949"
+            sha: 4b5a7e18f718c869a00bffdf6ae27f9564f33dc7
+            node: 24
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ matrix.sha }}
           persist-credentials: false
+      - name: Verify exact target commit
+        run: test "$(git rev-parse HEAD)" = "${{ matrix.sha }}"
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
       - run: npm run build
-      - name: Prepare sensitive-path test directory
-        run: mkdir -p "$HOME/.ssh"
-      - name: Test portable engine and viewer
+      - run: mkdir -p "$HOME/.ssh"
+      - name: Full portable suite
+        run: npm test -- --maxWorkers=2 --minWorkers=1
         env:
           CODEGRAPH_KERNEL: '0'
-        run: npm test -- --maxWorkers=2 --minWorkers=1
-
-  kernel:
-    name: Native kernel and AOSP
-    runs-on: ubuntu-22.04
-    timeout-minutes: 45
+  windows:
+    name: ${{ matrix.target }} Windows ${{ matrix.focus }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: "baseline"
+            sha: c326b6bec19a826f679a1fd8ec325888521ccde1
+            focus: security
+            tests: __tests__/security.test.ts -t validateProjectPath
+          - target: "1930"
+            sha: 3fe323f3b171135e009b49f657bedbbb0c3f1d8f
+            focus: security
+            tests: __tests__/security.test.ts -t validateProjectPath
+          - target: "1928"
+            sha: fc29d826f2d0e43733222ac0ac41ee0261683fcd
+            focus: MCP
+            tests: __tests__/mcp-initialize.test.ts __tests__/mcp-roots.test.ts __tests__/mcp-tool-allowlist.test.ts
+          - target: "1929"
+            sha: 1ff11b545f7f47a6b08c1702b3b52c4f21bb3a0e
+            focus: MCP
+            tests: __tests__/mcp-project-cache.test.ts __tests__/mcp-initialize.test.ts __tests__/mcp-roots.test.ts
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ matrix.sha }}
           persist-credentials: false
+      - name: Verify exact target commit
+        shell: pwsh
+        run: if ((git rev-parse HEAD).Trim() -ne '${{ matrix.sha }}') { throw 'Unexpected target SHA' }
       - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
       - run: npm ci
-      - name: Build Linux kernel
+      - run: npm run build
+      - shell: pwsh
+        run: New-Item -ItemType Directory -Force (Join-Path $HOME '.ssh') | Out-Null
+      - name: Windows platform regressions
+        run: npx vitest run ${{ matrix.tests }} --maxWorkers=2 --minWorkers=1
+        env:
+          CODEGRAPH_KERNEL: '0'
+  native:
+    name: ${{ matrix.target }} native kernel and language regressions
+    needs: [portable, windows]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: "baseline"
+            sha: c326b6bec19a826f679a1fd8ec325888521ccde1
+          - target: "1927"
+            sha: 54bdde21f28fa9499c85df24ed9668905e7dc0aa
+          - target: "1928"
+            sha: fc29d826f2d0e43733222ac0ac41ee0261683fcd
+          - target: "1948"
+            sha: 45bc0e7f2db6b791f3c4240deecc41bdd8220606
+          - target: "1949"
+            sha: 4b5a7e18f718c869a00bffdf6ae27f9564f33dc7
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+      - name: Verify exact target commit
+        run: test "$(git rev-parse HEAD)" = "${{ matrix.sha }}"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Build native kernel after portable suites
         run: bash scripts/build-kernel.sh --target x86_64-unknown-linux-gnu
       - run: npm run build
-      - name: Require the native binary
-        run: test -s codegraph-kernel/prebuilds/linux-x64/codegraph-kernel.node
-      - name: Verify kernel parity and Android tracing
-        env:
-          CODEGRAPH_KERNEL_EXPECT: '1'
+      - run: test -s codegraph-kernel/prebuilds/linux-x64/codegraph-kernel.node
+      - name: Native parity, language and Android regressions
         run: >-
           npx vitest run
           __tests__/kernel-*.test.ts
+          __tests__/kotlin-*.test.ts
           __tests__/aosp-*.test.ts
-          __tests__/kotlin-object-literal.test.ts
           __tests__/extraction.test.ts
           __tests__/resolution.test.ts
+          __tests__/function-ref*.test.ts
+          __tests__/qualified-name-boundary.test.ts
+          __tests__/cpp-specialization*.test.ts
+          __tests__/expo-modules.test.ts
           --maxWorkers=2 --minWorkers=1
-
+        env:
+          CODEGRAPH_KERNEL_EXPECT: '1'
   checks:
-    name: CI checks
+    name: Seven PR validation complete
     if: always()
-    needs: [test, kernel]
+    needs: [portable, windows, native]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Require every validation job to pass
         env:
-          TEST_RESULT: ${{ needs.test.result }}
-          KERNEL_RESULT: ${{ needs.kernel.result }}
+          PORTABLE_RESULT: ${{ needs.portable.result }}
+          WINDOWS_RESULT: ${{ needs.windows.result }}
+          NATIVE_RESULT: ${{ needs.native.result }}
         run: |
-          test "$TEST_RESULT" = success
-          test "$KERNEL_RESULT" = success
+          test "$PORTABLE_RESULT" = success
+          test "$WINDOWS_RESULT" = success
+          test "$NATIVE_RESULT" = success
