@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { matchKotlinReceiverChain, isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, GO_TYPE_KINDS, matchGoAssertedCall, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonAttrRefResolves } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonAttrRefResolves, isImportShadowedByJsBinding, matchKotlinReceiverChain } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -33,9 +33,9 @@ import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
 import { clearCppIncluderMemos } from './cpp-includers';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
-import { clearAmbientModuleMemos, ambientModuleFunctionIds } from './ambient-modules';
+import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters } from './import-resolver';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks, getResolvingFrameworks } from './frameworks';
@@ -88,6 +88,13 @@ const CHAIN_SHAPE = /^(.+)\(\)\.(\w+)$/;
 
 /** PHP `$this->prop->method()` encoded as `this->prop.method` — no `()`, so CHAIN_SHAPE misses it. */
 const PHP_PROP_SHAPE = /^this->\w+\.\w+$/;
+
+/**
+ * How many files that import a changed module by default a sync reads the
+ * edges of, when the module forwards its default from another file, to see
+ * whether they still land on it (changedDefaultExports).
+ */
+const DEFAULT_READER_SAMPLE_FILES = 8;
 
 /**
  * Cache size limits. Each per-resolver cache is bounded so memory
@@ -1356,11 +1363,19 @@ export class ReferenceResolver {
       const module = this.nodeById(resolved.targetNodeId);
       if (module && module.kind !== 'file' && module.kind !== 'module') return null;
     }
-    // A function a declaration file's `declare module 'x'` declares is reached
-    // only through an import of `x`, never by its bare name from another file
-    // (see ./ambient-modules).
-    if (resolved && resolved.resolvedBy !== 'import' && ambientModuleFunctionIds(this.context).has(resolved.targetNodeId) &&
-        this.nodeById(resolved.targetNodeId)?.filePath !== ref.filePath) return null;
+    // A name the calling JS/TS function binds itself (a parameter, a local) in
+    // scope at the reference is that binding even when the file imports the
+    // name, which the import resolver answers before the matcher's own check.
+    if (resolved && resolved.resolvedBy === 'import' && isImportShadowedByJsBinding(resolved, ref, this.context)) return null;
+    // A declaration of a declaration file's `declare module 'x'` is reached
+    // through an import of `x`, never by its bare name from a file that
+    // reaches no `x` (see reachesAmbientModule).
+    if (resolved && resolved.resolvedBy !== 'import') {
+      const specifier = ambientModuleDeclarations(this.context).get(resolved.targetNodeId);
+      const declaringFile = specifier === undefined ? undefined : this.nodeById(resolved.targetNodeId)?.filePath;
+      if (declaringFile !== undefined && declaringFile !== ref.filePath &&
+          !reachesAmbientModule(ref, specifier!, declaringFile, this.context)) return null;
+    }
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
 
     const target = this.nodeById(resolved.targetNodeId);
@@ -1403,6 +1418,10 @@ export class ReferenceResolver {
     // to nothing the project declares.
     const asserted = matchGoAssertedCall(ref, this.context);
     if (asserted !== undefined) return asserted;
+    // So is one on an indexed element (`schemas[ix].ValidateBytes(data)`,
+    // deepcopy's `(*in)[i].DeepCopyInto(…)`): to a method of the element type.
+    const indexed = matchGoIndexedCall(ref, this.context);
+    if (indexed !== undefined) return indexed;
 
     // A section or snippet a Shopify theme's file names is that theme's own,
     // or nothing: Shopify never looks in another theme (see ./shopify-themes).
@@ -1500,6 +1519,12 @@ export class ReferenceResolver {
     if (isVbPathCall(ref)) {
       return this.gateLanguage(matchVbPathCall(ref, this.context, (name) => isStdMethodName('vbnet', name)), ref);
     }
+
+    // The last name of a TypeScript type written qualified (`React.ReactNode`,
+    // `TChat.ChatMessage`) is a member of what its qualifier names, which no
+    // framework, import or name strategy may guess past by the name alone.
+    const tsQualified = resolveTsQualifiedTypeRef(ref, this.context);
+    if (tsQualified !== undefined) return this.gateLanguage(tsQualified, ref);
 
     // Function-as-value refs (#756) get a dedicated, strictly-gated path:
     // import-based resolution first (an imported callback resolves through its
@@ -2811,6 +2836,17 @@ export class ReferenceResolver {
     return resolveImportPath(specifier, fromFile, language, this.context);
   }
 
+  /**
+   * What `ref` resolves to against the graph as it is now, writing nothing:
+   * its target and how it was found, or null. A sync compares it with the
+   * edge the reference made before, to re-open only an edge an edit moved.
+   */
+  resolveNow(ref: UnresolvedReference): { targetNodeId: string; resolvedBy: string } | null {
+    if (!ref.filePath || !ref.language) return null;
+    const resolved = this.resolveOne({ ...ref, filePath: ref.filePath, language: ref.language });
+    return resolved ? { targetNodeId: resolved.targetNodeId, resolvedBy: resolved.resolvedBy } : null;
+  }
+
   /** True when a detected router binds navigation calls to its routes (see {@link reopenNavigationsFor}). */
   hasNavigationRouters(): boolean {
     return this.frameworks.some((f) => f.navigation !== undefined);
@@ -2894,6 +2930,72 @@ export class ReferenceResolver {
     }
     if (edgeIds.length > 0) this.queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
     return this.queries.reopenFailedReferences(rowIds) + refs.length;
+  }
+
+  /**
+   * The edited modules among `modifiedFilePaths` whose default export moved:
+   * an edit made `export default A` into `export default B`, or took the
+   * default away, while `A` stayed declared. A sync moves the edges other
+   * files made into a changed file onto the node that replaces each target, so
+   * `new Y()` after `import Y from './x'` kept `A` where a full index links
+   * `B`. An `export default` statement is no node, so neither the definition
+   * delta nor a failed-reference retry sees it change.
+   *
+   * The default a module had is read off the edges into it, with no file read:
+   * a default or namespace import of it is an `imports` edge into its file
+   * node named for the binding, and a whole-name reference through that
+   * binding (`Y`, not `Y.run`) that resolved through the import names exactly
+   * its default (a namespace binding's `NS` names the file). Only edges bound
+   * before this sync resolved anything count (up to `resolvedUpToEdgeId`), and
+   * only from files it left alone. A module that forwards its default from
+   * another file (`export { default } from './impl'`) has those edges there,
+   * so a few of its importers' are read instead. An edit that leaves the
+   * default alone, nearly every one, finds them all still on it. Each module
+   * comes with the declarations its default was (`was`), as those edges say.
+   */
+  changedDefaultExports(
+    modifiedFilePaths: readonly string[],
+    changedFilePaths: readonly string[],
+    resolvedUpToEdgeId: number,
+  ): Array<{ path: string; language: Language; was: string[] }> {
+    const fresh = new Set(changedFilePaths);
+    const moved: Array<{ path: string; language: Language; was: string[] }> = [];
+    for (const filePath of modifiedFilePaths) {
+      if (!isJsFamilyFile(filePath)) continue;
+      const bindings = new Map<string, Set<string>>();
+      for (const i of this.queries.getImportsInto(`file:${filePath}`, filePath)) {
+        if (i.refName === null || fresh.has(i.filePath) || !isModuleBindingName(i.refName)) continue;
+        const names = bindings.get(i.filePath) ?? new Set<string>();
+        names.add(i.refName);
+        bindings.set(i.filePath, names);
+      }
+      if (bindings.size === 0) continue;
+      const language = this.queries.getFileByPath(filePath)?.language;
+      if (!language) continue;
+      const readsDefault = (e: Edge & { edgeId: number; sourceFilePath: string }): boolean => {
+        const name = e.metadata?.refName;
+        return typeof name === 'string' && e.metadata?.resolvedBy === 'import' && e.edgeId <= resolvedUpToEdgeId &&
+          !e.target.startsWith('file:') && bindings.get(e.sourceFilePath)?.has(name) === true;
+      };
+      let readers: Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }> =
+        this.queries.getCrossFileIncomingEdgesWithTarget(filePath).filter(readsDefault);
+      if (readers.length === 0) {
+        const now = moduleDefaultExport(filePath, language, this.context);
+        if (!now || now.filePath === filePath) continue;
+        readers = [...bindings].slice(0, DEFAULT_READER_SAMPLE_FILES)
+          .flatMap(([file, names]) => this.queries.getResolutionEdgesThrough(file, [...names]))
+          .filter(readsDefault);
+      }
+      const was = new Set<string>();
+      for (const e of readers) {
+        const now = moduleDefaultExport(filePath, e.sourceLanguage, this.context);
+        // A call that lands on an alias binding goes on to the callable it names (resolveOne).
+        if (now && (e.target === now.id || (e.kind === 'calls' && resolveAliasBinding(now, null, this.context)?.id === e.target))) continue;
+        was.add(e.target);
+      }
+      if (was.size > 0) moved.push({ path: filePath, language, was: [...was] });
+    }
+    return moved;
   }
 
   /**
@@ -3564,6 +3666,9 @@ export class ReferenceResolver {
     // imported unaliased as `go.etcd.io/etcd/client/v3`), a type found by its
     // bare name is some other package's namesake.
     if (ref.language === 'go' && isGoUnknownQualified(ref, this.context)) return null;
+    // One embedded bare that only a package the file dot-imports declares is
+    // that package's, not a namesake as near the file.
+    if (ref.language === 'go') return goDotImportedSupertype(result, ref, this.context);
     return result;
   }
 

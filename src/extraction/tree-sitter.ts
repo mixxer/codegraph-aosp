@@ -26,7 +26,7 @@ import { NestedIntervals, scanCppBraceScopes, type CppBraceScopes } from './lang
 import { appendCppMacroMethods } from './languages/cpp-macro-methods';
 import { rustImplItemOwner, rustImplTypeName } from './languages/rust';
 import { goAliasTypeNames, goEmbeddedTypeName, goInterfaceMethodTypeNames, goStructFieldTypeNames } from './languages/go';
-import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeRefs } from './languages/dart';
+import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeAliasRefs, pushDartTypeRefs } from './languages/dart';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -488,6 +488,33 @@ function peelSwiftCallWrappers(node: SyntaxNode, source: string): SyntaxNode {
 }
 
 /**
+ * A Rust callee path without its turbofish type arguments: `Vec::<u8>::new`
+ * calls `Vec::new`, `Store::with_capacity::<u8>` calls `Store::with_capacity`.
+ * The arguments' brackets nest (`::<Vec<u8>>`), and the `>` of a `->` is no
+ * closing one (`::<fn() -> u8>`). Mirrored in the kernel's strip_turbofish
+ * (rustlang.rs): both emit the same bytes.
+ */
+function stripRustTurbofish(text: string): string {
+  if (!text.includes('::<')) return text;
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    if (text.startsWith('::<', i)) {
+      let depth = 0;
+      let j = i + 2;
+      for (; j < text.length; j++) {
+        const c = text[j];
+        if (c === '<') depth++;
+        else if (c === '>' && text[j - 1] !== '-' && --depth === 0) break;
+      }
+      i = j;
+      continue;
+    }
+    out += text[i];
+  }
+  return out;
+}
+
+/**
  * A Swift receiver's text from its innermost wrapped operand on: the wrappers
  * sit on the chain's left edge, so `!Settings.Defaults` reads
  * `Settings.Defaults` and `try! Foo.make().bar` reads `Foo.make().bar`.
@@ -534,13 +561,17 @@ const TS_JS_TRANSPARENT_RECEIVER_TYPES = new Set([
 
 /**
  * tree-sitter-typescript parses `await f<T>(x)` as a call whose callee is
- * `await f` (#2586); the call is to `f`. Peels every `await`, skipping a
- * comment written after one. Mirrored in the kernel (tsjs/extractors.rs).
+ * `await f` (#2586), and a prefix operator over a generic call the same way:
+ * `!settings.get<boolean>('X')`, `void apiRequest<T>()`, `typeof load<T>()`.
+ * The call is to `f`. Peels every `await` and prefix operator, skipping a
+ * comment written after an `await`. Mirrored in the kernel (tsjs/extractors.rs).
  */
-function peelTsAwaitCallee(node: SyntaxNode): SyntaxNode {
+function peelTsPrefixedCallee(node: SyntaxNode): SyntaxNode {
   let cur = node;
-  while (cur.type === 'await_expression') {
-    const inner = cur.namedChildren.find((c: SyntaxNode) => c.type !== 'comment');
+  while (cur.type === 'await_expression' || cur.type === 'unary_expression') {
+    const inner = cur.type === 'unary_expression'
+      ? getChildByField(cur, 'argument')
+      : cur.namedChildren.find((c: SyntaxNode) => c.type !== 'comment');
     if (!inner) break;
     cur = inner;
   }
@@ -566,6 +597,32 @@ function peelTsJsReceiver(node: SyntaxNode): SyntaxNode {
     cur = inner;
   }
   return cur;
+}
+
+/**
+ * The name a TS/JS call's callee writes when it is no member access, past the
+ * wrappers that keep it the same callee — `(fn)()`, `fn!()`, `(fn as F)()`,
+ * `await f<T>()`, the type arguments of a tagged template's tag
+ * (`css<Props>\`…\``) — or null when it names nothing: a call (`connect(map)
+ * (View)`, `create<T>()(…)`, `breakpoint('tablet')\`…\``), a function (an
+ * IIFE), a subscript (`handlers[type]()`), `(0, fn)()`. Its text used to be
+ * the reference's name, an IIFE's whole body among them, which no symbol is.
+ * A dotted chain in parentheses keeps its text, `(a.b)()` → `a.b`, as the
+ * parenthesized-callee normalization in extractCall reads it. `at` is where the
+ * name starts, which is where the reference sits, as a plain `fn()` call's does:
+ * scope checks read the name there (a parameter `fn` shadows a namesake).
+ */
+function tsJsCalleeName(func: SyntaxNode, source: string): { name: string; at: SyntaxNode } | null {
+  let cur = peelTsJsReceiver(func);
+  while (cur.type === 'instantiation_expression') {
+    const inner = getChildByField(cur, 'function') ?? cur.namedChild(0);
+    if (!inner) return null;
+    cur = peelTsJsReceiver(inner);
+  }
+  if (cur.type === 'identifier' || cur.type === 'super' || cur.type === 'import') return { name: getNodeText(cur, source), at: cur };
+  if (cur.type !== 'member_expression') return null;
+  const chain = getNodeText(cur, source).replace(/\s+/g, '');
+  return /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/.test(chain) ? { name: chain, at: cur } : null;
 }
 
 /**
@@ -1024,7 +1081,8 @@ export class TreeSitterExtractor {
   /**
    * Record value-reference bookkeeping as nodes are created: file-scope const/var symbols with
    * distinctive names become reference targets; function/method/const/var symbols become reader
-   * scopes whose bodies flushValueRefs scans.
+   * scopes whose bodies flushValueRefs scans, and so do React wrapper components, whose
+   * declaration reads values as a constant's does (`${BaseMenuItemCSS}` in a styled template).
    */
   private captureValueRefScope(kind: NodeKind, name: string, id: string, node: SyntaxNode, valueTarget = true): void {
     // Pascal targets `constant` only: its extractor emits function PARAMETERS
@@ -1055,7 +1113,7 @@ export class TreeSitterExtractor {
         this.fileScopeValueCounts.set(name, (this.fileScopeValueCounts.get(name) ?? 0) + 1);
       }
     }
-    if (kind === 'function' || kind === 'method' || kind === 'constant' || kind === 'variable') {
+    if (kind === 'function' || kind === 'method' || kind === 'constant' || kind === 'variable' || kind === 'component') {
       this.valueRefScopes.push({ id, node, name });
     }
   }
@@ -1466,9 +1524,12 @@ export class TreeSitterExtractor {
           this.nodeStack.pop();
         }
         // A field initializer can also register callbacks
-        // (`static handlers = { click: onClick }`) — scan it for
-        // function-as-value candidates (capture-only, halts at functions).
-        this.scanFnRefSubtree(node, 0);
+        // (`static handlers = { click: onClick }`). The walk above took those
+        // for the property, so the scan for function-as-value candidates
+        // (capture-only, halts at functions) skips the initializer it walked
+        // and covers the rest of the field: the class would keep a second
+        // reference to each function from the same spot.
+        this.scanFnRefSubtree(node, 0, propNode && valueNode ? new Set([valueNode.id]) : undefined);
         skipChildren = true;
       } else {
         this.extractMethod(node);
@@ -1560,16 +1621,20 @@ export class TreeSitterExtractor {
       const declaredType = this.walkDeclaredTypes ? getChildByField(node, 'type') : null;
       const definedType = declaredType && isClassLikeDefinition(declaredType) ? declaredType : null;
       if (definedType) this.visitNode(definedType);
-      this.extractVariable(node);
-      // extractVariable doesn't walk every initializer shape (object literals
-      // are deliberately skipped; Python/Ruby don't walk at all), so scan the
-      // declaration subtree for function-as-value candidates — `const routes =
-      // { home: renderHome }`, `handlers = {"recv": target_cb}`. The scan halts
-      // at nested function definitions (their bodies are walked — and
-      // attributed — separately) and flush-time dedup absorbs any overlap with
-      // initializers extractVariable DOES walk. A type walked above captured
-      // its own.
-      this.scanFnRefSubtree(node, 0, definedType ? new Set([definedType.id]) : undefined);
+      const walked = this.extractVariable(node);
+      // extractVariable doesn't walk every initializer (a store's members are
+      // extracted one by one, and only TS/JS, Python, Go and Rust walk one at
+      // all), so scan the declaration subtree for function-as-value candidates
+      // — `const routes = { home: renderHome }`, `handlers = {"recv":
+      // target_cb}`. The scan halts at nested function definitions (their
+      // bodies are walked — and attributed — separately). It skips what was
+      // walked already: a type walked above, and every initializer
+      // extractVariable walked under the symbol it declares — a constant's, a
+      // component wrapper's (which must not hand the component it wraps to the
+      // file). Those captured their own, and flush-time dedup keys on the
+      // source, so the file would keep a second reference to each function
+      // from the same spot.
+      this.scanFnRefSubtree(node, 0, definedType ? new Set([definedType.id]) : walked);
       skipChildren = true; // extractVariable handles children
     }
     // Swift properties inside a type. A stored instance property becomes a `field`
@@ -1967,9 +2032,9 @@ export class TreeSitterExtractor {
       createNode: (kind, name, node, extra) => self.createNode(kind, name, node, extra),
       visitNode: (node) => self.visitNode(node),
       visitFunctionBody: (body, functionId) => self.visitFunctionBody(body, functionId),
-      walkInitializer: (node) => {
+      walkInitializer: (node, functionId = '') => {
         (ctx.walked ??= new Set()).add(node.id);
-        self.visitFunctionBody(node, '');
+        self.visitFunctionBody(node, functionId);
       },
       addUnresolvedReference: (ref) => self.unresolvedReferences.push(ref),
       pushScope: (nodeId) => self.nodeStack.push(nodeId),
@@ -2214,7 +2279,8 @@ export class TreeSitterExtractor {
    * the node range spans the body. When the wrapper has an inline render
    * function, its body is walked so the component's callees (hooks, helpers) are
    * captured under the component node — matching how a plain
-   * `const Foo = () => …` arrow component already behaves.
+   * `const Foo = () => …` arrow component already behaves. Without one, the
+   * initializer is walked instead (walkComponentWrapper).
    */
   private extractReactComponentNode(
     name: string,
@@ -2223,12 +2289,127 @@ export class TreeSitterExtractor {
     extra: { docstring?: string; signature?: string; isExported?: boolean }
   ): void {
     const compNode = this.createNode('component', name, declarator, extra);
-    if (!compNode || !innerFn || !this.extractor) return;
+    if (!compNode || !this.extractor) return;
     this.nodeStack.push(compNode.id);
-    const body = this.extractor.resolveBody?.(innerFn, this.extractor.bodyField)
-      ?? getChildByField(innerFn, this.extractor.bodyField);
-    if (body) this.visitFunctionBody(body, compNode.id);
+    if (innerFn) {
+      const body = this.extractor.resolveBody?.(innerFn, this.extractor.bodyField)
+        ?? getChildByField(innerFn, this.extractor.bodyField);
+      if (body) this.visitFunctionBody(body, compNode.id);
+    } else {
+      const value = getChildByField(declarator, 'value');
+      if (value) this.walkComponentWrapper(value);
+    }
     this.nodeStack.pop();
+  }
+
+  /**
+   * Walk a wrapper with no render function of its own — `styled.div\`…\``,
+   * `styled(Base).attrs(…)<P>\`…\``, emotion's and MUI's `styled(Base)(styles)`,
+   * `memo(Base)` — with its component on the stack, the way a constant's
+   * initializer is walked with the constant on it (#693). The template's
+   * interpolations, the `.attrs()` / `.withConfig()` / options arguments, a
+   * style function and a `memo` comparator are the component's own code.
+   *
+   * The wrapper's own chain is the library it is declared with: `styled`,
+   * `styled.div`, `.attrs`, `memo` name no project code, so their calls are not
+   * recorded (every one would park as a reference nothing answers). Nor is the
+   * component it wraps (`styled(ActionButton)`, `memo(Button)`) a function
+   * passed as a value: React renders it whenever it renders this one, so the
+   * JSX synthesizer links it as a render, a hop explore can follow. A type
+   * argument read as comparisons (`styled.div<Props>`, see
+   * isTypedStyledTemplate) is a type, and is not walked. Mirrored in the kernel
+   * (tsjs/extractors.rs walk_component_wrapper).
+   */
+  private walkComponentWrapper(link: SyntaxNode): void {
+    switch (link.type) {
+      case 'binary_expression': {
+        // `(styled(Base) < Props) > \`…\``: the tag is the leftmost operand
+        // and the template the rightmost; the operands between are the type.
+        let tag: SyntaxNode | null = link;
+        while (tag?.type === 'binary_expression') tag = getChildByField(tag, 'left');
+        let template: SyntaxNode | null = link;
+        while (template?.type === 'binary_expression') template = getChildByField(template, 'right');
+        if (tag) this.walkComponentWrapper(tag);
+        if (template) this.visitFunctionBody(template, '');
+        return;
+      }
+      case 'call_expression': {
+        const callee = getChildByField(link, 'function');
+        if (callee) this.walkComponentWrapper(callee);
+        const args = getChildByField(link, 'arguments');
+        if (!args) return;
+        // A tagged template's argument is its template: the styles.
+        if (args.type !== 'arguments') {
+          this.visitFunctionBody(args, '');
+          return;
+        }
+        // `styled(Base)`, `memo(Base)`: the first argument is the component
+        // wrapped, or a wrapper around it (`memo(forwardRef(Inner))`).
+        const calleeText = callee ? getNodeText(callee, this.source) : '';
+        const root = calleeText === 'styled' || REACT_COMPONENT_HOCS.has(calleeText);
+        const first = args.namedChild(0);
+        const base = root && (first?.type === 'identifier' || first?.type === 'member_expression') ? first : null;
+        for (let i = 0; i < args.namedChildCount; i++) {
+          const arg = args.namedChild(i);
+          if (!arg || (base && arg.startIndex === base.startIndex)) continue;
+          if (root && i === 0 && arg.type === 'call_expression' && this.isComponentWrapperCall(arg)) {
+            this.walkComponentWrapper(arg);
+          } else if (arg.type === 'arrow_function' || arg.type === 'function_expression') {
+            // A style or `.attrs()` function runs as the component's code; its
+            // body is walked as a render function's is, never named for the
+            // declarator (curriedWrapperBoundName would take MUI's
+            // `styled(Box)(({ theme }) => …)` for a function of its own).
+            const body = this.extractor!.resolveBody?.(arg, this.extractor!.bodyField)
+              ?? getChildByField(arg, this.extractor!.bodyField);
+            if (body) this.visitFunctionBody(body, '');
+          } else {
+            this.visitFunctionBody(arg, '');
+          }
+        }
+        this.captureWrapperArgumentRefs(args, base);
+        return;
+      }
+      case 'member_expression':
+      case 'subscript_expression': {
+        const object = getChildByField(link, 'object');
+        if (object) this.walkComponentWrapper(object);
+        return;
+      }
+      case 'non_null_expression':
+      case 'parenthesized_expression':
+      case 'instantiation_expression': {
+        // `styled.div<{ open: boolean }>` error-recovers into a call on
+        // `non_null_expression(instantiation_expression(styled.div, …))`.
+        const inner = getChildByField(link, 'function') ?? link.namedChild(0);
+        if (inner) this.walkComponentWrapper(inner);
+        return;
+      }
+    }
+  }
+
+  /** A call of the kind reactComponentHoc reads as a component wrapper: `styled…(…)`, `memo(…)`, `forwardRef(…)`. */
+  private isComponentWrapperCall(call: SyntaxNode): boolean {
+    const callee = getChildByField(call, 'function');
+    if (!callee) return false;
+    const text = getNodeText(callee, this.source);
+    return /^styled\b/.test(text) || REACT_COMPONENT_HOCS.has(text);
+  }
+
+  /**
+   * Function-as-value candidates (#756) among a wrapper call's arguments — a
+   * `memo` comparator, a style function passed by name — attributed to the
+   * component. The component the call wraps is not one: it is what the
+   * component renders.
+   */
+  private captureWrapperArgumentRefs(args: SyntaxNode, base: SyntaxNode | null): void {
+    const spec = this.fnRefSpec;
+    const rule = spec?.dispatch.get(args.type);
+    const fromNodeId = this.nodeStack[this.nodeStack.length - 1];
+    if (!spec || !rule || !fromNodeId) return;
+    for (const cand of captureFnRefCandidates(args, rule, spec, this.source)) {
+      if (base && cand.line === base.startPosition.row + 1 && cand.column === base.startPosition.column) continue;
+      this.fnRefCandidates.push({ ...cand, fromNodeId });
+    }
   }
 
   /**
@@ -2705,8 +2886,8 @@ export class TreeSitterExtractor {
   /**
    * Extract a class field declaration (e.g. Java field_declaration, C# field_declaration).
    * Extracts each declarator as a 'field' kind node inside the owning class.
-   * Returns the C# declarators it walked, for the function-as-value scan to
-   * skip.
+   * Returns the initializers it walked (a C# declarator, a Java `value`), for
+   * the function-as-value scan to skip.
    */
   private extractField(node: SyntaxNode): Set<number> {
     const walked = new Set<number>();
@@ -2824,11 +3005,11 @@ export class TreeSitterExtractor {
                 decl.namedChild(decl.namedChildCount - 1),
                 varDecl ? getChildByField(varDecl, 'type') : null,
               );
-              // Its function-as-value candidates are the field's, captured
-              // here once. (VB.NET captures none; Java's scan still takes
-              // its initializers for the class as well.)
-              walked.add(decl.id);
             }
+            // Its function-as-value candidates are the field's, captured here
+            // once (VB.NET captures none): the scan would take Java's again for
+            // the class.
+            walked.add(valueNode.id);
             this.visitFunctionBody(valueNode, fieldNode.id);
             this.nodeStack.pop();
           }
@@ -3419,9 +3600,16 @@ export class TreeSitterExtractor {
    *
    * Extracts top-level and module-level variable declarations.
    * Captures the variable name and first 100 chars of initializer in signature for searchability.
+   *
+   * Returns the initializers it walked under the symbol they declare — a
+   * constant's or a variable's (#693), a component wrapper's — whose
+   * function-as-value candidates that walk already took for the symbol. The
+   * caller's scan of the declaration skips them: it would take each again for
+   * the file, as a second reference to the same function from the same spot.
    */
-  private extractVariable(node: SyntaxNode): void {
-    if (!this.extractor) return;
+  private extractVariable(node: SyntaxNode): Set<number> | undefined {
+    if (!this.extractor) return undefined;
+    let walked: Set<number> | undefined;
 
     // Different languages have different variable declaration structures
     // TypeScript/JavaScript: lexical_declaration contains variable_declarator children
@@ -3493,6 +3681,7 @@ export class TreeSitterExtractor {
                   signature: initSignature,
                   isExported,
                 });
+                if (!hoc.inner) (walked ??= new Set()).add(valueNode.id);
                 continue;
               }
             }
@@ -3516,6 +3705,7 @@ export class TreeSitterExtractor {
             const ownedObject = varNode ? this.ownedObjectValue(valueNode) : null;
             if (varNode && ownedObject) {
               this.extractOwnedObjectMembers(ownedObject, varNode.id, true, false);
+              (walked ??= new Set()).add(ownedObject.id);
               continue;
             }
 
@@ -3602,6 +3792,7 @@ export class TreeSitterExtractor {
               if (varNode) this.nodeStack.push(varNode.id);
               this.visitFunctionBody(valueNode, '');
               if (varNode) this.nodeStack.pop();
+              if (varNode) (walked ??= new Set()).add(valueNode.id);
             }
 
             if (extractObjectMethods && objectOfFns) {
@@ -3650,6 +3841,7 @@ export class TreeSitterExtractor {
         if (assigned) this.nodeStack.push(assigned.id);
         this.visitFunctionBody(right, '');
         if (assigned) this.nodeStack.pop();
+        if (assigned) (walked ??= new Set()).add(right.id);
       }
     } else if (this.language === 'go') {
       // Go: var_declaration, short_var_declaration, const_declaration
@@ -3690,6 +3882,7 @@ export class TreeSitterExtractor {
           if (varNode) this.nodeStack.push(varNode.id);
           this.visitFunctionBody(valueField, varNode?.id ?? '');
           if (varNode) this.nodeStack.pop();
+          if (varNode) (walked ??= new Set()).add(valueField.id);
         }
       }
 
@@ -3846,9 +4039,11 @@ export class TreeSitterExtractor {
           if (declared) this.nodeStack.push(declared.id);
           this.visitFunctionBody(valueNode, '');
           if (declared) this.nodeStack.pop();
+          if (declared) (walked ??= new Set()).add(valueNode.id);
         }
       }
     }
+    return walked;
   }
 
   /** Resolve a Lua assignment target into its callable name and optional table receiver. */
@@ -4063,6 +4258,12 @@ export class TreeSitterExtractor {
             column: type.startPosition.column,
           });
         }
+      } else if (this.language === 'dart') {
+        // A Dart typedef has no fields either: the type it aliases is the
+        // rest of the declaration, `void Function(Report r)` in `typedef
+        // ReportCallback = void Function(Report r);`, or a legacy one's
+        // return and parameter types (#2327).
+        pushDartTypeAliasRefs(node, typeAliasNode.id, (ref) => this.unresolvedReferences.push(ref));
       }
     }
     return false;
@@ -5462,7 +5663,7 @@ export class TreeSitterExtractor {
     } else {
       let func = getChildByField(node, 'function') || node.namedChild(0);
       if (func && (this.language === 'typescript' || this.language === 'tsx' || this.language === 'arkts')) {
-        const peeled = peelTsAwaitCallee(func);
+        const peeled = peelTsPrefixedCallee(func);
         if (peeled !== func) refStart = peeled.startPosition;
         func = peeled;
       }
@@ -5475,6 +5676,15 @@ export class TreeSitterExtractor {
         // Mirrored in the kernel's extract_call (swift.rs).
         if (func.type === 'call_suffix') return;
         func = peelSwiftCallWrappers(func, this.source);
+      }
+
+      // A Rust turbofish — `s.get::<u32>()`, `helper::<u8>()`,
+      // `Store::with_capacity::<u8>(1)` — calls the function it wraps: its type
+      // arguments are no part of the callee's name, which stayed in the ref
+      // (`s.get::<u32>`) and resolved through no strategy. Mirrored in the
+      // kernel's extract_call (rustlang.rs).
+      if (func && this.language === 'rust' && func.type === 'generic_function') {
+        func = getChildByField(func, 'function') ?? func;
       }
 
       // C++ explicit operator call `a.operator+(b)` / `p->operator+(b)` (#1247):
@@ -5652,10 +5862,16 @@ export class TreeSitterExtractor {
                 // fluent codebases. Leave those to the bare-name path.
                 reencode = /^[A-Z]/.test(innerCallee);
               } else {
-                const innerFn = getChildByField(receiver, 'function');
+                let innerFn = getChildByField(receiver, 'function');
+                // Rust: the inner call's turbofish is no part of its name either
+                // (`Foo::create::<T>().run()`, `Vec::<u8>::new().len()`).
+                if (this.language === 'rust' && innerFn?.type === 'generic_function') {
+                  innerFn = getChildByField(innerFn, 'function') ?? innerFn;
+                }
                 innerCallee = innerFn
                   ? getNodeText(innerFn, this.source).replace(/->/g, '.').replace(/\s+/g, '')
                   : '';
+                if (this.language === 'rust') innerCallee = stripRustTurbofish(innerCallee);
                 // Rust: only re-encode an associated-function chain
                 // (`Foo::new().bar()`), whose inner callee is a path/`scoped_identifier`.
                 // Go: only a bare package-level factory chain (`New().Method()`),
@@ -5753,7 +5969,7 @@ export class TreeSitterExtractor {
               // wrong edge. The inner call is visited on its own either way.
               // Mirrored in the kernel (tsjs/extractors.rs, python.rs).
               let innerFn = getChildByField(receiver, 'function');
-              if (innerFn && (this.language === 'typescript' || this.language === 'tsx')) innerFn = peelTsAwaitCallee(innerFn);
+              if (innerFn && (this.language === 'typescript' || this.language === 'tsx')) innerFn = peelTsPrefixedCallee(innerFn);
               const innerCallee = innerFn ? getNodeText(innerFn, this.source).replace(/\s+/g, '') : '';
               if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(innerCallee)) return;
               calleeName = `${innerCallee}().${methodName}`;
@@ -5832,8 +6048,9 @@ export class TreeSitterExtractor {
             }
           }
         } else if (func.type === 'scoped_identifier' || func.type === 'scoped_call_expression') {
-          // Scoped call: Module::function()
-          calleeName = getNodeText(func, this.source);
+          // Scoped call: Module::function(); a Rust path's turbofish is no
+          // part of the name (`Vec::<u8>::with_capacity` → `Vec::with_capacity`).
+          calleeName = this.language === 'rust' ? stripRustTurbofish(getNodeText(func, this.source)) : getNodeText(func, this.source);
         } else if (this.language === 'csharp' && func.type === 'member_access_expression') {
           // C# member call `recv.Method(...)`. When the receiver is itself a call
           // — a chained factory `Foo.Create(args).Bar()` — encode `inner().Bar`
@@ -5850,6 +6067,15 @@ export class TreeSitterExtractor {
           } else {
             calleeName = getNodeText(func, this.source);
           }
+        } else if (TS_JS_CHAIN_LANGUAGES.has(this.language)) {
+          // A callee that names nothing — a call, a function, a subscript —
+          // is no reference: a silent miss, never a name no symbol has. A
+          // curried call's inner call is visited on its own. Mirrored in the
+          // kernel's extract_call (tsjs/extractors.rs callee_name_of).
+          const named = tsJsCalleeName(func, this.source);
+          if (named === null) return;
+          calleeName = named.name;
+          refStart = named.at.startPosition;
         } else {
           calleeName = getNodeText(func, this.source);
         }
@@ -7410,6 +7636,24 @@ export class TreeSitterExtractor {
               column: target.startPosition.column,
             });
           }
+        }
+      }
+
+      // TypeScript: `interface Repo<T> extends Base, ns.Shape, Store<T>` — each
+      // supertype is a `type` of the extends_type_clause. A parameterized one
+      // (`generic_type`) is named by its `name` field: the index holds `Store`,
+      // never `Store<T>`.
+      if (child.type === 'extends_type_clause') {
+        for (const target of child.childrenForFieldName('type')) {
+          if (!target) continue;
+          const named = target.type === 'generic_type' ? getChildByField(target, 'name') ?? target : target;
+          this.unresolvedReferences.push({
+            fromNodeId: classId,
+            referenceName: getNodeText(named, this.source),
+            referenceKind: 'extends',
+            line: target.startPosition.row + 1,
+            column: target.startPosition.column,
+          });
         }
       }
 

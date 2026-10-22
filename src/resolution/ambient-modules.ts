@@ -224,6 +224,173 @@ export function scanAmbientModules(source: string): AmbientModuleScan {
   return { script, blocks };
 }
 
+/** Where a file declares into the global scope. */
+export interface GlobalScopeScan {
+  /** No top-level `import` or `export`: the file's top level is the global scope. */
+  script: boolean;
+  /**
+   * `line:column` of every word at the global scope: at a script's top level,
+   * and directly inside `declare global { … }`. A declaration starts at one of
+   * these exactly when it is a global (its keyword: `interface`, `type`, `class`,
+   * `abstract`, `enum`, `function`, `const`, …).
+   */
+  globalWords: Set<string>;
+  /** The file's `declare module '<name>' { … }` blocks, whose names are the declared module's. */
+  moduleBlocks: readonly AmbientModuleBlock[];
+  /** Names an `import X = …` declaration binds: `import AutofillIpcServer = autofill.AutofillIpcServer`. */
+  importAliases: Set<string>;
+}
+
+/**
+ * The global scope's share of `source`: its top level if the file is a
+ * script, and the bodies of its `declare global` blocks. A namespace's or a
+ * `declare module` block's members, and a module's own declarations, are
+ * not in it.
+ */
+export function scanGlobalScope(source: string): GlobalScopeScan {
+  const { script, blocks: moduleBlocks } = scanAmbientModules(source);
+  const globalWords = new Set<string>();
+  const importAliases = new Set<string>();
+  let declare = 0; // 1: `declare`, 2: `declare global`
+  let inGlobal = false;
+  let alias = 0; // 1: `import` (or `import type`), 2: `import X`
+  let aliasName = '';
+  tokenize(source, (kind, text, line, column, depth) => {
+    if (kind === Kind.Word && text === 'import') alias = 1;
+    else if (alias === 1 && kind === Kind.Word && text !== 'type') {
+      alias = 2;
+      aliasName = text;
+    } else if (alias === 2 && kind === Kind.Punct && text === '=') {
+      importAliases.add(aliasName);
+      alias = 0;
+    } else if (!(alias === 1 && kind === Kind.Word)) alias = 0;
+    if (inGlobal) {
+      if (kind === Kind.Punct && text === '}' && depth === 0) inGlobal = false;
+      else if (kind === Kind.Word && depth === 1) globalWords.add(`${line}:${column}`);
+      return;
+    }
+    if (depth !== 0) {
+      declare = 0;
+      return;
+    }
+    if (kind === Kind.Word) {
+      if (script) globalWords.add(`${line}:${column}`);
+      declare = text === 'declare' ? 1 : declare === 1 && text === 'global' ? 2 : 0;
+      return;
+    }
+    if (kind === Kind.Punct && text === '{' && declare === 2) inGlobal = true;
+    declare = 0;
+  });
+  return { script, globalWords, moduleBlocks, importAliases };
+}
+
+/** One `namespace A.B { … }` statement, or one in the old spelling, `module A { … }`. */
+export interface NamespaceBlock {
+  /** The namespace's full name, the namespaces around it first: `A.B` for `namespace B` in `namespace A`, as for `namespace A.B`. */
+  path: string;
+  /** The `namespace` keyword: 1-based line, 0-based column. */
+  startLine: number;
+  startColumn: number;
+  /** The closing brace. */
+  endLine: number;
+  endColumn: number;
+  /**
+   * A global namespace: directly inside `declare global`, at a declaration
+   * script's top level, or in another global one. A script `.ts`'s top level
+   * is global to its own program only (see isTsTypeInScope in name-matcher).
+   */
+  global: boolean;
+}
+
+/**
+ * Every namespace block in `source`, a nested one under its full name. Read
+ * from tokens, as the module blocks are. One in a `declare module 'x'` body is
+ * module `x`'s, never global, and named as if at the file's top level, where
+ * the module's own declarations name it (`const passport:
+ * passport.PassportStatic`). One in a class's or a function's body is no
+ * namespace a qualified name reaches, and is left out.
+ */
+export function scanNamespaceBlocks(source: string, declarationFile: boolean): NamespaceBlock[] {
+  const topLevelGlobal = declarationFile && scanAmbientModules(source).script;
+  const blocks: NamespaceBlock[] = [];
+  // What each open brace opened, innermost last.
+  const open: Array<NamespaceBlock | 'global' | 'module' | 'other'> = [];
+  let names: string[] | null = null; // the names after `namespace`, while its header is read
+  let expectName = false;
+  let keyword = { line: 0, column: 0 };
+  let declare = 0; // 1: `declare`, 2: `declare global`
+  let ambientModule = false; // just read `module 'x'`
+  let afterDot = false;
+  tokenize(source, (kind, text, line, column) => {
+    if (kind === Kind.Punct && text === '{') {
+      const header = names && names.length > 0 && !expectName ? names : null;
+      const outer = open[open.length - 1];
+      if (declare === 2) {
+        open.push('global');
+      } else if (ambientModule) {
+        open.push('module');
+      } else if (header && outer !== 'other') {
+        const parent = typeof outer === 'object' ? outer : null;
+        const block: NamespaceBlock = {
+          path: (parent ? `${parent.path}.` : '') + header.join('.'),
+          startLine: keyword.line,
+          startColumn: keyword.column,
+          endLine: line,
+          endColumn: column,
+          global: parent ? parent.global : outer === 'global' || (outer === undefined && topLevelGlobal),
+        };
+        blocks.push(block);
+        open.push(block);
+      } else {
+        open.push('other');
+      }
+      names = null;
+      declare = 0;
+      ambientModule = false;
+      afterDot = false;
+      return;
+    }
+    if (kind === Kind.Punct && text === '}') {
+      const closed = open.pop();
+      if (typeof closed === 'object') {
+        closed.endLine = line;
+        closed.endColumn = column;
+      }
+      names = null;
+      declare = 0;
+      ambientModule = false;
+      afterDot = false;
+      return;
+    }
+    ambientModule = names !== null && expectName && names.length === 0 && kind === Kind.String;
+    if (names) {
+      if (expectName && kind === Kind.Word) {
+        names.push(text);
+        expectName = false;
+        return;
+      }
+      if (!expectName && kind === Kind.Punct && text === '.') {
+        expectName = true;
+        return;
+      }
+      names = null;
+    }
+    if (kind === Kind.Word) {
+      if ((text === 'namespace' || text === 'module') && !afterDot) {
+        names = [];
+        expectName = true;
+        keyword = { line, column };
+      }
+      declare = text === 'declare' ? 1 : declare === 1 && text === 'global' ? 2 : 0;
+      afterDot = false;
+      return;
+    }
+    declare = 0;
+    afterDot = kind === Kind.Punct && text === '.';
+  });
+  return blocks;
+}
+
 /**
  * Feed `source`'s tokens to `visit`: words, string literals (by their
  * contents), template literals (as one token, their `${…}` expressions read as
@@ -415,12 +582,16 @@ interface Memo {
   scanned: { byFile: Map<string, AmbientModule[]>; bySpecifier: Map<string, AmbientModule[]> } | null;
   /** Per block (`file`, line, column): its declarations, by name. */
   members: Map<string, Map<string, Node[]>>;
-  /** See ambientModuleFunctionIds. */
-  functionIds: ReadonlySet<string> | null;
+  /** See ambientModuleDeclarations. */
+  declarationIds: ReadonlyMap<string, string> | null;
+  /** The blocks of TypeScript files other than declaration files, by file (see isInModuleBlock). */
+  otherBlocks: Map<string, readonly AmbientModuleBlock[]>;
   /** declarationsFor's answers, by specifier and importing file. */
   declarations: Map<string, AmbientModule[]>;
   /** isMergedAmbientDeclaration's answers, by node id. */
   merged: Map<string, boolean>;
+  /** Each read file's namespace blocks (see namespaceBlocks). */
+  namespaces: Map<string, readonly NamespaceBlock[]>;
 }
 
 const MEMO = new WeakMap<ResolutionContext, Memo>();
@@ -432,8 +603,20 @@ export function clearAmbientModuleMemos(context: ResolutionContext): void {
 
 function memoFor(context: ResolutionContext): Memo {
   let memo = MEMO.get(context);
-  if (!memo) MEMO.set(context, (memo = { scanned: null, members: new Map(), functionIds: null, declarations: new Map(), merged: new Map() }));
+  if (!memo) MEMO.set(context, (memo = { scanned: null, members: new Map(), declarationIds: null, otherBlocks: new Map(), declarations: new Map(), merged: new Map(), namespaces: new Map() }));
   return memo;
+}
+
+/** The namespace blocks of `file` (scanNamespaceBlocks), read once a resolution pass. */
+export function namespaceBlocks(file: string, context: ResolutionContext): readonly NamespaceBlock[] {
+  const memo = memoFor(context);
+  let blocks = memo.namespaces.get(file);
+  if (!blocks) {
+    const source = context.readFile(file);
+    blocks = source && /\b(?:namespace|module)\s+[A-Za-z_$]/.test(source) ? scanNamespaceBlocks(source, DECLARATION_FILE.test(file)) : [];
+    memo.namespaces.set(file, blocks);
+  }
+  return blocks;
 }
 
 /**
@@ -472,7 +655,10 @@ function scanned(context: ResolutionContext): NonNullable<Memo['scanned']> {
 const DECLARATION_KINDS = new Set<Node['kind']>(['function', 'class', 'interface', 'type_alias', 'enum', 'constant', 'variable', 'component']);
 
 /** Whether `node` starts inside the block, by position. */
-function inBlock(node: Node, block: AmbientModuleBlock): boolean {
+export function inBlock(
+  node: Pick<Node, 'startLine' | 'startColumn'>,
+  block: Pick<AmbientModuleBlock, 'startLine' | 'startColumn' | 'endLine' | 'endColumn'>
+): boolean {
   const afterStart = node.startLine > block.startLine || (node.startLine === block.startLine && node.startColumn >= block.startColumn);
   const beforeEnd = node.startLine < block.endLine || (node.startLine === block.endLine && node.startColumn <= block.endColumn);
   return afterStart && beforeEnd;
@@ -616,23 +802,49 @@ function blockDeclaring(node: Node, context: ResolutionContext): AmbientModule |
 }
 
 /**
- * The ids of the functions declaration files' `declare module 'x'` bodies
- * declare. Only an import of `x` reaches one: a module's functions are never
- * global, so a bare `encode()` elsewhere is no call of the `encode` excalidraw
- * declares for `png-chunks-encode`. A set, so asking about every reference a
- * strategy other than the import resolver settles costs a lookup.
+ * The declarations at the own level of declaration files' `declare module 'x'`
+ * bodies, by id, each with the `x` its block declares. A module's members are
+ * never global: a bare `encode()` elsewhere is no call of the `encode`
+ * excalidraw declares for `png-chunks-encode`, Node's `import * as fs from
+ * 'fs'` no import of the `fs` vscode's `workspace` namespace declares, and an
+ * ESLint `Property` no use of emmet's `declare module 'EmmetFlatNode'`. A
+ * map, so asking about every reference a strategy other than the import
+ * resolver settles costs a lookup (see reachesAmbientModule).
  */
-export function ambientModuleFunctionIds(context: ResolutionContext): ReadonlySet<string> {
+export function ambientModuleDeclarations(context: ResolutionContext): ReadonlyMap<string, string> {
   const memo = memoFor(context);
-  if (memo.functionIds) return memo.functionIds;
-  const ids = new Set<string>();
+  if (memo.declarationIds) return memo.declarationIds;
+  const ids = new Map<string, string>();
   for (const [file, modules] of scanned(context).byFile) {
     for (const node of context.getNodesInFile(file)) {
-      if (node.kind === 'function' && isBlockLevel(node) && modules.some((mod) => inBlock(node, mod))) ids.add(node.id);
+      if (!isBlockLevel(node)) continue;
+      const mod = modules.find((m) => inBlock(node, m));
+      if (mod) ids.set(node.id, mod.specifier);
     }
   }
-  memo.functionIds = ids;
+  memo.declarationIds = ids;
   return ids;
+}
+
+/**
+ * Whether line:column of `file` lies inside a block declaring `specifier`:
+ * one of the module's own declarations, which merge, as vscode's proposed API
+ * files add to `vscode.d.ts`'s `declare module 'vscode'`. A declaration
+ * file's blocks are the scanned ones; another TypeScript file's are read the
+ * first time one is asked about.
+ */
+export function isInModuleBlock(file: string, line: number, column: number, specifier: string, context: ResolutionContext): boolean {
+  let blocks: readonly AmbientModuleBlock[] | undefined = scanned(context).byFile.get(file);
+  if (!blocks && !DECLARATION_FILE.test(file)) {
+    const memo = memoFor(context);
+    blocks = memo.otherBlocks.get(file);
+    if (!blocks) {
+      const source = context.readFile(file);
+      blocks = source && /\bdeclare\s+module\s*['"]/.test(source) ? scanAmbientModules(source).blocks : [];
+      memo.otherBlocks.set(file, blocks);
+    }
+  }
+  return (blocks ?? []).some((block) => block.specifier === specifier && inBlock({ startLine: line, startColumn: column }, block));
 }
 
 /**

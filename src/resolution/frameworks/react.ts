@@ -84,16 +84,39 @@ export const reactResolver: FrameworkResolver = {
       isPascalCase(ref.referenceName) &&
       !isBuiltInType(ref.referenceName)
     ) {
-      // A name the file declares itself is that declaration, whatever refers
-      // to it — a route's `element`, a page's default export, a type: the
-      // module a `const RegisterPage = Loadable(lazy(() =>
-      // import('pages/auth/Register')))` loads, the function a value wraps, or
-      // else the declaration, which name matching binds — never a same-named
-      // component in another app of the repository.
-      const own = declaredComponent(ref.referenceName, ref.filePath, context);
-      if (own) {
-        return own.component ? { original: ref, targetNodeId: own.component.id, confidence: 0.9, resolvedBy: 'framework' } : null;
+      // A type annotation is name matching's, which scopes a type as
+      // TypeScript does — the file's own, an import's or a global one — and
+      // never a component elsewhere: component lookup handed the `Option`
+      // annotations of outline's InputSelect.tsx, which declares `type
+      // Option`, to the `Option` component of Export/ExportDialog.tsx, and
+      // mastodon's `<Item>` type parameters to the `Item` class of
+      // media_gallery.jsx. Only a type alias or interface the file declares
+      // beside a value or a component of its name is decided here, where both
+      // are the file's own: the annotation is the type, as bigbluebutton's
+      // `type ModalRegistration` is beside its render-prop component `const
+      // ModalRegistration = (…) =>`. (A class is a type and a value at once.)
+      const own = ownDeclarations(ref.referenceName, ref.filePath, context);
+      if (namesType(ref)) {
+        const type = own.find((n) => n.kind === 'type_alias' || n.kind === 'interface');
+        return type && own.some((n) => n.kind !== 'type_alias' && n.kind !== 'interface' && n.kind !== 'class')
+          ? { original: ref, targetNodeId: type.id, confidence: 0.8, resolvedBy: 'framework' } : null;
       }
+      // Anything else the file declares itself is that declaration, whatever
+      // refers to it — a route's `element`, a page's default export — never a
+      // same-named component in another app of the repository: the module a
+      // `const RegisterPage = Loadable(lazy(() =>
+      // import('pages/auth/Register')))` loads, the function a value wraps, a
+      // function, class or component of that name, or else the declaration,
+      // which name matching binds.
+      const value = declaredComponent(ref.referenceName, ref.filePath, context);
+      if (value) {
+        return value.component ? { original: ref, targetNodeId: value.component.id, confidence: 0.9, resolvedBy: 'framework' } : null;
+      }
+      const component = own.find((n) => COMPONENT_KINDS.has(n.kind));
+      if (component) {
+        return { original: ref, targetNodeId: component.id, confidence: 0.8, resolvedBy: 'framework' };
+      }
+      if (own.length > 0) return null;
       const result = resolveComponent(ref.referenceName, ref.filePath, context);
       if (result) {
         return {
@@ -858,6 +881,27 @@ function handedComponent(value: Node, context: ResolutionContext, nodes = contex
   return handed && isPascalCase(handed) && handed !== value.name
     ? nodes.find((n) => n.name === handed && n.qualifiedName === handed && COMPONENT_KINDS.has(n.kind)) ?? null
     : null;
+}
+
+/**
+ * The name of the component a wrapper component's declaration hands its
+ * rendering to: what `styled(…)` is given (outline's `styled(ActionButton)`,
+ * whatever `.attrs(…)`, `.withConfig(…)`, type arguments or template follow),
+ * or what a `memo` or `forwardRef` call wraps (`memo(Button)`, `React.memo(Row,
+ * areEqual)`, `memo(forwardRef(Input))`; `wrappedName`). React renders it
+ * whenever it renders the wrapper, so a JSX tag's render flow goes on to it.
+ * Null for a wrapper of an element (`styled.div`, `styled('a')`) and for one
+ * around an inline render function, which has a body of its own.
+ */
+export function wrappedComponentName(component: Node, context: ResolutionContext): string | null {
+  const code = stripCommentsForRegex(declarationText(component, context), 'typescript');
+  const init = initializerAt(code, component.name.length);
+  if (init < 0) return null;
+  const expression = code.slice(init, statementEnd(code, init)).trim();
+  const styled = /^styled\s*\(\s*([A-Za-z_$][\w$]*)\s*[,)]/.exec(expression);
+  const name = styled ? styled[1]!
+    : /^(?:React\s*\.\s*)?(?:memo|forwardRef)\b/.test(expression) ? wrappedName(expression) : null;
+  return name && isPascalCase(name) && name !== component.name ? name : null;
 }
 
 /**
@@ -2343,6 +2387,28 @@ const BUILT_IN_TYPES = new Set([
 ]);
 
 const COMPONENT_KINDS = new Set(['component', 'function', 'class']);
+
+/**
+ * What `filePath` declares at its top level under `name`: a type alias, an
+ * interface, a class, an enum, a function, a component or a value. A
+ * declaration nested in another (`EmojiMenu::renderMenuItem`) carries its
+ * owner in its qualified name; an import is no declaration.
+ */
+function ownDeclarations(name: string, filePath: string, context: ResolutionContext): Node[] {
+  return (context.getNodesInFileNamed?.(filePath, name) ?? context.getNodesInFile(filePath).filter((n) => n.name === name))
+    .filter((n) => n.qualifiedName === name && n.kind !== 'import' && n.kind !== 'export' && n.kind !== 'file');
+}
+
+/**
+ * Whether a reference is written where TypeScript reads a type: what a class
+ * implements, or a type annotation's name — the extractor writes a
+ * `references` ref only for a name in a type, and a route's reference to what
+ * it renders comes from the router's own extraction.
+ */
+function namesType(ref: UnresolvedRef): boolean {
+  return ref.referenceKind === 'implements' ||
+    (ref.referenceKind === 'references' && !ref.fromNodeId.startsWith('route:'));
+}
 
 /**
  * Resolve a component reference using name-based lookup
