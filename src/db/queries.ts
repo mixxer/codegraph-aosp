@@ -3030,6 +3030,42 @@ export class QueryBuilder {
   }
 
   /**
+   * {@link getUnresolvedReferencesFrom} for many nodes at once, limited to
+   * `kinds`: a Go type's embeddings of types outside the index, say. Chunked
+   * probe over `idx_unresolved_from_node`.
+   */
+  getUnresolvedReferencesFromNodes(nodeIds: Iterable<string>, kinds: readonly string[]): UnresolvedReference[] {
+    const unique = [...new Set(nodeIds)];
+    const found: UnresolvedReference[] = [];
+    if (unique.length === 0 || kinds.length === 0) return found;
+    const kindPlaceholders = kinds.map(() => '?').join(',');
+    for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM unresolved_refs
+            WHERE from_node_id IN (${placeholders})
+              AND reference_kind IN (${kindPlaceholders})`
+        )
+        .all(...chunk, ...kinds) as UnresolvedRefRow[];
+      for (const row of rows) {
+        found.push({
+          fromNodeId: row.from_node_id,
+          referenceName: row.reference_name,
+          referenceKind: row.reference_kind as EdgeKind,
+          line: row.line,
+          column: row.col,
+          filePath: row.file_path,
+          language: row.language as Language,
+          rowId: row.id,
+        });
+      }
+    }
+    return found;
+  }
+
+  /**
    * Find all edges where both source and target are in the given node set.
    * Useful for recovering inter-node connectivity after BFS.
    */
@@ -3108,7 +3144,7 @@ export class QueryBuilder {
    */
   getCrossFileIncomingEdgesWithTarget(
     filePath: string
-  ): Array<Edge & { targetName: string; targetKind: NodeKind; sourceFilePath: string; sourceLanguage: Language }> {
+  ): Array<Edge & { edgeId: number; targetName: string; targetKind: NodeKind; sourceFilePath: string; sourceLanguage: Language }> {
     const sql = `SELECT e.*, tgt.name AS target_name, tgt.kind AS target_kind,
         src.file_path AS source_file_path, src.language AS source_language
       FROM edges e
@@ -3122,6 +3158,7 @@ export class QueryBuilder {
     >;
     return rows.map(row => ({
       ...rowToEdge(row),
+      edgeId: row.id,
       targetName: row.target_name,
       targetKind: row.target_kind,
       sourceFilePath: row.source_file_path,
@@ -3162,6 +3199,85 @@ export class QueryBuilder {
       sourceLanguage: row.source_language,
       targetFilePath: row.target_file_path,
     }));
+  }
+
+  /**
+   * The import bindings of `filePaths` that resolved some other way than
+   * through their import — `imports` edges out of each file's node named for
+   * the binding, whose `resolvedBy` is a name match or a framework's — with
+   * the source file and language a resurrection needs and the file of each
+   * target. Synthesized edges are left out. The binding edges of a file are
+   * an indexed range (idx_edges_source_kind); few of them resolve by name.
+   */
+  getImportBindingsResolvedElsewhere(
+    filePaths: readonly string[]
+  ): Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language; targetFilePath: string }> {
+    const out: Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language; targetFilePath: string }> = [];
+    const unique = [...new Set(filePaths)].map((filePath) => `file:${filePath}`);
+    for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(
+          `SELECT e.*, src.file_path AS source_file_path, src.language AS source_language, tgt.file_path AS target_file_path
+             FROM edges e
+             JOIN nodes src ON src.id = e.source
+             JOIN nodes tgt ON tgt.id = e.target
+            WHERE e.source IN (${placeholders})
+              AND e.kind = 'imports'
+              AND (e.provenance IS NULL OR e.provenance != 'heuristic')
+              AND json_valid(e.metadata)
+              AND json_extract(e.metadata, '$.resolvedBy') != 'import'`
+        )
+        .all(...chunk) as Array<EdgeRow & { source_file_path: string; source_language: Language; target_file_path: string }>;
+      for (const row of rows) {
+        out.push({
+          ...rowToEdge(row),
+          edgeId: row.id,
+          sourceFilePath: row.source_file_path,
+          sourceLanguage: row.source_language,
+          targetFilePath: row.target_file_path,
+        });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * The resolution edges into `targetIds` — every edge into one of them but
+   * `contains` and synthesized (`provenance='heuristic'`) ones — with the
+   * source file and language a resurrection needs and the file of each target.
+   */
+  getResolutionEdgesInto(
+    targetIds: readonly string[]
+  ): Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language; targetFilePath: string }> {
+    const out: Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language; targetFilePath: string }> = [];
+    const unique = [...new Set(targetIds)];
+    for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(
+          `SELECT e.*, src.file_path AS source_file_path, src.language AS source_language, tgt.file_path AS target_file_path
+             FROM edges e
+             JOIN nodes src ON src.id = e.source
+             JOIN nodes tgt ON tgt.id = e.target
+            WHERE e.target IN (${placeholders})
+              AND e.kind != 'contains'
+              AND (e.provenance IS NULL OR e.provenance != 'heuristic')`
+        )
+        .all(...chunk) as Array<EdgeRow & { source_file_path: string; source_language: Language; target_file_path: string }>;
+      for (const row of rows) {
+        out.push({
+          ...rowToEdge(row),
+          edgeId: row.id,
+          sourceFilePath: row.source_file_path,
+          sourceLanguage: row.source_language,
+          targetFilePath: row.target_file_path,
+        });
+      }
+    }
+    return out;
   }
 
   /**

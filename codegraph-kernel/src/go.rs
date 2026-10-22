@@ -428,8 +428,10 @@ impl<'t> Walker<'t> {
         } else if matches!(kind, "var_declaration" | "short_var_declaration" | "const_declaration")
             && !self.inside_class_like()
         {
-            self.extract_variable(node);
-            self.scan_fn_ref_subtree(node, 0);
+            // The initializers extract_variable walked under their specs'
+            // symbols took their own candidates; the scan covers the rest.
+            let walked = self.extract_variable(node);
+            self.scan_fn_ref_subtree(node, 0, &walked);
             skip_children = true;
         } else if kind == "import_declaration" {
             self.extract_import(node);
@@ -678,7 +680,10 @@ impl<'t> Walker<'t> {
     }
 
     /// extractVariable's Go branch: var/const specs + short_var_declaration.
-    fn extract_variable(&mut self, node: Node<'t>) {
+    /// Returns the initializers it walked under their specs' symbols, for the
+    /// declaration scan to skip.
+    fn extract_variable(&mut self, node: Node<'t>) -> Vec<usize> {
+        let mut walked = Vec::new();
         let docstring = self.docstring_of(node);
         let is_const_decl = node.kind() == "const_declaration";
 
@@ -726,6 +731,7 @@ impl<'t> Walker<'t> {
                     self.stack.push(Scope { row, kind: "variable", name });
                     self.visit_function_body(value_field);
                     self.stack.pop();
+                    walked.push(value_field.id());
                 } else {
                     self.visit_function_body(value_field);
                 }
@@ -756,6 +762,7 @@ impl<'t> Walker<'t> {
                 }
             }
         }
+        walked
     }
 
     /// extractImport's Go branch: one import node + ref per import_spec.
@@ -929,7 +936,7 @@ impl<'t> Walker<'t> {
     /// embedding names — `T`, `*T` (the `*` is a sibling token), `pkg.T` and
     /// `T[X]` all embed `T`. A qualified type yields its name; resolution reads
     /// the package back from the source at that position. None for any other
-    /// type and for a predeclared one.
+    /// type and for a predeclared one but `error`, an interface with a method.
     fn embedded_type_name(&self, ty: Option<Node<'t>>) -> Option<Node<'t>> {
         let mut ty = ty?;
         if ty.kind() == "generic_type" {
@@ -937,7 +944,10 @@ impl<'t> Walker<'t> {
         }
         match ty.kind() {
             "qualified_type" => ty.child_by_field_name("name"),
-            "type_identifier" if !is_go_predeclared_type(self.text(ty)) => Some(ty),
+            "type_identifier" => {
+                let name = self.text(ty);
+                (name == "error" || !is_go_predeclared_type(name)).then_some(ty)
+            }
             _ => None,
         }
     }
@@ -1241,9 +1251,13 @@ impl<'t> Walker<'t> {
         }
     }
 
-    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32, walked: &[usize]) {
         stack_guard!();
         if depth > 12 {
+            return;
+        }
+        // Subtrees the body walker has already been through.
+        if walked.contains(&node.id()) {
             return;
         }
         if depth > 0
@@ -1258,7 +1272,7 @@ impl<'t> Walker<'t> {
         self.maybe_capture_fn_refs(node);
         for i in 0..node.named_child_count() {
             if let Some(c) = node.named_child(i) {
-                self.scan_fn_ref_subtree(c, depth + 1);
+                self.scan_fn_ref_subtree(c, depth + 1, walked);
             }
         }
     }
