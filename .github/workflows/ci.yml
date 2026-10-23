@@ -73,6 +73,7 @@ jobs:
           __tests__/kotlin-object-literal.test.ts
           __tests__/extraction.test.ts
           __tests__/resolution.test.ts
+          __tests__/override-overload-pairing.test.ts
           --maxWorkers=2 --minWorkers=1
 
   checks:
