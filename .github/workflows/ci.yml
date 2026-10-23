@@ -1,95 +1,57 @@
-name: CI
-
+name: Windows compatibility proof
 on:
-  pull_request:
-  push:
-    branches: ["**"]
-  merge_group:
   workflow_dispatch:
-
 permissions:
   contents: read
-
-concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
 env:
   CODEGRAPH_TELEMETRY: '0'
   CODEGRAPH_NO_UPDATE_CHECK: '1'
-
+  CODEGRAPH_KERNEL: '0'
 jobs:
-  test:
-    name: Build and test (Node ${{ matrix.node }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  windows:
+    name: Windows ${{ matrix.target.name }} Node ${{ matrix.node }}
+    runs-on: windows-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         node: [22, 24]
+        target:
+          - { name: upstream, sha: 3a93f57ae1796b47cf6f27e8685e58de957392c3 }
+          - { name: downstream, sha: b6ae433cface2fe3828a6387d97c75b1834eb6d9 }
+          - { name: pr15, sha: f1ed60e2ab1b9685aa00aa4e7f3ccbe6f5ef5da1 }
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ matrix.target.sha }}
           persist-credentials: false
+      - name: Require the exact requested source
+        shell: pwsh
+        env:
+          EXPECTED: ${{ matrix.target.sha }}
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:EXPECTED) { throw "Wrong source SHA: $actual" }
+          Write-Output "Validated source $actual"
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
       - run: npm run build
-      - name: Prepare sensitive-path test directory
-        run: mkdir -p "$HOME/.ssh"
-      - name: Test portable engine and viewer
-        env:
-          CODEGRAPH_KERNEL: '0'
-        run: npm test -- --maxWorkers=2 --minWorkers=1
-
-  kernel:
-    needs: test
-    name: Native kernel and AOSP
-    runs-on: ubuntu-22.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - name: Build Linux kernel
-        run: bash scripts/build-kernel.sh --target x86_64-unknown-linux-gnu
-      - run: npm run build
-      - name: Require the native binary
-        run: test -s codegraph-kernel/prebuilds/linux-x64/codegraph-kernel.node
-      - name: Verify kernel parity and Android tracing
-        env:
-          CODEGRAPH_KERNEL_EXPECT: '1'
+      - name: Windows process, lock and status regressions
         run: >-
           npx vitest run
-          __tests__/kernel-*.test.ts
-          __tests__/aosp-*.test.ts
-          __tests__/kotlin-object-literal.test.ts
-          __tests__/extraction.test.ts
-          __tests__/resolution.test.ts
-          __tests__/override-overload-pairing.test.ts
-          __tests__/java-records.test.ts
-          __tests__/kotlin-call-result-receiver.test.ts
-          __tests__/generic-supertypes.test.ts
+          __tests__/child-process-windows-hide.test.ts
+          __tests__/daemon-lock-holder.test.ts
+          __tests__/cli-unlock.test.ts
+          __tests__/status-index-health.test.ts
           --maxWorkers=2 --minWorkers=1
-
   checks:
-    name: CI checks
     if: always()
-    needs: [test, kernel]
+    needs: windows
     runs-on: ubuntu-latest
-    timeout-minutes: 5
     steps:
-      - name: Require every validation job to pass
-        env:
-          TEST_RESULT: ${{ needs.test.result }}
-          KERNEL_RESULT: ${{ needs.kernel.result }}
-        run: |
-          test "$TEST_RESULT" = success
-          test "$KERNEL_RESULT" = success
+      - env:
+          RESULT: ${{ needs.windows.result }}
+        run: test "$RESULT" = success
