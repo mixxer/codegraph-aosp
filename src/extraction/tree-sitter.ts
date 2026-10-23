@@ -16,7 +16,7 @@ import {
   UnresolvedReference,
 } from '../types';
 import { getParser, detectLanguage, isLanguageSupported, isFileLevelOnlyLanguage } from './grammars';
-import { NodeIdAllocator, getNodeText, getChildByField, getPrecedingDocstring, BUILTIN_TYPE_NAMES } from './tree-sitter-helpers';
+import { NodeIdAllocator, getNodeText, getChildByField, getPrecedingDocstring, BUILTIN_TYPE_NAMES, namedArgCount } from './tree-sitter-helpers';
 import { FN_REF_SPECS, captureFnRefCandidates, goScopedFnRefScopes, type FnRefSpec, type FnRefCandidate } from './function-ref';
 import { isGeneratedFile, isMinifiedContent } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
@@ -27,6 +27,7 @@ import { appendCppMacroMethods } from './languages/cpp-macro-methods';
 import { rustImplItemOwner, rustImplTypeName } from './languages/rust';
 import { goAliasTypeNames, goEmbeddedTypeName, goInterfaceMethodTypeNames, goStructFieldTypeNames } from './languages/go';
 import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeAliasRefs, pushDartTypeRefs } from './languages/dart';
+import { cfmlConstructedComponent, cfmlCreatedComponent, isCfIncludeCall } from './languages/cfscript';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -214,6 +215,24 @@ function extractNameRaw(node: SyntaxNode, source: string, extractor: LanguageExt
 }
 
 /**
+ * The type a Java or TypeScript supertype clause names, without its type
+ * arguments: `Store` for `implements Store<String>`, `a.Base` for `extends
+ * a.Base<Integer>`, `ns.Other` for TypeScript's `implements ns.Other<number>`.
+ * The grammars wrap a parameterized supertype in a `generic_type` whose first
+ * child is the name; the index holds the interface or class under that name,
+ * so the full text (`Store<String>`) matched nothing and a class implementing
+ * a generic interface had no `implements` edge, nor the interface-impl links
+ * that follow from it. Any other node is its own text, as before.
+ */
+function supertypeName(node: SyntaxNode, source: string): string {
+  if (node.type === 'generic_type') {
+    const named = node.namedChildren.find((c: SyntaxNode) => c.type !== 'type_arguments');
+    if (named) return getNodeText(named, source);
+  }
+  return getNodeText(node, source);
+}
+
+/**
  * Resolve a Scala type node to its base type NAME for name-matching — unwrapping
  * `generic_type` (`Monoid[Int]` → `Monoid`), taking the last segment of a
  * qualified `stable_type_identifier` (`cats.Functor` → `Functor`), and falling
@@ -303,6 +322,18 @@ function swiftPropertyInfo(
     (c) => c.type === 'computed_property' || c.type === 'protocol_property_requirements',
   );
   return { nameNode: firstSimpleIdentifier(pattern), isLet, isComputed };
+}
+
+/**
+ * A Ruby constant, or a `scope_resolution` path of constants (`A::B::C`, a
+ * top-level `::A` / `::A::B`): what Ruby reads as a constant. A path through
+ * a value (`obj::Thing`, `self.class::LIMIT`) is not one.
+ */
+function isRubyConstantPath(node: SyntaxNode): boolean {
+  if (node.type === 'constant') return true;
+  if (node.type !== 'scope_resolution') return false;
+  const scope = getChildByField(node, 'scope');
+  return getChildByField(node, 'name')?.type === 'constant' && (!scope || isRubyConstantPath(scope));
 }
 
 /** True when `node` is (transitively) inside a C function body — i.e. a local,
@@ -432,6 +463,14 @@ const LITERAL_RECEIVER_TYPES = new Set([
 const KOTLIN_RECEIVER_CHAIN = /^(?:this|[A-Za-z_]\w*)(?:\.[A-Za-z_]\w*){1,3}$/;
 const TS_JS_CHAIN_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx']);
 
+/** Languages whose `class` node is a class expression (#2499). */
+const CLASS_EXPRESSION_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx', 'arkts']);
+
+/** A class expression's head, `class Widget extends Base`: its text up to the body. Mirrored in the kernel (tsjs extract_class). */
+function classExpressionHead(source: string, node: SyntaxNode, body: SyntaxNode): string {
+  return source.substring(node.startIndex, body.startIndex).replace(/[ \t\r\n]+$/, '');
+}
+
 /** Receiver node types (TS/JS grammars) that continue a member chain downward. */
 const TS_JS_CHAIN_RECEIVER_TYPES = new Set(['member_expression', 'subscript_expression']);
 
@@ -513,6 +552,45 @@ function stripRustTurbofish(text: string): string {
     out += text[i];
   }
   return out;
+}
+
+/** The most links a Rust receiver chain is kept with (rustReceiverChain). */
+const RUST_RECEIVER_CHAIN_MAX_LINKS = 16;
+
+/**
+ * The receiver chain a Rust method call is written on, when it is fields and
+ * method calls on `self` or on a name: `self.services.store`, `self.store()`,
+ * `vis.map`, `self.0`, `x.get::<u8>(1)` — each field by its name or index,
+ * each call as `name()`, its arguments and turbofish dropped. Null for any
+ * other receiver (a path's call, a literal, parentheses, `?`, `.await`, an
+ * index, a macro), and past RUST_RECEIVER_CHAIN_MAX_LINKS links, which keep
+ * the bare method name. Mirrored in the kernel's receiver_chain
+ * (rustlang.rs): both emit the same bytes.
+ */
+function rustReceiverChain(node: SyntaxNode, source: string): string | null {
+  const links: string[] = [];
+  let cur: SyntaxNode | null = node;
+  while (cur && links.length <= RUST_RECEIVER_CHAIN_MAX_LINKS) {
+    if (cur.type === 'self' || cur.type === 'identifier') {
+      const root = getNodeText(cur, source);
+      if (links.length === 0 || !/^[A-Za-z_]\w*$/.test(root)) return null;
+      return [root, ...links.reverse()].join('.');
+    }
+    let fieldOf: SyntaxNode | null = cur;
+    let call = false;
+    if (cur.type === 'call_expression') {
+      fieldOf = getChildByField(cur, 'function');
+      if (fieldOf?.type === 'generic_function') fieldOf = getChildByField(fieldOf, 'function');
+      call = true;
+    }
+    if (fieldOf?.type !== 'field_expression') return null;
+    const field = getChildByField(fieldOf, 'field');
+    const name = field ? getNodeText(field, source) : '';
+    if (call ? !/^[A-Za-z_]\w*$/.test(name) : !/^(?:[A-Za-z_]\w*|\d+)$/.test(name)) return null;
+    links.push(call ? `${name}()` : name);
+    cur = getChildByField(fieldOf, 'value');
+  }
+  return null;
 }
 
 /**
@@ -627,22 +705,47 @@ function tsJsCalleeName(func: SyntaxNode, source: string): { name: string; at: S
 }
 
 /**
+ * A TS/JS receiver that subscripts the enclosing class's object: an element
+ * of a field, `this.<field>[k]` → `this.<field>[]`, or a field named by a
+ * string key, `this['svc']` → `this.svc`. Null for any other subscript.
+ * Mirrored in the kernel's this_subscript_of.
+ */
+function tsThisSubscriptReceiver(node: SyntaxNode, source: string): string | null {
+  if (node.type !== 'subscript_expression') return null;
+  const objectNode = getChildByField(node, 'object');
+  if (!objectNode) return null;
+  const object = peelTsJsReceiver(objectNode);
+  if (object.type === 'this') {
+    const index = getChildByField(node, 'index');
+    const key = index?.type === 'string' ? /^(['"])([A-Za-z_$][\w$]*)\1$/.exec(getNodeText(index, source))?.[2] : undefined;
+    return key ? `this.${key}` : null;
+  }
+  if (object.type !== 'member_expression' || getChildByField(object, 'object')?.type !== 'this') return null;
+  const property = getChildByField(object, 'property');
+  if (!property || !THIS_FIELD_PROPERTY_TYPES.has(property.type)) return null;
+  return `this.${getNodeText(property, source)}[]`;
+}
+
+/**
  * Whether a TS/JS receiver still collapses to the bare method name: `this` /
- * `super` (the resolver reads the owner off the enclosing class), a member
+ * `super` (the resolver reads the owner off the enclosing class) and a member
  * chain rooted at either or at `window` (the project-global escape of
- * {@link isUnresolvedTsJsChain}), and `new C()` (its class is written at the
- * call).
+ * {@link isUnresolvedTsJsChain}). `new C().m()` has its own encoding. A
+ * subscript anywhere in the chain does not: the resolver cannot read the
+ * receiver back from it, so the bare name would exact-match any project
+ * method of that name. (An element of a this-field is typed instead, see
+ * {@link tsThisSubscriptReceiver}.)
  */
 function keepsBareTsJsReceiver(node: SyntaxNode, source: string): boolean {
   let cur: SyntaxNode | null = node;
   while (cur && TS_JS_CHAIN_RECEIVER_TYPES.has(cur.type)) {
+    if (cur.type === 'subscript_expression') return false;
     const object = getChildByField(cur, 'object');
     cur = object ? peelTsJsReceiver(object) : null;
   }
   if (!cur) return false;
   if (cur.type === 'this' || cur.type === 'super') return true;
-  if (cur.type === 'identifier') return getNodeText(cur, source) === 'window';
-  return cur === node && cur.type === 'new_expression';
+  return cur.type === 'identifier' && getNodeText(cur, source) === 'window';
 }
 
 /**
@@ -798,15 +901,19 @@ export class TreeSitterExtractor {
   // don't blank it a second time.
   private sourceIsPreParsed = false;
   private kotlinObjectScopeDepth = 0;
-  // The source as the file has it, kept when this instance's preParse changed
-  // it, for an extractor whose signatures read it (`signatureAsWritten`).
+  // The source as the file has it, kept when preParse changed it (by this
+  // instance, or at the kernel route point for a deferred file), for an
+  // extractor whose signatures read it (`signatureAsWritten`) or whose
+  // re-exports keep their statements as written (`reExportAsWritten`).
   private sourceAsWritten: string | null = null;
+  // Memoized reExportAsWritten verdict (per-extractor = per-file).
+  private reExportsAsWritten: boolean | null = null;
 
   constructor(
     filePath: string,
     source: string,
     language?: Language,
-    options?: { sourceIsPreParsed?: boolean }
+    options?: { sourceIsPreParsed?: boolean; sourceAsWritten?: string }
   ) {
     this.filePath = filePath;
     this.source = source;
@@ -814,11 +921,25 @@ export class TreeSitterExtractor {
     this.extractor = EXTRACTORS[this.language] || null;
     this.fnRefSpec = FN_REF_SPECS[this.language];
     this.sourceIsPreParsed = options?.sourceIsPreParsed === true;
+    if (options?.sourceAsWritten !== undefined && options.sourceAsWritten !== source) {
+      this.sourceAsWritten = options.sourceAsWritten;
+    }
   }
 
   /** The text `getSignature` reads: the source as written when the extractor asks for it. */
   private get signatureSource(): string {
-    return this.sourceAsWritten ?? this.source;
+    return this.extractor?.signatureAsWritten && this.sourceAsWritten !== null ? this.sourceAsWritten : this.source;
+  }
+
+  /**
+   * The text an import node reads its statement from: for a re-export, the
+   * source as written when the extractor asks (`reExportAsWritten`), so
+   * `export type * from './x'` keeps its `type` (#2474).
+   */
+  private importSource(node: SyntaxNode): string {
+    if (node.type !== 'export_statement' || this.sourceAsWritten === null) return this.source;
+    this.reExportsAsWritten ??= this.extractor?.reExportAsWritten?.(this.sourceAsWritten) === true;
+    return this.reExportsAsWritten ? this.sourceAsWritten : this.source;
   }
 
   /**
@@ -871,7 +992,7 @@ export class TreeSitterExtractor {
       // kernel route point already applied it (sourceIsPreParsed).
       if (this.extractor?.preParse && !this.sourceIsPreParsed) {
         const preParsed = this.extractor.preParse(this.source, this.filePath);
-        if (preParsed !== this.source && this.extractor.signatureAsWritten) this.sourceAsWritten = this.source;
+        if (preParsed !== this.source) this.sourceAsWritten = this.source;
         this.source = preParsed;
       }
       this.tree = parser.parse(this.source) ?? null;
@@ -968,6 +1089,7 @@ export class TreeSitterExtractor {
       }
       // Release source string to reduce GC pressure
       this.source = '';
+      this.sourceAsWritten = null;
     }
 
     return {
@@ -1546,7 +1668,7 @@ export class TreeSitterExtractor {
       skipChildren = true;
     }
     // Check for class declarations
-    else if (this.extractor.classTypes.includes(nodeType)) {
+    else if (this.isClassTypeNode(node, nodeType)) {
       // Some languages reuse class_declaration for structs/enums (e.g. Swift)
       const classification = this.extractor.classifyClassNode?.(node) ?? 'class';
       if (classification === 'struct') {
@@ -2551,6 +2673,16 @@ export class TreeSitterExtractor {
   /**
    * Extract a class
    */
+  /**
+   * Whether `node` is a class to extract: one of the language's class types,
+   * except a TS/JS class expression without a name (`register(class extends
+   * Base {…})`), which is passed over as before (#2499).
+   */
+  private isClassTypeNode(node: SyntaxNode, nodeType: string): boolean {
+    if (!this.extractor!.classTypes.includes(nodeType)) return false;
+    return nodeType !== 'class' || !CLASS_EXPRESSION_LANGUAGES.has(this.language) || !!getChildByField(node, 'name');
+  }
+
   private extractClass(node: SyntaxNode, kind: NodeKind = 'class'): void {
     if (!this.extractor) return;
 
@@ -2566,13 +2698,19 @@ export class TreeSitterExtractor {
     const name = extractName(node, this.source, this.extractor);
     const docstring = this.docstringFor(node);
     const visibility = this.extractor.getVisibility?.(node);
-    const isExported = this.extractor.isExported?.(node, this.source);
+    // A class expression's name is bound inside the expression alone, so the
+    // class is never what a module exports by it, and it carries its head
+    // (`class Widget extends Base`) as its signature: a class declaration
+    // has none, which is how resolution tells the two apart (#2499).
+    const expression = node.type === 'class' && CLASS_EXPRESSION_LANGUAGES.has(this.language);
+    const isExported = expression ? false : this.extractor.isExported?.(node, this.source);
     const scoped = this.writtenScopeQualifiedName(node, name);
 
     const classNode = this.createNode(kind, name, node, {
       docstring,
       visibility,
       isExported,
+      ...(expression && resolvedBody ? { signature: classExpressionHead(this.source, node, resolvedBody) } : {}),
       ...this.cppBodyEnd(resolvedBody),
       ...(scoped !== undefined ? { qualifiedName: scoped } : {}),
     });
@@ -2663,10 +2801,20 @@ export class TreeSitterExtractor {
     // on every ordinary method (breaks kernel↔wasm parity JSON equality).
     const isAbstract = this.extractor.isAbstract?.(node) ? true : undefined;
     const returnType = this.extractor.getReturnType?.(node, this.source);
+    // A method that is a top-level declaration (Go: `func (r *T) Name()`) has
+    // the same exportedness rule as a function — the name's case — and a
+    // consumer asking "can another package name this?" needs it on methods
+    // too. Class members keep the flag unset: their reachability is the
+    // class's, and the languages whose isExported walks the parent chain
+    // (JS/TS) would otherwise re-mark every member of an exported class.
+    const isExported = this.extractor.methodsAreTopLevel
+      ? this.extractor.isExported?.(node, this.source)
+      : undefined;
     const extraProps: Partial<Node> = {
       docstring,
       signature,
       visibility,
+      isExported,
       isAsync,
       isStatic,
       isAbstract,
@@ -4599,11 +4747,12 @@ export class TreeSitterExtractor {
   private extractImport(node: SyntaxNode): void {
     if (!this.extractor) return;
 
-    const importText = getNodeText(node, this.source).trim();
+    const statementSource = this.importSource(node);
+    const importText = getNodeText(node, statementSource).trim();
 
     // Try language-specific hook first
     if (this.extractor.extractImport) {
-      const info = this.extractor.extractImport(node, this.source);
+      const info = this.extractor.extractImport(node, statementSource);
       if (info) {
         this.createNode('import', info.moduleName, node, {
           signature: info.signature,
@@ -5141,6 +5290,31 @@ export class TreeSitterExtractor {
     const callerId = this.nodeStack[this.nodeStack.length - 1];
     if (!callerId) return;
 
+    // CFML `cfinclude(template="x.cfm")` includes a template, as `include
+    // "x.cfm";` does (#2651): an import of the file, never a call.
+    if (this.language === 'cfscript' && isCfIncludeCall(node, this.source)) {
+      this.extractImport(node);
+      return;
+    }
+
+    // CFML `createObject("component", "a.b.Batch")` makes an instance of the
+    // component, as `new a.b.Batch()` does (#2652): an instantiation of it,
+    // under the path as written, which the resolver reads as `extends`'
+    // component paths. Not a call: createObject is the engine's own function.
+    if (this.language === 'cfscript') {
+      const created = cfmlCreatedComponent(node, this.source);
+      if (created) {
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: created,
+          referenceKind: 'instantiates',
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
+        return;
+      }
+    }
+
     // VB.NET: `foo(args)` is syntactically ambiguous between a call and an
     // index read, so the grammar parses non-empty parens as
     // array_access_expression (field `array`, not `function`) — even Roslyn
@@ -5242,8 +5416,7 @@ export class TreeSitterExtractor {
           }
           // Arity from the call site's own argument list — part of the callee's
           // identity, and what disambiguates `f/1` from `f/2` (#1610).
-          const callArgsNode = getChildByField(node, 'args');
-          const callArity = callArgsNode ? callArgsNode.namedChildCount : 0;
+          const callArity = namedArgCount(getChildByField(node, 'args'));
           this.unresolvedReferences.push({
             fromNodeId: callerId,
             referenceName: `${calleeName}/${callArity}`,
@@ -5310,7 +5483,7 @@ export class TreeSitterExtractor {
               // qualified matcher then resolves it only when the module
               // defines exactly one arity of that name.
               const mfaList = argExprs[i + 2];
-              const arityTail = mfaList?.type === 'list' ? `/${mfaList.namedChildCount}` : '';
+              const arityTail = mfaList?.type === 'list' ? `/${namedArgCount(mfaList)}` : '';
               this.unresolvedReferences.push({
                 fromNodeId: callerId,
                 referenceName: (isLocalModule ? erlAtom(f) : `${erlAtom(m)}::${erlAtom(f)}`) + arityTail,
@@ -5431,7 +5604,10 @@ export class TreeSitterExtractor {
       // — is itself a dependency on that constant; emit a `references` ref so a
       // class used only via its class methods still records a dependent (the edge
       // the old receiver-only callee happened to provide, now made explicit).
-      if (!skip && receiverNode.type === 'constant') {
+      // So is one written with its namespace, `Billing::ChargeCard.call` or
+      // `::Foo.call` (#2503), under the receiver as written; a path through a
+      // value (`obj::Thing`, `self.class::LIMIT`) names no constant.
+      if (!skip && isRubyConstantPath(receiverNode)) {
         this.unresolvedReferences.push({
           fromNodeId: callerId,
           referenceName: receiverName,
@@ -5909,6 +6085,8 @@ export class TreeSitterExtractor {
               : rawReceiver && this.language === 'swift'
                 ? peelSwiftCallWrappers(rawReceiver, this.source)
                 : rawReceiver;
+            // `this.<field>[]` / `this.<name>` of a subscript receiver, set by its branch below.
+            let thisSubscript: string | null = null;
             // A LITERAL receiver — `", ".join(...)`, `"x".toUpperCase()`,
             // `5.times`, `[].concat(...)` — calls a builtin of the literal's
             // type, never a project symbol. The bare-name fallback below let
@@ -5920,6 +6098,8 @@ export class TreeSitterExtractor {
               return;
             }
             const SKIP_RECEIVERS = new Set(['self', 'this', 'cls', 'super']);
+            let constructed: string | null = null;
+            let rustChain: string | null = null;
             if (receiver && (receiver.type === 'identifier' || receiver.type === 'simple_identifier' || receiver.type === 'field_identifier')) {
               const receiverName = getNodeText(receiver, this.source);
               if (!SKIP_RECEIVERS.has(receiverName)) {
@@ -5953,11 +6133,20 @@ export class TreeSitterExtractor {
               // or unknown. Previously this collapsed to the bare method name,
               // which exact-matched whichever same-named method was nearest —
               // often the calling method itself, a self-edge not in the source.
-              // Deeper chains (`self.a.b.m()`), `self.f().m()` and parenthesized
-              // receivers keep the bare name. Mirrored in the kernel's
-              // extract_call (rustlang.rs).
+              // Mirrored in the kernel's extract_call (rustlang.rs).
               const fieldName = getNodeText(getChildByField(receiver, 'field')!, this.source);
               calleeName = `self.${fieldName}.${methodName}`;
+            } else if (this.language === 'rust' && receiver && (rustChain = rustReceiverChain(receiver, this.source)) !== null) {
+              // Rust call on a longer chain of fields and method calls —
+              // `self.services.store.put()`, `self.store().put()`,
+              // `vis.map.get()`, split over lines by rustfmt or not (#2836).
+              // Keep the chain, calls written `name()`: the bare method name
+              // this used to emit said nothing of which value the call is
+              // made on. The resolver reads the receiver where the call is
+              // written. Parenthesized receivers, `?`, `.await` and a path's
+              // call (`Foo::new().a().b()`) keep the bare name. Mirrored in
+              // the kernel's extract_call (rustlang.rs).
+              calleeName = `${rustChain}.${methodName}`;
             } else if (
               (this.language === 'cpp' ||
                 this.language === 'c' ||
@@ -6043,6 +6232,14 @@ export class TreeSitterExtractor {
               // (`!Settings.Defaults.isOn()`). Mirrored in the kernel's
               // extract_call (swift.rs).
               calleeName = `${swiftUnwrappedText(receiver, this.source).replace(/\s+/g, '')}.${methodName}`;
+            } else if (this.language === 'cfscript' && receiver && (constructed = cfmlConstructedComponent(receiver, this.source))) {
+              // CFML call on the component the receiver constructs —
+              // `createObject("component", "a.b.Batch").init()`, `new
+              // a.b.Batch().init()` (#2652). Encode `<component>().<method>`:
+              // the resolver finds the component as `new`/`extends` do and the
+              // method on it, or nothing. The bare `init` this used to emit
+              // matched whichever component's `init` came first.
+              calleeName = `${constructed}().${methodName}`;
             } else if (
               this.language === 'cfscript' &&
               receiver &&
@@ -6083,6 +6280,18 @@ export class TreeSitterExtractor {
               // its name keeps the `#` (#1987).
               const fieldName = getNodeText(getChildByField(receiver, 'property')!, this.source);
               calleeName = `this.${fieldName}.${methodName}`;
+            } else if (
+              TS_JS_CHAIN_LANGUAGES.has(this.language) &&
+              receiver &&
+              (thisSubscript = tsThisSubscriptReceiver(receiver, this.source)) !== null
+            ) {
+              // An element of a field of the enclosing class —
+              // `this.listeners[type].push()`, `this.items[0].save()` — kept
+              // as `this.<field>[].<method>`: the resolver reads the element
+              // type off the field's declaration (`Item[]`, `Record<K, V>`)
+              // or leaves it unresolved. `this['svc'].start()` is the field
+              // itself. Mirrored in the kernel's extract_call.
+              calleeName = `${thisSubscript}.${methodName}`;
             } else if (
               (this.language === 'typescript' ||
                 this.language === 'javascript' ||
@@ -6152,6 +6361,24 @@ export class TreeSitterExtractor {
               const chain = getNodeText(func, this.source).replace(/\s+/g, '').replace(/\?\./g, '.');
               if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*){2,}$/.test(chain)) return;
               calleeName = chain;
+            } else if (TS_JS_CHAIN_LANGUAGES.has(this.language) && receiver?.type === 'new_expression') {
+              // Constructor receiver — `new Runner().run()`, `new RegExp(p).exec(s)`.
+              // The class is written at the call, so keep it: `new Runner().run`
+              // tells the resolver the receiver is an INSTANCE of `Runner`, and
+              // the method resolves on that class (or a supertype) or nowhere —
+              // a built-in or external class has no project method to bind to.
+              // The bare method name this used to emit exact-matched any
+              // same-named project method (`new RegExp(p).exec()` onto a
+              // database wrapper's `exec`). A constructor that is not a plain
+              // name or member chain (`new (f())().m()`) emits nothing.
+              // Mirrored in the kernel's extract_call (tsjs/extractors.rs).
+              const ctor = getChildByField(receiver, 'constructor');
+              const ctorName = ctor ? getNodeText(ctor, this.source).replace(/\s+/g, '') : '';
+              if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(ctorName)) return;
+              // `new this.constructor().copy(this)`, a static `new this().init()`:
+              // an instance of the enclosing class, which no name is written for,
+              // keeps the bare method name, as a call on `this` does.
+              calleeName = ctorName === 'this' || ctorName === 'this.constructor' ? methodName : `new ${ctorName}().${methodName}`;
             } else if (
               TS_JS_CHAIN_LANGUAGES.has(this.language) &&
               receiver &&
@@ -6159,7 +6386,7 @@ export class TreeSitterExtractor {
             ) {
               // Any other TS/JS receiver is an expression with no static
               // type here — `(a ?? b).map()`, `f().list.map()`,
-              // `arr[0].run()`, `(() => {}).call()`. The bare method name this
+              // `arr[0].run()`, `this.a.b[k].run()`, `(() => {}).call()`. The bare method name this
               // used to emit exact-matched whichever project method shared the
               // name (`(await list()).map()` onto an adapter class's `map`).
               // Emit nothing: a silent miss, never a wrong edge. Mirrored in
@@ -7369,6 +7596,10 @@ export class TreeSitterExtractor {
       // handler paths live in a raw token tree the call walker can't see.
       if (nodeType === 'macro_invocation') this.extractRustRouteMacro(node);
 
+      // A CFML `include "x.cfm";` in a function body includes the template
+      // there, as it does at component scope (#2651).
+      if (nodeType === 'include_statement' && this.language === 'cfscript') this.extractImport(node);
+
       if (this.extractor!.callTypes.includes(nodeType)) {
         this.extractCall(node);
       } else if (INSTANTIATION_KINDS.has(nodeType) || this.isVbnetConstructorShapedArrayCreation(node)) {
@@ -7584,7 +7815,7 @@ export class TreeSitterExtractor {
 
       // Extract structural nodes found inside function bodies.
       // Each extract method visits its own children, so we return after extracting.
-      if (this.extractor!.classTypes.includes(nodeType)) {
+      if (this.isClassTypeNode(node, nodeType)) {
         const classification = this.extractor!.classifyClassNode?.(node) ?? 'class';
         if (classification === 'struct') this.extractStruct(node);
         else if (classification === 'enum') this.extractEnum(node);
@@ -7762,7 +7993,7 @@ export class TreeSitterExtractor {
         const targets = typeList ? typeList.namedChildren : [child.namedChild(0)];
         for (const target of targets) {
           if (target) {
-            const name = getNodeText(target, this.source);
+            const name = supertypeName(target, this.source);
             this.unresolvedReferences.push({
               fromNodeId: classId,
               referenceName: name,
@@ -7829,7 +8060,7 @@ export class TreeSitterExtractor {
         const targets = typeList ? typeList.namedChildren : child.namedChildren;
         for (const iface of targets) {
           if (iface) {
-            const name = getNodeText(iface, this.source);
+            const name = supertypeName(iface, this.source);
             this.unresolvedReferences.push({
               fromNodeId: classId,
               referenceName: name,
@@ -9637,7 +9868,7 @@ export function extractFromSource(
         filePath,
         deferredPre ?? source,
         detectedLanguage,
-        { sourceIsPreParsed: deferredPre != null }
+        deferredPre != null ? { sourceIsPreParsed: true, sourceAsWritten: source } : undefined
       );
       result = extractor.extract();
     }

@@ -74,6 +74,9 @@ jobs:
           __tests__/extraction.test.ts
           __tests__/resolution.test.ts
           __tests__/override-overload-pairing.test.ts
+          __tests__/java-records.test.ts
+          __tests__/kotlin-call-result-receiver.test.ts
+          __tests__/generic-supertypes.test.ts
           --maxWorkers=2 --minWorkers=1
 
   checks:

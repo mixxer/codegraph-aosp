@@ -30,6 +30,7 @@ import {
   tsImportedTypeFile,
   reExportSource,
   pythonFunctionModuleAlias,
+  isPythonFromImportModule,
   isRustAssociatedItem,
   tsGlobalScope,
 } from './name-matcher';
@@ -2721,8 +2722,9 @@ export function resolvePhpQualifiedClassRef(
   if (separator === 0) {
     fqn = name.slice(1);
   } else {
-    const head = name.slice(0, separator);
-    const imp = context.getImportMappings(ref.filePath, ref.language).find((i) => i.localName === head);
+    // PHP matches a namespace alias without regard to case.
+    const head = name.slice(0, separator).toLowerCase();
+    const imp = context.getImportMappings(ref.filePath, ref.language).find((i) => i.localName.toLowerCase() === head);
     if (imp) {
       fqn = imp.source.replace(/^\\/, '') + name.slice(separator);
     } else {
@@ -3661,11 +3663,14 @@ function resolvePythonAbsoluteModule(
   context: ResolutionContext
 ): ResolvedRef | null {
   if (ref.referenceKind !== 'imports') return null;
-  // Only a DOTTED `import a.b.c` ref carries its full module path. A bare leaf
-  // (`from app.api.routes import authentication`) is ambiguous on its own — three
-  // `authentication.py` files may exist — so leave it to resolveModuleImportToFile,
-  // which uses the import's source (`app.api.routes`) to build the full path.
-  if (!ref.referenceName.includes('.')) return null;
+  // Only a DOTTED `import a.b.c` ref carries its full module path, and so does
+  // the module a from-import names, dotted or not: `from loader import X` is
+  // the top-level `loader`, found from the package roots as `import loader`
+  // finds it. A bare leaf it imports (`from app.api.routes import
+  // authentication`) is ambiguous on its own — three `authentication.py` files
+  // may exist — so leave it to resolveModuleImportToFile, which uses the
+  // import's source (`app.api.routes`) to build the full path.
+  if (!ref.referenceName.includes('.') && !isPythonFromImportModule(ref, context)) return null;
   const hit = pythonModuleFileNode(ref.referenceName, ref.filePath, context);
   return hit ? { original: ref, targetNodeId: hit.id, confidence: 0.9, resolvedBy: 'import' } : null;
 }
@@ -3930,7 +3935,9 @@ function findGoPackageMember(
   if (pkgDir == null) return null;
   for (const node of context.getNodesByName(memberName)) {
     if (node.language !== 'go') continue;
-    if (!node.isExported) continue;
+    // A method is no member of its package: `pkg.Infof` is the package's
+    // function, never a method `(*Logger).Infof` declared beside it.
+    if (!node.isExported || node.kind === 'method') continue;
     if (path.posix.dirname(node.filePath.replace(/\\/g, '/')) === pkgDir) {
       return {
         original: ref,

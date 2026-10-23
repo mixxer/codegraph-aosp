@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonAttrRefResolves, isImportShadowedByJsBinding, isManualMockPath, matchKotlinReceiverChain } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustPathCallReachable, rustChainedCallByName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -40,6 +40,8 @@ import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
 import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js-super-calls';
+import { CLASS_EXPRESSION_REF_LANGUAGES, isCommonJsExportedClass, isJsClassExpression, writtenIn, type ClassExpressionIndex } from './js-class-expressions';
+import { matchRubyConstantPathRef } from './ruby-constant-paths';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
@@ -94,6 +96,9 @@ const CHAIN_SHAPE = /^(.+)\(\)\.(\w+)$/;
 
 /** PHP `$this->prop->method()` encoded as `this->prop.method` — no `()`, so CHAIN_SHAPE misses it. */
 const PHP_PROP_SHAPE = /^this->\w+\.\w+$/;
+
+/** A CFML call on a construction, `a.b.Batch().init` (#2652); CFML names may hold `$` (`$init`). */
+const CFML_CONSTRUCTED_CALL = /^([A-Za-z_$][\w$.-]*)\(\)\.([A-Za-z_$][\w$]*)$/;
 
 /**
  * How many files that import a changed module by default a sync reads the
@@ -575,6 +580,10 @@ export class ReferenceResolver {
     this.mocklessContext = null;
     this.mocklessBase = null;
     this.manualMocks = undefined;
+    this.classExpressionFreeViews = new WeakMap();
+    this.classExpressionFreeBases = new WeakMap();
+    this.classExpressionIndex = undefined;
+    this.classExpressionOnlyNameSet = null;
     this.nodeCache.clear();
     this.fileCache.clear();
     this.importMappingCache.clear();
@@ -764,6 +773,10 @@ export class ReferenceResolver {
         this.nameCache.set(name, result);
         return result;
       },
+
+      // The set warmCaches loads (`SELECT DISTINCT name FROM nodes`, the exact
+      // match getNodesByName makes); unloaded, no name is absent.
+      isAbsentName: (name: string) => this.knownNames !== null && !this.knownNames.has(name),
 
       getMethodMatches: (typeName: string, methodName: string, language: Language) => {
         const key = `${language} ${typeName}::${methodName}`;
@@ -1193,33 +1206,37 @@ export class ReferenceResolver {
    */
   private hasAnyPossibleMatch(name: string): boolean {
     if (!this.knownNames) return true; // no pre-filter available
+    // In the view outside the class expressions, names only their classes
+    // and members carry name nothing (classExpressionFreeContextFor).
+    const only = this.classExpressionFreeBases.has(this.context) ? this.classExpressionOnlyNames() : null;
+    const known = (n: string): boolean => this.knownNames!.has(n) && !(only?.has(n) ?? false);
 
     // Direct name match
-    if (this.knownNames.has(name)) return true;
+    if (known(name)) return true;
 
     // For qualified names like "obj.method" or "Class::method", check the parts
     const dotIdx = name.indexOf('.');
     if (dotIdx > 0) {
       const receiver = name.substring(0, dotIdx);
       const member = name.substring(dotIdx + 1);
-      if (this.knownNames.has(receiver) || this.knownNames.has(member)) return true;
+      if (known(receiver) || known(member)) return true;
       // Also check capitalized receiver (instance-method resolution)
       const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
-      if (this.knownNames.has(capitalized)) return true;
+      if (known(capitalized)) return true;
       // JVM FQN: `com.example.foo.Bar` — the only useful segment is the
       // last one (`Bar`); the earlier check finds `example.foo.Bar` which
       // never matches a node name.
       const lastDot = name.lastIndexOf('.');
       if (lastDot > dotIdx) {
         const tail = name.substring(lastDot + 1);
-        if (tail && this.knownNames.has(tail)) return true;
+        if (tail && known(tail)) return true;
       }
     }
     const colonIdx = name.indexOf('::');
     if (colonIdx > 0) {
       const receiver = name.substring(0, colonIdx);
       const member = name.substring(colonIdx + 2);
-      if (this.knownNames.has(receiver) || this.knownNames.has(member)) return true;
+      if (known(receiver) || known(member)) return true;
       // Multi-segment path `a::b::c` (a Rust/C++ module call like
       // `database::profiles::find`) — the only segment that names a symbol is
       // the last (`c`); `member` above is `b::c`, which never matches a node
@@ -1228,7 +1245,7 @@ export class ReferenceResolver {
       const lastColon = name.lastIndexOf('::');
       if (lastColon > colonIdx) {
         const tail = name.substring(lastColon + 2);
-        if (tail && this.knownNames.has(tail)) return true;
+        if (tail && known(tail)) return true;
       }
     }
 
@@ -1242,9 +1259,9 @@ export class ReferenceResolver {
       if (sepIdx > 0) {
         const receiver = name.substring(0, sepIdx);
         const member = name.substring(sepIdx + 1);
-        if (this.knownNames.has(member) || this.knownNames.has(receiver)) return true;
+        if (known(member) || known(receiver)) return true;
         const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
-        if (this.knownNames.has(capitalized)) return true;
+        if (known(capitalized)) return true;
       }
     }
 
@@ -1252,7 +1269,7 @@ export class ReferenceResolver {
     const slashIdx = name.lastIndexOf('/');
     if (slashIdx > 0) {
       const fileName = name.substring(slashIdx + 1);
-      if (this.knownNames.has(fileName)) return true;
+      if (known(fileName)) return true;
     }
 
     return false;
@@ -1380,11 +1397,20 @@ export class ReferenceResolver {
 
   resolveOne(ref: UnresolvedRef): ResolvedRef | null {
     // Production code is resolved as if the project's manual mocks were not
-    // indexed (see mocklessContextFor); every strategy below reads the graph
-    // through this.context, so it answers for that view.
+    // indexed (see mocklessContextFor), and code outside the named class
+    // expressions as if their classes were not (classExpressionFreeContextFor);
+    // every strategy below reads the graph through this.context, so it
+    // answers for that view.
     const outer = this.context;
-    const base = outer === this.mocklessContext && this.mocklessBase ? this.mocklessBase : outer;
-    const context = this.mocklessContextFor(ref, base) ?? base;
+    const unviewed = this.classExpressionFreeBases.get(outer) ?? outer;
+    const base = unviewed === this.mocklessContext && this.mocklessBase ? this.mocklessBase : unviewed;
+    const mockless = this.mocklessContextFor(ref, base) ?? base;
+    return this.resolveOneWith(this.classExpressionFreeContextFor(ref, mockless) ?? mockless, ref);
+  }
+
+  /** resolveOneIn with every strategy reading the graph through `context`. */
+  private resolveOneWith(context: ResolutionContext, ref: UnresolvedRef): ResolvedRef | null {
+    const outer = this.context;
     if (context === outer) return this.resolveOneIn(ref);
     this.context = context;
     try {
@@ -1395,6 +1421,17 @@ export class ReferenceResolver {
   }
 
   private resolveOneIn(ref: UnresolvedRef): ResolvedRef | null {
+    // A Rust call kept with its receiver chain — `self.services.store.put`,
+    // `self.store().put` (#2836) — resolves as the call by its method's name
+    // did before the extractor kept the chain: every strategy and gate reads
+    // that name the same way, and the receiver's type is read through the
+    // whole chain where the call is written (matchRustWrittenReceiverCall).
+    // The edge keeps the call as written.
+    const byName = rustChainedCallByName(ref);
+    if (byName) {
+      const resolved = this.resolveOneIn(byName);
+      return resolved && { ...resolved, original: ref };
+    }
     // A C/C++ "call" whose name is a function-like macro visible in this
     // translation unit is a macro expansion, not a call — it must never bind
     // to a same-named function in another file (#1838).
@@ -1428,6 +1465,8 @@ export class ReferenceResolver {
       const module = this.nodeById(resolved.targetNodeId);
       if (module && module.kind !== 'file' && module.kind !== 'module') return null;
     }
+    if (resolved && (resolved.byName || resolved.resolvedBy === 'exact-match' || resolved.resolvedBy === 'fuzzy') &&
+        isGuessedRecordAccessor(resolved, ref, this.context)) return null;
     // A name the calling JS/TS function binds itself (a parameter, a local) in
     // scope at the reference is that binding even when the file imports the
     // name, which the import resolver answers before the matcher's own check.
@@ -1534,9 +1573,14 @@ export class ReferenceResolver {
     const superCall = matchJsSuperCall(ref, this.context);
     if (superCall !== undefined) return superCall;
 
-    // Skip built-in/external references
+    // Skip built-in/external references — except a python call of a
+    // builtin-named method through a local or a parameter its def types as a
+    // project class (`reg = Registry(); reg.get(k)`, #2583): that reading,
+    // by evidence only, is the one way back, and nothing guesses past it.
     if (this.isBuiltInOrExternal(ref)) {
-      return null;
+      return this.isPythonBuiltinNamedMethodCall(ref)
+        ? this.gateLanguage(matchPythonTypedLocalCall(ref, this.context), ref)
+        : null;
     }
 
     // CFML component paths in inheritance (#1152): `extends="coldbox.system.web.
@@ -1555,6 +1599,30 @@ export class ReferenceResolver {
     ) {
       return this.resolveCfmlComponentPath(ref);
     }
+    // The component a CFML `createObject("component", "a.b.Batch")` makes,
+    // named by its component path as `extends` names one (#2652), and a call
+    // chained onto a construction — `createObject(…).init()`, `new
+    // a.b.Batch().init()`, encoded `a.b.Batch().init` — which is a method of
+    // that component or of nothing: no name match may guess past it.
+    if (ref.language === 'cfml' || ref.language === 'cfscript') {
+      if (ref.referenceKind === 'instantiates' && ref.referenceName.includes('.')) return this.resolveCfmlComponentPath(ref);
+      if (ref.referenceKind === 'calls' && CFML_CONSTRUCTED_CALL.test(ref.referenceName)) return this.resolveCfmlConstructedCall(ref);
+    }
+
+    // A CFML include names a template by its path from the including file's
+    // directory, or from the web root (#2651): `<cfinclude template="../shared/
+    // helpers.cfm">` is that file, not whichever `helpers.cfm` file-name
+    // matching would settle on. A path that names no file here (one through a
+    // server mapping, `/contenscms/…`) is matched by its file name, as before,
+    // but only to a file: the symbol strategies below took a path no file
+    // matched for another template's import statement of the same path. Nor
+    // is it the including file, which a file-name match can land on (Wheels'
+    // `views/wheels/wheels.cfm` including `../../wheels/public/wheels.cfm`).
+    if ((ref.language === 'cfml' || ref.language === 'cfscript') && ref.referenceKind === 'imports' && isCfmlTemplatePath(ref.referenceName)) {
+      const included = this.resolveCfmlIncludePath(ref) ?? matchByFilePath(ref, this.context);
+      if (included && this.nodeById(included.targetNodeId)?.filePath === ref.filePath) return null;
+      return this.gateLanguage(included, ref);
+    }
 
     // A PHP class written with a namespace in it — `new Alias\X()` through a
     // `use Ns as Alias;` namespace alias, `extends Sub\Base`, `\Ns\X::make()`
@@ -1562,6 +1630,15 @@ export class ReferenceResolver {
     // strategy ran, and PHP gives each one exactly one meaning; resolve it first.
     const phpQualified = resolvePhpQualifiedClassRef(ref, this.context);
     if (phpQualified !== undefined) return this.gateLanguage(phpQualified, ref);
+
+    // A Ruby constant written with its namespace (`Billing::ChargeCard`,
+    // `::Foo`) and a call on one (`Billing::ChargeCard.call`) are what Ruby's
+    // constant lookup finds from where they are written, or nothing the
+    // project declares (see ./ruby-constant-paths). The pre-filter below
+    // drops a `::`-rooted name, and the strategies past it would take a
+    // namesake by its last name.
+    const rubyPath = matchRubyConstantPathRef(ref, this.context);
+    if (rubyPath !== undefined) return this.gateLanguage(rubyPath, ref);
 
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is
@@ -1702,6 +1779,14 @@ export class ReferenceResolver {
     }
     if (this.profileStages) this.stageAdd('frameworks', ref, fwEarly !== null, tFw);
     if (fwEarly) return fwEarly;
+    // A reference a framework answers alone ends with the frameworks' answer
+    // (see FrameworkResolver.ownsReference): Nuxt's `navigateTo(x)` with a
+    // destination no route serves is no namesake's call.
+    if (this.frameworksFor(ref.language).some((f) => f.ownsReference?.(ref, this.context))) {
+      return candidates.length > 0
+        ? candidates.reduce((best, curr) => (curr.confidence > best.confidence ? curr : best))
+        : null;
+    }
     // A retained untyped chain supplies effect/call-site evidence only. In
     // particular, importing its root does not make the root its call target.
     // A path through module namespaces is not untyped: `z.coerce.number()`
@@ -1728,7 +1813,17 @@ export class ReferenceResolver {
       CHAIN_SHAPE.test(ref.referenceName) &&
       (ref.language === 'typescript' || ref.language === 'javascript' || ref.language === 'tsx' || ref.language === 'jsx' || ref.language === 'python')
     ) {
-      return this.gateLanguage(matchReference(ref, this.context), ref);
+      const chainResult = this.gateLanguage(matchReference(ref, this.context), ref);
+      // `new Sub().inherited()`: the method may live on a supertype of a
+      // project class, resolvable once extends edges exist — defer to the
+      // conformance pass like the other chained calls.
+      if (!chainResult && NEW_RECEIVER_SHAPE.test(ref.referenceName)) {
+        const cls = newReceiverClass(ref, this.context);
+        if (cls && this.context.getNodesByName(cls).some((n) => n.kind === 'class' && sameLanguageFamily(n.language, ref.language))) {
+          this.deferReference(ref, this.deferredChainRefs);
+        }
+      }
+      return chainResult;
     }
 
     const tImp = this.profileStages ? process.hrtime.bigint() : 0n;
@@ -2176,6 +2271,8 @@ export class ReferenceResolver {
       // dotted-receiver languages on `.` (matchDottedCallChain).
       const chainMatch = (ref.language === 'php' && PHP_PROP_SHAPE.test(ref.referenceName))
         ? matchMethodCall(ref, this.context)
+        : NEW_RECEIVER_SHAPE.test(ref.referenceName)
+        ? matchNewReceiverCall(ref, this.context)
         : SCOPED_CHAIN_LANGUAGES.has(ref.language)
         ? matchScopedCallChain(ref, this.context)
         : matchDottedCallChain(ref, this.context);
@@ -3228,6 +3325,24 @@ export class ReferenceResolver {
     return false;
   }
 
+  /** A python call `x.get(…)` of a method named like a builtin collection, string or file method. */
+  private isPythonBuiltinNamedMethodCall(ref: UnresolvedRef): boolean {
+    if (ref.language !== 'python' || ref.referenceKind !== 'calls') return false;
+    const dot = ref.referenceName.indexOf('.');
+    return dot > 0 && PYTHON_BUILT_IN_METHODS.has(ref.referenceName.slice(dot + 1)) &&
+      !PYTHON_BUILT_IN_TYPES.has(ref.referenceName.slice(0, dot));
+  }
+
+  /**
+   * True when the Go file imports `qualifier` — by its last path segment or
+   * an alias — from a package of one of the project's own modules.
+   */
+  private isGoProjectPackage(ref: UnresolvedRef, qualifier: string): boolean {
+    return this.context
+      .getImportMappings(ref.filePath, ref.language)
+      .some((imp) => imp.localName === qualifier && this.context.getGoPackageDir?.(imp.source, ref.filePath) != null);
+  }
+
   /**
    * Check if reference is to a built-in or external symbol
    */
@@ -3322,7 +3437,9 @@ export class ReferenceResolver {
     // Go standard library packages — refs like "fmt.Println", "http.ListenAndServe", etc.
     if (ref.language === 'go') {
       const dotIdx = name.indexOf('.');
-      if (dotIdx > 0) {
+      // What the file imports decides before the name does: a project package
+      // may be called `errors`, `log` or `types` too.
+      if (dotIdx > 0 && !this.isGoProjectPackage(ref, name.substring(0, dotIdx))) {
         const pkg = name.substring(0, dotIdx);
         // Not a local bound from a type assertion that is named like one:
         // grpc-go's `parser.ParseConfig(…)` after `parser, ok :=
@@ -3461,6 +3578,18 @@ export class ReferenceResolver {
    * edge. Directory comparison is case-insensitive (CFML path resolution is);
    * the class segment itself is matched exactly, which real code satisfies —
    * dotted paths are written to match the on-disk file name.
+   *
+   * A test suite is no candidate for production code (#2209's rule), and on a
+   * tie it yields to the one component outside the test suites (#2650): a
+   * TestBox spec mirroring the component's path (`tests/specs/unit/core/
+   * basecore.cfc` beside `core/basecore.cfc`) corroborates the same segments,
+   * and a mapping root like `contenscms` (onto `contens/`) matches neither.
+   *
+   * The one exception to corroboration is a path with a single folder segment
+   * and a component at the project root (#2652): `wheels.JobWorker` in Wheels'
+   * own source, where `wheels` is the mapping onto the root, has no folder of
+   * the file's to corroborate. It ranks below any candidate a folder
+   * corroborates, and the file must be named like the component.
    */
   private resolveCfmlComponentPath(ref: UnresolvedRef): ResolvedRef | null {
     const cfmlCandidates = (name: string): Node[] =>
@@ -3504,10 +3633,13 @@ export class ReferenceResolver {
     const className = segments[segments.length - 1]!;
     const dirSegments = segments.slice(0, -1);
 
-    let best: Node | null = null;
+    // Production code never names a component in a test suite; a test can
+    // name one, by the path to it.
+    const fromTest = isTestPath(ref.filePath);
     let bestScore = 0;
-    let tie = false;
+    let tied: Node[] = [];
     for (const cand of cfmlCandidates(className)) {
+      if (!fromTest && isTestSuitePath(cand.filePath)) continue;
       const dirs = cand.filePath.replace(/\\/g, '/').split('/').slice(0, -1);
       // Count matching directory segments right-to-left: for
       // `coldbox.system.web.Controller` vs `system/web/Controller.cfc`,
@@ -3521,16 +3653,109 @@ export class ReferenceResolver {
       ) {
         score++;
       }
+      if (
+        score === 0 && dirs.length === 0 && dirSegments.length === 1 &&
+        cand.filePath.replace(/\.cfc$/i, '').toLowerCase() === className.toLowerCase()
+      ) {
+        score = 0.5; // a root component, named by the mapping onto the root
+      }
       if (score > bestScore) {
-        best = cand;
         bestScore = score;
-        tie = false;
+        tied = [cand];
       } else if (score === bestScore && score > 0) {
-        tie = true;
+        tied.push(cand);
       }
     }
-    if (!best || bestScore === 0 || tie) return null;
-    return { original: ref, targetNodeId: best.id, confidence: 0.9, resolvedBy: 'qualified-name' };
+    // A test's tie between a component and a suite mirroring its path: the
+    // path names the component, as it does from production code.
+    if (tied.length > 1) tied = tied.filter((c) => !isTestSuitePath(c.filePath));
+    if (bestScore === 0 || tied.length !== 1) return null;
+    return { original: ref, targetNodeId: tied[0]!.id, confidence: bestScore >= 1 ? 0.9 : 0.8, resolvedBy: 'qualified-name' };
+  }
+
+  /**
+   * A CFML call chained onto a construction (#2652): `createObject("component",
+   * "a.b.Batch").init()` or `new a.b.Batch().init()`, encoded
+   * `a.b.Batch().init`. The component is the one its path names, by
+   * resolveCfmlComponentPath's rules, or for a bare name the one beside the
+   * calling file (where CFML looks first), else the only one of that name. The
+   * method is the component's own or one it inherits — inheritance is wired
+   * before calls are resolved. Null when either is missing: the bare `init`
+   * such a call used to emit matched whichever component's `init` came first.
+   */
+  private resolveCfmlConstructedCall(ref: UnresolvedRef): ResolvedRef | null {
+    const match = CFML_CONSTRUCTED_CALL.exec(ref.referenceName);
+    if (!match) return null;
+    const component = match[1]!;
+    const cls = component.includes('.')
+      ? this.nodeById(this.resolveCfmlComponentPath({ ...ref, referenceName: component, referenceKind: 'instantiates' })?.targetNodeId ?? '')
+      : this.cfmlComponentByName(component, ref.filePath);
+    const method = cls ? this.cfmlMethodOf(cls, match[2]!.toLowerCase(), new Set()) : undefined;
+    return method ? { original: ref, targetNodeId: method.id, confidence: 0.9, resolvedBy: 'instance-method' } : null;
+  }
+
+  /** The CFML component a bare name reaches from `fromFile`: the one in its directory, else the only one so named. */
+  private cfmlComponentByName(name: string, fromFile: string): Node | undefined {
+    const components = this.context
+      .getNodesByLowerName(name.toLowerCase())
+      .filter((n) => (n.kind === 'class' || n.kind === 'interface') && (n.language === 'cfml' || n.language === 'cfscript'));
+    const dirOf = (p: string): string => p.slice(0, p.lastIndexOf('/') + 1);
+    const beside = components.filter((n) => dirOf(n.filePath) === dirOf(fromFile));
+    if (beside.length === 1) return beside[0];
+    return components.length === 1 ? components[0] : undefined;
+  }
+
+  /** A CFML component's method by its lowercased name (CFML names ignore case): its own, else one a supertype has. */
+  private cfmlMethodOf(cls: Node, lowerName: string, seen: Set<string>): Node | undefined {
+    if (seen.has(cls.id) || seen.size >= 8) return undefined;
+    seen.add(cls.id);
+    const own = this.context.getNodesInFile(cls.filePath).find((n) =>
+      n.kind === 'method' &&
+      n.name.toLowerCase() === lowerName &&
+      n.qualifiedName.toLowerCase() === `${cls.name}::${n.name}`.toLowerCase() &&
+      n.startLine >= cls.startLine && n.endLine <= cls.endLine
+    );
+    if (own) return own;
+    for (const supertype of this.context.getSupertypeNodes?.(cls.id) ?? []) {
+      const inherited = this.cfmlMethodOf(supertype, lowerName, seen);
+      if (inherited) return inherited;
+    }
+    return undefined;
+  }
+
+  /**
+   * The file a CFML include names (#2651) — `include "x.cfm";`,
+   * `<cfinclude template="x.cfm">`, `cfinclude(template="x.cfm")`. A template
+   * path is relative to the directory of the file that includes it
+   * (`formlistshared.cfm`, `../shared/helpers.cfm`), or to the web root when
+   * it starts with `/`: the project root, when the project is the web root —
+   * an assumption, so such a match is less sure. Null when no indexed file is
+   * there. CFML code written on a case-blind file system often spells a path
+   * in another case, so a single file that matches ignoring case counts too.
+   */
+  private resolveCfmlIncludePath(ref: UnresolvedRef): ResolvedRef | null {
+    const written = ref.referenceName.trim().replace(/\\/g, '/');
+    const fromRoot = written.startsWith('/');
+    const parts = fromRoot ? [] : ref.filePath.replace(/\\/g, '/').split('/').slice(0, -1);
+    for (const seg of written.split('/')) {
+      if (seg === '' || seg === '.') continue;
+      if (seg === '..') {
+        if (parts.length === 0) return null; // above the project root
+        parts.pop();
+      } else {
+        parts.push(seg);
+      }
+    }
+    const fileName = parts[parts.length - 1];
+    if (!fileName) return null;
+    const wanted = parts.join('/');
+    const files = this.context.getNodesByLowerName(fileName.toLowerCase()).filter((n) => n.kind === 'file');
+    const exact = files.find((n) => n.filePath === wanted);
+    if (exact) return { original: ref, targetNodeId: exact.id, confidence: fromRoot ? 0.85 : 0.95, resolvedBy: 'file-path' };
+    const folded = files.filter((n) => n.filePath.toLowerCase() === wanted.toLowerCase());
+    return folded.length === 1
+      ? { original: ref, targetNodeId: folded[0]!.id, confidence: fromRoot ? 0.8 : 0.9, resolvedBy: 'file-path' }
+      : null;
   }
 
   /**
@@ -3862,8 +4087,10 @@ export class ReferenceResolver {
   /**
    * A bare Rust name reaches only what is in scope — every strategy's result,
    * a framework resolver's `Ok(x)` → `struct Ok` construction included (see
-   * isRustNameInScope). And a call, however written, reaches a project impl
-   * on a std type only as Rust would pick it (isRustForeignImplCallable).
+   * isRustNameInScope). A call through a path whose type is from outside the
+   * project reaches only the project's impls for that type (or of that trait,
+   * isRustPathCallReachable). And a call, however written, reaches a project
+   * impl on a std type only as Rust would pick it (isRustForeignImplCallable).
    */
   private gateRustScope(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result || ref.language !== 'rust') return result;
@@ -3872,7 +4099,9 @@ export class ReferenceResolver {
     const target = this.nodeById(result.targetNodeId);
     if (!target) return result;
     if (bare && !isRustNameInScope(target, ref, this.context)) return null;
-    return ref.referenceKind === 'calls' && !isRustForeignImplCallable(target, ref, this.context) ? null : result;
+    if (ref.referenceKind !== 'calls') return result;
+    if (!bare && !isRustPathCallReachable(target, ref, this.context)) return null;
+    return isRustForeignImplCallable(target, ref, this.context) ? result : null;
   }
 
   /**
@@ -3956,6 +4185,149 @@ export class ReferenceResolver {
     }
     this.manualMocks = names.size > 0 ? { names, lowerNames } : null;
     return this.manualMocks;
+  }
+
+  /**
+   * The context a TS/JS reference is resolved in outside the named class
+   * expressions (#2499): one without the classes they declare or their
+   * members. An expression's name is bound inside it alone, and its class's
+   * value travels in ways resolution doesn't follow. So outside, a reference
+   * means what it would were those classes not indexed, with the confidence
+   * it had: `const Panel = class Panel {…}` keeps `new Panel()` on the
+   * constant, an interface beside a same-named class expression keeps its
+   * typed calls, and an `HTMLElement` type stays clear of lit's
+   * `HTMLElementShim = class HTMLElement {…}`. A class a CommonJS module
+   * exports isn't among them (classExpressions). Null inside a class
+   * expression, where the whole graph applies.
+   */
+  private classExpressionFreeContextFor(ref: UnresolvedRef, base: ResolutionContext): ResolutionContext | null {
+    if (!CLASS_EXPRESSION_REF_LANGUAGES.has(ref.language)) return null;
+    const expressions = this.classExpressions();
+    if (!expressions) return null;
+    const dot = ref.referenceName.indexOf('.');
+    const named = expressions.byName.get(dot > 0 ? ref.referenceName.slice(0, dot) : ref.referenceName);
+    // Written in a class expression, a reference sees its class and the
+    // classes around it, as JavaScript scopes them, unless it names another
+    // one, which is bound only inside that one.
+    const inside = expressions.byFile.get(ref.filePath)?.some((n) => writtenIn(n, ref)) ?? false;
+    if (inside && !(named && !named.some((n) => writtenIn(n, ref)))) return null;
+    let view = this.classExpressionFreeViews.get(base);
+    if (!view) {
+      view = this.classExpressionFreeView(base);
+      this.classExpressionFreeViews.set(base, view);
+      this.classExpressionFreeBases.set(view, base);
+    }
+    return view;
+  }
+
+  /**
+   * `base` without the classes class expressions declare and their members.
+   * The lookups an import reads a module's exports by (getNodesInFileNamed,
+   * getExportedNodesInFile) are left whole.
+   */
+  private classExpressionFreeView(base: ResolutionContext): ResolutionContext {
+    const { hiddenIds } = this.classExpressions()!;
+    const hidden = (n: Node): boolean => hiddenIds.has(n.id);
+    const keep = (nodes: Node[]): Node[] => (nodes.some(hidden) ? nodes.filter((n) => !hidden(n)) : nodes);
+    const byKind = new Map<Node['kind'], Node[]>();
+    const getMethodMatches = base.getMethodMatches;
+    const iterateNodesByKind = base.iterateNodesByKind;
+    const { files } = this.classExpressions()!;
+    return {
+      ...base,
+      getNodesByName: (name) => keep(base.getNodesByName(name)),
+      getNodesByLowerName: (lowerName) => keep(base.getNodesByLowerName(lowerName)),
+      getNodesByQualifiedName: (qualifiedName) => keep(base.getNodesByQualifiedName(qualifiedName)),
+      getNodesInFile: (filePath) => (files.has(filePath) ? keep(base.getNodesInFile(filePath)) : base.getNodesInFile(filePath)),
+      getNodesByKind: (kind) => {
+        let nodes = byKind.get(kind);
+        if (!nodes) byKind.set(kind, (nodes = keep(base.getNodesByKind(kind))));
+        return nodes;
+      },
+      getMethodMatches: getMethodMatches
+        ? (typeName, methodName, language) => keep(getMethodMatches(typeName, methodName, language))
+        : undefined,
+      iterateNodesByKind: iterateNodesByKind
+        ? function* (kind) {
+          for (const n of iterateNodesByKind(kind)) if (!hidden(n)) yield n;
+        }
+        : undefined,
+    };
+  }
+
+  /** classExpressionFreeContextFor's views, by the context each hides from and what it hides, and each view's context; clearCaches drops both. */
+  private classExpressionFreeViews = new WeakMap<ResolutionContext, ResolutionContext>();
+  private classExpressionFreeBases = new WeakMap<ResolutionContext, ResolutionContext>();
+  /**
+   * The names that only class expressions' classes and members carry, which
+   * name nothing where classExpressionFreeView hides those: lit's DOM shims
+   * (`class HTMLElement`, `class Event`) would otherwise send every
+   * `HTMLElement` and `new Event()` across the project through the whole
+   * resolution only to find nothing, where before the name pre-filter
+   * dropped them. Read once per cache window.
+   */
+  private classExpressionOnlyNames(): Set<string> {
+    if (this.classExpressionOnlyNameSet) return this.classExpressionOnlyNameSet;
+    const only = new Set<string>();
+    const expressions = this.classExpressions();
+    if (expressions) {
+      const names = new Set<string>();
+      for (const id of expressions.hiddenIds) {
+        const n = this.nodeById(id);
+        if (n) names.add(n.name);
+      }
+      for (const name of names) {
+        if (!this.queries.getNodesByName(name).some((n) => !expressions.hiddenIds.has(n.id))) only.add(name);
+      }
+    }
+    this.classExpressionOnlyNameSet = only;
+    return only;
+  }
+
+  /** classExpressionOnlyNames' answer; clearCaches drops it. */
+  private classExpressionOnlyNameSet: Set<string> | null = null;
+
+  /**
+   * The classes named class expressions declare: by name, the files holding
+   * them, the ids of them and their members, and the one a member belongs
+   * to. Null when there are none. Read once per cache window. A class a
+   * CommonJS module exports is left out: the module binds it, so it is read
+   * as a declaration is.
+   */
+  private classExpressionIndex: ClassExpressionIndex | null | undefined;
+
+  private classExpressions(): ClassExpressionIndex | null {
+    if (this.classExpressionIndex !== undefined) return this.classExpressionIndex;
+    const byName = new Map<string, Node[]>();
+    const byFile = new Map<string, Node[]>();
+    const byKey = new Map<string, Node>();
+    const files = new Set<string>();
+    const hiddenIds = new Set<string>();
+    const linesOf = (file: string): readonly string[] =>
+      this.context.getFileLines?.(file) ?? this.context.readFile(file)?.split(/\r?\n/) ?? [];
+    for (const n of this.queries.getNodesByKind('class')) {
+      if (!isJsClassExpression(n) || isCommonJsExportedClass(n, linesOf(n.filePath))) continue;
+      const named = byName.get(n.name);
+      if (named) named.push(n); else byName.set(n.name, [n]);
+      const inFile = byFile.get(n.filePath);
+      if (inFile) inFile.push(n); else byFile.set(n.filePath, [n]);
+      byKey.set(`${n.filePath}\0${n.qualifiedName}`, n);
+      files.add(n.filePath);
+      hiddenIds.add(n.id);
+    }
+    // A member is its class's when it is declared in its file under its
+    // qualified name (`Widget::run` of `Widget`).
+    const ownerOf = (member: Node): Node | undefined => {
+      const cut = member.qualifiedName.lastIndexOf('::');
+      return cut > 0 ? byKey.get(`${member.filePath}\0${member.qualifiedName.slice(0, cut)}`) : undefined;
+    };
+    if (files.size > 0) {
+      for (const n of this.queries.getNodesByFiles([...files])) {
+        if ((n.kind === 'method' || n.kind === 'property' || n.kind === 'field') && ownerOf(n)) hiddenIds.add(n.id);
+      }
+    }
+    this.classExpressionIndex = byName.size > 0 ? { byName, byFile, files, hiddenIds, ownerOf } : null;
+    return this.classExpressionIndex;
   }
 
   /** Is `filePath` (project-relative) one of the files the index holds? */
@@ -4070,6 +4442,15 @@ export class ReferenceResolver {
     if (tgt && ref.language && crossesCodeBoundary(tgt, ref.language)) return null;
     return result;
   }
+}
+
+/**
+ * Whether a CFML `imports` name is the path of a template an include names
+ * (`formlistshared.cfm`, `../shared/helpers.cfm`, `/app/x.cfm`), not a
+ * cfscript `import com.foo.Bar;` or `import "java:…";` (#2651).
+ */
+function isCfmlTemplatePath(name: string): boolean {
+  return !name.includes(':') && (name.includes('/') || name.includes('\\') || /\.(?:cfml?|cfc|cfs)$/i.test(name.trim()));
 }
 
 /** The project-relative directory holding `p` ('' for the project root). */

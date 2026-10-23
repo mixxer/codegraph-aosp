@@ -884,7 +884,14 @@ export class CodeGraph {
         return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
       try {
-        return this.orchestrator.indexFiles(filePaths);
+        // The files' nodes are new to the resolver: a resolution after this
+        // reloads its caches, the set of node names included, as indexAll and
+        // sync do before they resolve, instead of reading the graph as it was
+        // before (#2829). Awaited, so the write lock is held until the files
+        // are stored, as indexAll and sync hold it: returned unawaited, the
+        // promise left the `try` at once and the `finally` let the lock go as
+        // soon as indexing started, so another process could write meanwhile.
+        return await this.orchestrator.indexFiles(filePaths).finally(() => this.resolver.clearCaches());
       } finally {
         this.fileLock.release();
       }
@@ -2458,7 +2465,7 @@ export class CodeGraph {
    * via the `references` edge that framework resolvers emit. Returns
    * null when fewer than 3 valid (non-test) routes exist.
    */
-  getRoutingManifest(limit?: number): {
+  getRoutingManifest(limit?: number, perRoute?: boolean): {
     entries: Array<{
       url: string;
       handler: string;
@@ -2473,7 +2480,7 @@ export class CodeGraph {
     topHandlerFileCount: number;
     totalRoutes: number;
   } | null {
-    return this.queries.getRoutingManifest(limit);
+    return this.queries.getRoutingManifest(limit, perRoute);
   }
 
   // ===========================================================================

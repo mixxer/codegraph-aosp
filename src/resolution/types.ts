@@ -55,6 +55,8 @@ export interface ResolvedRef {
   edgeKind?: EdgeKind;
   /** Extra metadata the strategy wants persisted on the edge (`href`, …). */
   metadata?: Record<string, unknown>;
+  /** Picked by a name-only strategy (the receiver's word, not its type). Not persisted. */
+  byName?: boolean;
   /**
    * The OTHER targets, when one reference names several.
    *
@@ -101,6 +103,15 @@ export interface ResolutionContext {
   getNodesInFileNamed?(filePath: string, name: string): Node[];
   /** Get all nodes by name */
   getNodesByName(name: string): Node[];
+  /**
+   * Whether no node in the index has exactly this name, answered from the
+   * resolver's set of every node name rather than a query (#2829). False
+   * whenever that set isn't loaded (before `warmCaches`, after
+   * `clearCaches`), so a caller only ever acts on a certain absence. A view
+   * that hides nodes keeps its base's answer, which stays certain: hiding
+   * nodes adds no name. Optional: a context without it never answers.
+   */
+  isAbsentName?(name: string): boolean;
   /** Get all nodes by qualified name */
   getNodesByQualifiedName(qualifiedName: string): Node[];
   /** Get all nodes of a kind */
@@ -373,6 +384,17 @@ export interface FrameworkResolver {
    * Asked only about references written in the languages `resolve()` sees.
    */
   claimsReference?(name: string): boolean;
+  /**
+   * A reference this framework answers alone. When no framework's `resolve()`
+   * links it, it stays unresolved: no import or name strategy guesses past it,
+   * as they would for a project function that only shares its name. Nuxt's
+   * auto-imported `navigateTo('/x')` names a page, which Vue Router reads;
+   * one whose destination is computed, or a path no page serves, calls no
+   * function of the project — elk declares a `navigateTo` of its own inside a
+   * plugin. Unresolved, a sync can still revisit it when a route appears.
+   * Asked only about references written in the languages `resolve()` sees.
+   */
+  ownsReference?(ref: UnresolvedRef, context: ResolutionContext): boolean;
   /**
    * Extract framework-specific nodes and references from a file.
    *
