@@ -15,7 +15,8 @@
     }
   },
   "permissions": {
-    "contents": "read"
+    "contents": "read",
+    "actions": "read"
   },
   "env": {
     "CODEGRAPH_TELEMETRY": "0",
@@ -31,7 +32,7 @@
             "GH_TOKEN": "${{ github.token }}",
             "VALIDATION_STAGE": "${{ inputs.stage }}"
           },
-          "run": "python3 - <<'PY'\nimport json,os,urllib.request\nreq=urllib.request.Request('https://api.github.com/repos/mixxer/codegraph-aosp/git/matching-refs/heads',headers={'Authorization':'Bearer '+os.environ['GH_TOKEN']})\nwith urllib.request.urlopen(req,timeout=30) as res: rows=json.load(res)\nrefs={x['ref'].removeprefix('refs/heads/'):x['object']['sha'] for x in rows}\nexpected={'fix/java-kotlin-inheritance': '11efa862763031c9ca943c105a78bc61a16f8b31', 'feat/android-platform-tools': '231f959da16f809244bfaafb5e1959162c7d7235', 'fix/mcp-project-cache-lifetime': 'af5e560ba2414df15fd231b753032dc46403713b', 'fix/project-path-realpath': '4c8f64415f47228986dcac7e4ad2c7ca6e886797', 'docs/contributing-guide': '691f067c012e7708f5241cfb8a74c2d2c4c9634c', 'fix/kotlin-imported-type-calls': '7d0faad04295c6d1dd93bc3cfd663340cbd86f9a', 'fix/java-static-field-calls': '261cc306d45b18ef6fc4788f949550401309993c'} if os.environ['VALIDATION_STAGE']=='published' else {'fix/java-kotlin-inheritance': '0057f90b074b26f2f9d44336cb204e3df48f0249', 'feat/android-platform-tools': '878c3ae577e6cd26fdf7f5b2a25b8e89ca6bd3b4', 'fix/mcp-project-cache-lifetime': '206dee62acf5009b502052cb947358c8b669c075', 'fix/project-path-realpath': '576f387e6670b347915a7245f53d253f839c6964', 'docs/contributing-guide': '852174294f1cc1f07cf1f38a714aa6736c5cfcba', 'fix/kotlin-imported-type-calls': '24ecca1ac17df6b9535ddaec1eaabcc5c4a6bedd', 'fix/java-static-field-calls': '84504b80fddf2f686f9dcf5de1d73a04026db120'}\nfor b,h in {**expected,**{'main': 'b6ae433cface2fe3828a6387d97c75b1834eb6d9', 'fix/android-platform-language-coverage': 'f1ed60e2ab1b9685aa00aa4e7f3ccbe6f5ef5da1'}}.items():\n assert refs.get(b)==h,(b,h,refs.get(b))\nprint('Verified protected downstream and expected feature refs.')\nPY"
+          "run": "python3 - <<'PY'\nimport json,os,urllib.request\nreq=urllib.request.Request('https://api.github.com/repos/mixxer/codegraph-aosp/git/matching-refs/heads',headers={'Authorization':'Bearer '+os.environ['GH_TOKEN']})\nwith urllib.request.urlopen(req,timeout=30) as res: rows=json.load(res)\nrefs={x['ref'].removeprefix('refs/heads/'):x['object']['sha'] for x in rows}\nexpected={'fix/java-kotlin-inheritance': '7afee836d8488b9533a18f3dcd11c9df708462a5', 'feat/android-platform-tools': '231f959da16f809244bfaafb5e1959162c7d7235', 'fix/mcp-project-cache-lifetime': 'af5e560ba2414df15fd231b753032dc46403713b', 'fix/project-path-realpath': '4c8f64415f47228986dcac7e4ad2c7ca6e886797', 'docs/contributing-guide': '691f067c012e7708f5241cfb8a74c2d2c4c9634c', 'fix/kotlin-imported-type-calls': '7d0faad04295c6d1dd93bc3cfd663340cbd86f9a', 'fix/java-static-field-calls': '261cc306d45b18ef6fc4788f949550401309993c'} if os.environ['VALIDATION_STAGE']=='published' else {'fix/java-kotlin-inheritance': '0057f90b074b26f2f9d44336cb204e3df48f0249', 'feat/android-platform-tools': '878c3ae577e6cd26fdf7f5b2a25b8e89ca6bd3b4', 'fix/mcp-project-cache-lifetime': '206dee62acf5009b502052cb947358c8b669c075', 'fix/project-path-realpath': '576f387e6670b347915a7245f53d253f839c6964', 'docs/contributing-guide': '852174294f1cc1f07cf1f38a714aa6736c5cfcba', 'fix/kotlin-imported-type-calls': '24ecca1ac17df6b9535ddaec1eaabcc5c4a6bedd', 'fix/java-static-field-calls': '84504b80fddf2f686f9dcf5de1d73a04026db120'}\nfor b,h in {**expected,**{'main': 'b6ae433cface2fe3828a6387d97c75b1834eb6d9', 'fix/android-platform-language-coverage': 'f1ed60e2ab1b9685aa00aa4e7f3ccbe6f5ef5da1'}}.items():\n assert refs.get(b)==h,(b,h,refs.get(b))\nprint('Verified protected downstream and expected feature refs.')\nPY"
         }
       ]
     },
@@ -46,83 +47,13 @@
         "matrix": {
           "include": [
             {
-              "target": "baseline",
-              "sha": "69af19ace270f2e940444d514de6dde971df12df",
-              "node": 22
-            },
-            {
-              "target": "baseline",
-              "sha": "69af19ace270f2e940444d514de6dde971df12df",
-              "node": 24
-            },
-            {
               "target": "1927",
-              "sha": "11efa862763031c9ca943c105a78bc61a16f8b31",
+              "sha": "7afee836d8488b9533a18f3dcd11c9df708462a5",
               "node": 22
             },
             {
               "target": "1927",
-              "sha": "11efa862763031c9ca943c105a78bc61a16f8b31",
-              "node": 24
-            },
-            {
-              "target": "1928",
-              "sha": "231f959da16f809244bfaafb5e1959162c7d7235",
-              "node": 22
-            },
-            {
-              "target": "1928",
-              "sha": "231f959da16f809244bfaafb5e1959162c7d7235",
-              "node": 24
-            },
-            {
-              "target": "1929",
-              "sha": "af5e560ba2414df15fd231b753032dc46403713b",
-              "node": 22
-            },
-            {
-              "target": "1929",
-              "sha": "af5e560ba2414df15fd231b753032dc46403713b",
-              "node": 24
-            },
-            {
-              "target": "1930",
-              "sha": "4c8f64415f47228986dcac7e4ad2c7ca6e886797",
-              "node": 22
-            },
-            {
-              "target": "1930",
-              "sha": "4c8f64415f47228986dcac7e4ad2c7ca6e886797",
-              "node": 24
-            },
-            {
-              "target": "1931",
-              "sha": "691f067c012e7708f5241cfb8a74c2d2c4c9634c",
-              "node": 22
-            },
-            {
-              "target": "1931",
-              "sha": "691f067c012e7708f5241cfb8a74c2d2c4c9634c",
-              "node": 24
-            },
-            {
-              "target": "1948",
-              "sha": "7d0faad04295c6d1dd93bc3cfd663340cbd86f9a",
-              "node": 22
-            },
-            {
-              "target": "1948",
-              "sha": "7d0faad04295c6d1dd93bc3cfd663340cbd86f9a",
-              "node": 24
-            },
-            {
-              "target": "1949",
-              "sha": "261cc306d45b18ef6fc4788f949550401309993c",
-              "node": 22
-            },
-            {
-              "target": "1949",
-              "sha": "261cc306d45b18ef6fc4788f949550401309993c",
+              "sha": "7afee836d8488b9533a18f3dcd11c9df708462a5",
               "node": 24
             }
           ]
@@ -171,90 +102,11 @@
         }
       ]
     },
-    "windows": {
-      "name": "${{ matrix.target }} Windows Node ${{ matrix.node }}",
-      "needs": "guard",
-      "runs-on": "windows-latest",
-      "timeout-minutes": 25,
-      "strategy": {
-        "fail-fast": false,
-        "max-parallel": 6,
-        "matrix": {
-          "include": [
-            {
-              "target": "baseline",
-              "sha": "69af19ace270f2e940444d514de6dde971df12df",
-              "node": 22
-            },
-            {
-              "target": "baseline",
-              "sha": "69af19ace270f2e940444d514de6dde971df12df",
-              "node": 24
-            },
-            {
-              "target": "1929",
-              "sha": "af5e560ba2414df15fd231b753032dc46403713b",
-              "node": 22
-            },
-            {
-              "target": "1929",
-              "sha": "af5e560ba2414df15fd231b753032dc46403713b",
-              "node": 24
-            },
-            {
-              "target": "1930",
-              "sha": "4c8f64415f47228986dcac7e4ad2c7ca6e886797",
-              "node": 22
-            },
-            {
-              "target": "1930",
-              "sha": "4c8f64415f47228986dcac7e4ad2c7ca6e886797",
-              "node": 24
-            }
-          ]
-        }
-      },
-      "steps": [
-        {
-          "uses": "actions/checkout@v6",
-          "with": {
-            "ref": "${{ matrix.sha }}",
-            "persist-credentials": false
-          }
-        },
-        {
-          "name": "Verify exact source commit",
-          "shell": "bash",
-          "run": "test \"$(git rev-parse HEAD)\" = \"${{ matrix.sha }}\"\necho \"Validated source ${{ matrix.sha }}\""
-        },
-        {
-          "uses": "actions/setup-node@v6",
-          "with": {
-            "node-version": "${{ matrix.node }}",
-            "cache": "npm"
-          }
-        },
-        {
-          "run": "npm ci"
-        },
-        {
-          "run": "npm run build"
-        },
-        {
-          "name": "Windows path and MCP lifecycle regressions",
-          "shell": "bash",
-          "run": "npx vitest run __tests__/security.test.ts __tests__/mcp-initialize.test.ts __tests__/mcp-roots.test.ts __tests__/child-process-windows-hide.test.ts __tests__/daemon-lock-holder.test.ts __tests__/status-index-health.test.ts $(test ! -f __tests__/mcp-project-cache.test.ts || echo __tests__/mcp-project-cache.test.ts) --maxWorkers=2 --minWorkers=1",
-          "env": {
-            "CODEGRAPH_KERNEL": "0"
-          }
-        }
-      ]
-    },
     "native": {
       "name": "${{ matrix.target }} native kernel and language regressions",
       "needs": [
-        "portable",
-        "windows"
+        "prior",
+        "portable"
       ],
       "runs-on": "ubuntu-22.04",
       "timeout-minutes": 45,
@@ -269,7 +121,7 @@
             },
             {
               "target": "1927",
-              "sha": "11efa862763031c9ca943c105a78bc61a16f8b31"
+              "sha": "7afee836d8488b9533a18f3dcd11c9df708462a5"
             },
             {
               "target": "1928",
@@ -337,7 +189,7 @@
           "env": {
             "CODEGRAPH_KERNEL_EXPECT": "1"
           },
-          "run": "python3 - <<'PY'\nimport glob,subprocess\npatterns=['kernel-*.test.ts', 'kotlin-*.test.ts', 'java-*.test.ts', 'aosp-*.test.ts', 'rust-*.test.ts', 'ruby-*.test.ts', 'go-*.test.ts', 'pascal-*.test.ts', 'extraction.test.ts', 'resolution.test.ts', 'function-ref*.test.ts', 'generic-supertypes.test.ts', 'override-overload-pairing.test.ts', 'mcp-project-cache.test.ts', 'security.test.ts', 'mcp-tool-allowlist.test.ts', 'mcp-initialize.test.ts']\nfiles=sorted({p for pat in patterns for p in glob.glob('__tests__/'+pat)})\nassert files\nsubprocess.run(['npx','vitest','run',*files,'--maxWorkers=2','--minWorkers=1'],check=True)\nPY"
+          "run": "python3 - <<'PY'\nimport glob,subprocess\npatterns=['kernel-*.test.ts', 'kotlin-*.test.ts', 'java-*.test.ts', 'aosp-*.test.ts', 'rust-*.test.ts', 'ruby-*.test.ts', 'go-*.test.ts', 'pascal-*.test.ts', 'frameworks-integration.test.ts','extraction.test.ts', 'resolution.test.ts', 'function-ref*.test.ts', 'generic-supertypes.test.ts', 'override-overload-pairing.test.ts', 'mcp-project-cache.test.ts', 'security.test.ts', 'mcp-tool-allowlist.test.ts', 'mcp-initialize.test.ts']\nfiles=sorted({p for pat in patterns for p in glob.glob('__tests__/'+pat)})\nassert files\nsubprocess.run(['npx','vitest','run',*files,'--maxWorkers=2','--minWorkers=1'],check=True)\nPY"
         }
       ]
     },
@@ -346,8 +198,8 @@
       "if": "always()",
       "needs": [
         "guard",
+        "prior",
         "portable",
-        "windows",
         "native"
       ],
       "runs-on": "ubuntu-latest",
@@ -355,11 +207,24 @@
         {
           "env": {
             "GUARD": "${{ needs.guard.result }}",
+            "PRIOR": "${{ needs.prior.result }}",
             "PORTABLE": "${{ needs.portable.result }}",
-            "WINDOWS": "${{ needs.windows.result }}",
             "NATIVE": "${{ needs.native.result }}"
           },
-          "run": "test \"$GUARD\" = success\ntest \"$PORTABLE\" = success\ntest \"$WINDOWS\" = success\ntest \"$NATIVE\" = success"
+          "run": "test \"$GUARD\" = success\ntest \"$PRIOR\" = success\ntest \"$PORTABLE\" = success\ntest \"$NATIVE\" = success"
+        }
+      ]
+    },
+    "prior": {
+      "name": "Verify unchanged full portable and Windows results",
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": 25,
+      "steps": [
+        {
+          "env": {
+            "GH_TOKEN": "${{ github.token }}"
+          },
+          "run": "python3 - <<'PY'\nimport json,os,time,urllib.request\nexpected={'baseline portable Node 22': {'sha': '69af19ace270f2e940444d514de6dde971df12df', 'step': 'Full portable engine and viewer'}, 'baseline portable Node 24': {'sha': '69af19ace270f2e940444d514de6dde971df12df', 'step': 'Full portable engine and viewer'}, '1928 portable Node 22': {'sha': '231f959da16f809244bfaafb5e1959162c7d7235', 'step': 'Full portable engine and viewer'}, '1928 portable Node 24': {'sha': '231f959da16f809244bfaafb5e1959162c7d7235', 'step': 'Full portable engine and viewer'}, '1929 portable Node 22': {'sha': 'af5e560ba2414df15fd231b753032dc46403713b', 'step': 'Full portable engine and viewer'}, '1929 portable Node 24': {'sha': 'af5e560ba2414df15fd231b753032dc46403713b', 'step': 'Full portable engine and viewer'}, '1930 portable Node 22': {'sha': '4c8f64415f47228986dcac7e4ad2c7ca6e886797', 'step': 'Full portable engine and viewer'}, '1930 portable Node 24': {'sha': '4c8f64415f47228986dcac7e4ad2c7ca6e886797', 'step': 'Full portable engine and viewer'}, '1931 portable Node 22': {'sha': '691f067c012e7708f5241cfb8a74c2d2c4c9634c', 'step': 'Full portable engine and viewer'}, '1931 portable Node 24': {'sha': '691f067c012e7708f5241cfb8a74c2d2c4c9634c', 'step': 'Full portable engine and viewer'}, '1948 portable Node 22': {'sha': '7d0faad04295c6d1dd93bc3cfd663340cbd86f9a', 'step': 'Full portable engine and viewer'}, '1948 portable Node 24': {'sha': '7d0faad04295c6d1dd93bc3cfd663340cbd86f9a', 'step': 'Full portable engine and viewer'}, '1949 portable Node 22': {'sha': '261cc306d45b18ef6fc4788f949550401309993c', 'step': 'Full portable engine and viewer'}, '1949 portable Node 24': {'sha': '261cc306d45b18ef6fc4788f949550401309993c', 'step': 'Full portable engine and viewer'}, 'baseline Windows Node 22': {'sha': '69af19ace270f2e940444d514de6dde971df12df', 'step': 'Windows path and MCP lifecycle regressions'}, 'baseline Windows Node 24': {'sha': '69af19ace270f2e940444d514de6dde971df12df', 'step': 'Windows path and MCP lifecycle regressions'}, '1929 Windows Node 22': {'sha': 'af5e560ba2414df15fd231b753032dc46403713b', 'step': 'Windows path and MCP lifecycle regressions'}, '1929 Windows Node 24': {'sha': 'af5e560ba2414df15fd231b753032dc46403713b', 'step': 'Windows path and MCP lifecycle regressions'}, '1930 Windows Node 22': {'sha': '4c8f64415f47228986dcac7e4ad2c7ca6e886797', 'step': 'Windows path and MCP lifecycle regressions'}, '1930 Windows Node 24': {'sha': '4c8f64415f47228986dcac7e4ad2c7ca6e886797', 'step': 'Windows path and MCP lifecycle regressions'}}\ndef read(path):\n req=urllib.request.Request('https://api.github.com/repos/mixxer/codegraph-aosp/'+path,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN']})\n with urllib.request.urlopen(req,timeout=30) as res:return json.load(res)\nrun=read('actions/runs/40055781935')\nassert run['head_sha']=='8d8132af8e18e6398e7484ad77a6e9aa8e66f3ae'\nfor attempt in range(50):\n jobs={j['name']:j for j in read('actions/runs/40055781935/jobs?per_page=100')['jobs']}\n failures=[name for name in expected if name in jobs and jobs[name]['conclusion'] not in [None,'success']]\n assert not failures,failures\n if all(name in jobs and jobs[name]['conclusion']=='success' for name in expected):break\n time.sleep(20)\nelse:raise RuntimeError('Previous exact-source validations not complete')\nfor name,item in expected.items():\n steps={v['name']:v['conclusion'] for v in jobs[name]['steps']}\n assert steps['Verify exact source commit']=='success' and steps[item['step']]=='success'\n print('Reused successful exact-source validation',name,item['sha'],'job',jobs[name]['id'])\nprint('All unchanged full portable and Windows results verified from immutable driver commit.')\nPY"
         }
       ]
     }
