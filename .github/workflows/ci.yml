@@ -1,151 +1,367 @@
-name: CI
-on:
-  workflow_dispatch:
-permissions:
-  contents: read
-env:
-  CODEGRAPH_TELEMETRY: '0'
-  CODEGRAPH_NO_UPDATE_CHECK: '1'
-jobs:
-  verified:
-    name: Verify published heads and full validation evidence
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Check exact published refs and prior full portable/native results
-        run: |
-          python3 - <<'PY'
-          import json, urllib.request
-
-          def read(path):
-              with urllib.request.urlopen('https://api.github.com/repos/mixxer/codegraph-aosp/' + path, timeout=30) as response:
-                  return json.load(response)
-          run = read('actions/runs/39725975839')
-          assert run['head_sha'] == '90b5d7fcbae26aef4c8ab0d24cf87284fa99e0a2' and run['conclusion'] == 'success'
-          jobs = read('actions/runs/39725975839/jobs?per_page=100')['jobs']
-          assert len(jobs) == 26 and all(job['conclusion'] == 'success' for job in jobs)
-          with urllib.request.urlopen('https://api.github.com/repos/colbymchenry/codegraph/branches/main', timeout=30) as response:
-              upstream = json.load(response)['commit']['sha']
-          assert upstream == '0c3e12ddbbcc467b595ca994941151a7dc60db23', ('Upstream advanced during validation', upstream)
-          refs = {'fix/java-kotlin-inheritance': '0057f90b074b26f2f9d44336cb204e3df48f0249', 'feat/android-platform-tools': '878c3ae577e6cd26fdf7f5b2a25b8e89ca6bd3b4', 'fix/mcp-project-cache-lifetime': '206dee62acf5009b502052cb947358c8b669c075', 'fix/project-path-realpath': '576f387e6670b347915a7245f53d253f839c6964', 'docs/contributing-guide': '852174294f1cc1f07cf1f38a714aa6736c5cfcba', 'fix/kotlin-imported-type-calls': '24ecca1ac17df6b9535ddaec1eaabcc5c4a6bedd', 'fix/java-static-field-calls': '84504b80fddf2f686f9dcf5de1d73a04026db120', 'main': '6dde0e8b4568ab6797da34b33250cb994ac198e8', 'fix/android-platform-language-coverage': 'd1e05ef4d039bbbecc8e96cd8a8e1e31277b9b6c'}
-          actual_heads = {item['ref'].removeprefix('refs/heads/'): item['object']['sha'] for item in read('git/matching-refs/heads')}
-          for branch, sha in refs.items():
-              assert actual_heads.get(branch) == sha, (branch, sha, actual_heads.get(branch))
-              print(branch, sha)
-          tags = {'refs/tags/backup/upstream-pr1927-before-rebase-20261022-73a9bea3': '73a9bea3c027d92aba19c76cca2dc82a5ed6ed24', 'refs/tags/backup/upstream-pr1927-before-rebase-20261022-3bfb25c0': '3bfb25c07ef5d41df097e861786042b920c71927', 'refs/tags/backup/upstream-pr1928-before-rebase-20261022-a252a722': 'a252a722a6b2d3a18f0b9b4725ab5e57ea6ca191', 'refs/tags/backup/upstream-pr1928-before-rebase-20261022-9dcb4f9e': '9dcb4f9e007fb6ea03e326b1207cc0c8c9af3f04', 'refs/tags/backup/upstream-pr1929-before-rebase-20261022-19fbbbad': '19fbbbadf78614a6ec0085dab88583e46b277017', 'refs/tags/backup/upstream-pr1929-before-rebase-20261022-7398a498': '7398a498102d58cff96e296e8ae6ce45e3109c5b', 'refs/tags/backup/upstream-pr1930-before-rebase-20261022-3be0f559': '3be0f5597778f2e76a912e2a5937bd72f5d41b76', 'refs/tags/backup/upstream-pr1930-before-rebase-20261022-0f75b0d0': '0f75b0d0e7076fb858fbbddf346cbc47a5754307', 'refs/tags/backup/upstream-pr1931-before-rebase-20261022-72fd8142': '72fd8142e7266dc590cc5772b9753486d97f9583', 'refs/tags/backup/upstream-pr1931-before-rebase-20261022-07a229bc': '07a229bc49b58b13a989a0a35a041ee40d3ce6ad', 'refs/tags/backup/upstream-pr1948-before-rebase-20261022-2633f50c': '2633f50cef50bda70aa8ab555377d65c075d2f3a', 'refs/tags/backup/upstream-pr1948-before-rebase-20261022-3a9e7461': '3a9e74619f6955bebef38d0abe6faaaf90db6873', 'refs/tags/backup/upstream-pr1949-before-rebase-20261022-25208eea': '25208eea6e12db8cb05efddf58ae09ca6e8020e3', 'refs/tags/backup/upstream-pr1949-before-rebase-20261022-33737125': '33737125e7a5fd336738fcac95bd04d8443a6ba6'}
-          actual_tags = {item['ref']: item['object']['sha'] for item in read('git/matching-refs/tags/backup/upstream-pr')}
-          assert all(actual_tags.get(ref) == sha for ref, sha in tags.items())
-          print('Verified latest upstream, both backup generations, exact published heads and full portable/native success.')
-          PY
-  published:
-    name: ${{ matrix.target }} published Node ${{ matrix.node }}
-    needs: verified
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: "1927"
-            sha: 0057f90b074b26f2f9d44336cb204e3df48f0249
-            node: 22
-            tests: "__tests__/go-chained-receivers.test.ts"
-          - target: "1927"
-            sha: 0057f90b074b26f2f9d44336cb204e3df48f0249
-            node: 24
-            tests: "__tests__/go-chained-receivers.test.ts"
-          - target: "1928"
-            sha: 878c3ae577e6cd26fdf7f5b2a25b8e89ca6bd3b4
-            node: 22
-            tests: "__tests__/go-chained-receivers.test.ts"
-          - target: "1928"
-            sha: 878c3ae577e6cd26fdf7f5b2a25b8e89ca6bd3b4
-            node: 24
-            tests: "__tests__/go-chained-receivers.test.ts"
-          - target: "1929"
-            sha: 206dee62acf5009b502052cb947358c8b669c075
-            node: 22
-            tests: "__tests__/go-chained-receivers.test.ts"
-          - target: "1929"
-            sha: 206dee62acf5009b502052cb947358c8b669c075
-            node: 24
-            tests: "__tests__/go-chained-receivers.test.ts"
-          - target: "1930"
-            sha: 576f387e6670b347915a7245f53d253f839c6964
-            node: 22
-            tests: "__tests__/go-chained-receivers.test.ts"
-          - target: "1930"
-            sha: 576f387e6670b347915a7245f53d253f839c6964
-            node: 24
-            tests: "__tests__/go-chained-receivers.test.ts"
-          - target: "1931"
-            sha: 852174294f1cc1f07cf1f38a714aa6736c5cfcba
-            node: 22
-            tests: "__tests__/go-chained-receivers.test.ts"
-          - target: "1931"
-            sha: 852174294f1cc1f07cf1f38a714aa6736c5cfcba
-            node: 24
-            tests: "__tests__/go-chained-receivers.test.ts"
-          - target: "1948"
-            sha: 24ecca1ac17df6b9535ddaec1eaabcc5c4a6bedd
-            node: 22
-            tests: "__tests__/go-chained-receivers.test.ts"
-          - target: "1948"
-            sha: 24ecca1ac17df6b9535ddaec1eaabcc5c4a6bedd
-            node: 24
-            tests: "__tests__/go-chained-receivers.test.ts"
-          - target: "1949"
-            sha: 84504b80fddf2f686f9dcf5de1d73a04026db120
-            node: 22
-            tests: "__tests__/go-chained-receivers.test.ts"
-          - target: "1949"
-            sha: 84504b80fddf2f686f9dcf5de1d73a04026db120
-            node: 24
-            tests: "__tests__/go-chained-receivers.test.ts"
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ matrix.sha }}
-          persist-credentials: false
-      - name: Verify exact published commit
-        run: test "$(git rev-parse HEAD)" = "${{ matrix.sha }}"
-      - uses: actions/setup-node@v6
-        with:
-          node-version: ${{ matrix.node }}
-          cache: npm
-      - run: npm ci
-      - run: npm run build
-      - run: mkdir -p "$HOME/.ssh"
-      - name: Focused portable regressions on published commit
-        run: npx vitest run ${{ matrix.tests }} --maxWorkers=2 --minWorkers=1
-        env:
-          CODEGRAPH_KERNEL: '0'
-      - name: Check contribution documentation links
-        if: matrix.target == '1931'
-        run: |
-          node <<'JS'
-          const fs = require('fs'), path = require('path');
-          for (const file of ['CONTRIBUTING.md', 'README.md', 'docs/README.md']) {
-            const body = fs.readFileSync(file, 'utf8');
-            for (const match of body.matchAll(/\]\(([^)]+)\)/g)) {
-              const link = match[1];
-              if (link.includes('://') || link.startsWith('#') || link.startsWith('mailto:')) continue;
-              const target = path.resolve(path.dirname(file), link.split(/[?#]/)[0]);
-              if (!fs.existsSync(target)) throw new Error(file + ': broken link ' + link);
+{
+  "name": "Seven contribution validation 69af",
+  "on": {
+    "workflow_dispatch": {
+      "inputs": {
+        "stage": {
+          "type": "choice",
+          "options": [
+            "candidate",
+            "published"
+          ],
+          "default": "candidate"
+        }
+      }
+    }
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "env": {
+    "CODEGRAPH_TELEMETRY": "0",
+    "CODEGRAPH_NO_UPDATE_CHECK": "1"
+  },
+  "jobs": {
+    "guard": {
+      "name": "Verify remote refs",
+      "runs-on": "ubuntu-latest",
+      "steps": [
+        {
+          "env": {
+            "GH_TOKEN": "${{ github.token }}",
+            "VALIDATION_STAGE": "${{ inputs.stage }}"
+          },
+          "run": "python3 - <<'PY'\nimport json,os,urllib.request\nreq=urllib.request.Request('https://api.github.com/repos/mixxer/codegraph-aosp/git/matching-refs/heads',headers={'Authorization':'Bearer '+os.environ['GH_TOKEN']})\nwith urllib.request.urlopen(req,timeout=30) as res: rows=json.load(res)\nrefs={x['ref'].removeprefix('refs/heads/'):x['object']['sha'] for x in rows}\nexpected={'fix/java-kotlin-inheritance': '11efa862763031c9ca943c105a78bc61a16f8b31', 'feat/android-platform-tools': '231f959da16f809244bfaafb5e1959162c7d7235', 'fix/mcp-project-cache-lifetime': 'af5e560ba2414df15fd231b753032dc46403713b', 'fix/project-path-realpath': '4c8f64415f47228986dcac7e4ad2c7ca6e886797', 'docs/contributing-guide': '691f067c012e7708f5241cfb8a74c2d2c4c9634c', 'fix/kotlin-imported-type-calls': '7d0faad04295c6d1dd93bc3cfd663340cbd86f9a', 'fix/java-static-field-calls': '261cc306d45b18ef6fc4788f949550401309993c'} if os.environ['VALIDATION_STAGE']=='published' else {'fix/java-kotlin-inheritance': '0057f90b074b26f2f9d44336cb204e3df48f0249', 'feat/android-platform-tools': '878c3ae577e6cd26fdf7f5b2a25b8e89ca6bd3b4', 'fix/mcp-project-cache-lifetime': '206dee62acf5009b502052cb947358c8b669c075', 'fix/project-path-realpath': '576f387e6670b347915a7245f53d253f839c6964', 'docs/contributing-guide': '852174294f1cc1f07cf1f38a714aa6736c5cfcba', 'fix/kotlin-imported-type-calls': '24ecca1ac17df6b9535ddaec1eaabcc5c4a6bedd', 'fix/java-static-field-calls': '84504b80fddf2f686f9dcf5de1d73a04026db120'}\nfor b,h in {**expected,**{'main': 'b6ae433cface2fe3828a6387d97c75b1834eb6d9', 'fix/android-platform-language-coverage': 'f1ed60e2ab1b9685aa00aa4e7f3ccbe6f5ef5da1'}}.items():\n assert refs.get(b)==h,(b,h,refs.get(b))\nprint('Verified protected downstream and expected feature refs.')\nPY"
+        }
+      ]
+    },
+    "portable": {
+      "name": "${{ matrix.target }} portable Node ${{ matrix.node }}",
+      "needs": "guard",
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": 35,
+      "strategy": {
+        "fail-fast": false,
+        "max-parallel": 8,
+        "matrix": {
+          "include": [
+            {
+              "target": "baseline",
+              "sha": "69af19ace270f2e940444d514de6dde971df12df",
+              "node": 22
+            },
+            {
+              "target": "baseline",
+              "sha": "69af19ace270f2e940444d514de6dde971df12df",
+              "node": 24
+            },
+            {
+              "target": "1927",
+              "sha": "11efa862763031c9ca943c105a78bc61a16f8b31",
+              "node": 22
+            },
+            {
+              "target": "1927",
+              "sha": "11efa862763031c9ca943c105a78bc61a16f8b31",
+              "node": 24
+            },
+            {
+              "target": "1928",
+              "sha": "231f959da16f809244bfaafb5e1959162c7d7235",
+              "node": 22
+            },
+            {
+              "target": "1928",
+              "sha": "231f959da16f809244bfaafb5e1959162c7d7235",
+              "node": 24
+            },
+            {
+              "target": "1929",
+              "sha": "af5e560ba2414df15fd231b753032dc46403713b",
+              "node": 22
+            },
+            {
+              "target": "1929",
+              "sha": "af5e560ba2414df15fd231b753032dc46403713b",
+              "node": 24
+            },
+            {
+              "target": "1930",
+              "sha": "4c8f64415f47228986dcac7e4ad2c7ca6e886797",
+              "node": 22
+            },
+            {
+              "target": "1930",
+              "sha": "4c8f64415f47228986dcac7e4ad2c7ca6e886797",
+              "node": 24
+            },
+            {
+              "target": "1931",
+              "sha": "691f067c012e7708f5241cfb8a74c2d2c4c9634c",
+              "node": 22
+            },
+            {
+              "target": "1931",
+              "sha": "691f067c012e7708f5241cfb8a74c2d2c4c9634c",
+              "node": 24
+            },
+            {
+              "target": "1948",
+              "sha": "7d0faad04295c6d1dd93bc3cfd663340cbd86f9a",
+              "node": 22
+            },
+            {
+              "target": "1948",
+              "sha": "7d0faad04295c6d1dd93bc3cfd663340cbd86f9a",
+              "node": 24
+            },
+            {
+              "target": "1949",
+              "sha": "261cc306d45b18ef6fc4788f949550401309993c",
+              "node": 22
+            },
+            {
+              "target": "1949",
+              "sha": "261cc306d45b18ef6fc4788f949550401309993c",
+              "node": 24
             }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@v6",
+          "with": {
+            "ref": "${{ matrix.sha }}",
+            "persist-credentials": false
           }
-          console.log('All relative contribution documentation links resolve.');
-          JS
-  checks:
-    name: Published contribution verification complete
-    if: always()
-    needs: [verified, published]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - env:
-          PROOF_RESULT: ${{ needs.verified.result }}
-          PUBLISHED_RESULT: ${{ needs.published.result }}
-        run: |
-          test "$PROOF_RESULT" = success
-          test "$PUBLISHED_RESULT" = success
+        },
+        {
+          "name": "Verify exact source commit",
+          "shell": "bash",
+          "run": "test \"$(git rev-parse HEAD)\" = \"${{ matrix.sha }}\"\necho \"Validated source ${{ matrix.sha }}\""
+        },
+        {
+          "uses": "actions/setup-node@v6",
+          "with": {
+            "node-version": "${{ matrix.node }}",
+            "cache": "npm"
+          }
+        },
+        {
+          "run": "npm ci"
+        },
+        {
+          "run": "npm run build"
+        },
+        {
+          "run": "mkdir -p \"$HOME/.ssh\""
+        },
+        {
+          "name": "Full portable engine and viewer",
+          "run": "npm test -- --maxWorkers=3 --minWorkers=1",
+          "env": {
+            "CODEGRAPH_KERNEL": "0"
+          }
+        },
+        {
+          "name": "Documentation links",
+          "if": "matrix.target == '1931'",
+          "run": "node <<'JS'\nconst fs=require('fs'),p=require('path');for(const f of ['CONTRIBUTING.md','README.md','docs/README.md'])for(const m of fs.readFileSync(f,'utf8').matchAll(/\\]\\(([^)]+)\\)/g)){const u=m[1];if(u.includes('://')||u.startsWith('#')||u.startsWith('mailto:'))continue;if(!fs.existsSync(p.resolve(p.dirname(f),u.split(/[?#]/)[0])))throw Error(f+': '+u)}console.log('Documentation links resolve.');\nJS"
+        }
+      ]
+    },
+    "windows": {
+      "name": "${{ matrix.target }} Windows Node ${{ matrix.node }}",
+      "needs": "guard",
+      "runs-on": "windows-latest",
+      "timeout-minutes": 25,
+      "strategy": {
+        "fail-fast": false,
+        "max-parallel": 6,
+        "matrix": {
+          "include": [
+            {
+              "target": "baseline",
+              "sha": "69af19ace270f2e940444d514de6dde971df12df",
+              "node": 22
+            },
+            {
+              "target": "baseline",
+              "sha": "69af19ace270f2e940444d514de6dde971df12df",
+              "node": 24
+            },
+            {
+              "target": "1929",
+              "sha": "af5e560ba2414df15fd231b753032dc46403713b",
+              "node": 22
+            },
+            {
+              "target": "1929",
+              "sha": "af5e560ba2414df15fd231b753032dc46403713b",
+              "node": 24
+            },
+            {
+              "target": "1930",
+              "sha": "4c8f64415f47228986dcac7e4ad2c7ca6e886797",
+              "node": 22
+            },
+            {
+              "target": "1930",
+              "sha": "4c8f64415f47228986dcac7e4ad2c7ca6e886797",
+              "node": 24
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@v6",
+          "with": {
+            "ref": "${{ matrix.sha }}",
+            "persist-credentials": false
+          }
+        },
+        {
+          "name": "Verify exact source commit",
+          "shell": "bash",
+          "run": "test \"$(git rev-parse HEAD)\" = \"${{ matrix.sha }}\"\necho \"Validated source ${{ matrix.sha }}\""
+        },
+        {
+          "uses": "actions/setup-node@v6",
+          "with": {
+            "node-version": "${{ matrix.node }}",
+            "cache": "npm"
+          }
+        },
+        {
+          "run": "npm ci"
+        },
+        {
+          "run": "npm run build"
+        },
+        {
+          "name": "Windows path and MCP lifecycle regressions",
+          "shell": "bash",
+          "run": "npx vitest run __tests__/security.test.ts __tests__/mcp-initialize.test.ts __tests__/mcp-roots.test.ts __tests__/child-process-windows-hide.test.ts __tests__/daemon-lock-holder.test.ts __tests__/status-index-health.test.ts $(test ! -f __tests__/mcp-project-cache.test.ts || echo __tests__/mcp-project-cache.test.ts) --maxWorkers=2 --minWorkers=1",
+          "env": {
+            "CODEGRAPH_KERNEL": "0"
+          }
+        }
+      ]
+    },
+    "native": {
+      "name": "${{ matrix.target }} native kernel and language regressions",
+      "needs": [
+        "portable",
+        "windows"
+      ],
+      "runs-on": "ubuntu-22.04",
+      "timeout-minutes": 45,
+      "strategy": {
+        "fail-fast": false,
+        "max-parallel": 4,
+        "matrix": {
+          "include": [
+            {
+              "target": "baseline",
+              "sha": "69af19ace270f2e940444d514de6dde971df12df"
+            },
+            {
+              "target": "1927",
+              "sha": "11efa862763031c9ca943c105a78bc61a16f8b31"
+            },
+            {
+              "target": "1928",
+              "sha": "231f959da16f809244bfaafb5e1959162c7d7235"
+            },
+            {
+              "target": "1929",
+              "sha": "af5e560ba2414df15fd231b753032dc46403713b"
+            },
+            {
+              "target": "1930",
+              "sha": "4c8f64415f47228986dcac7e4ad2c7ca6e886797"
+            },
+            {
+              "target": "1931",
+              "sha": "691f067c012e7708f5241cfb8a74c2d2c4c9634c"
+            },
+            {
+              "target": "1948",
+              "sha": "7d0faad04295c6d1dd93bc3cfd663340cbd86f9a"
+            },
+            {
+              "target": "1949",
+              "sha": "261cc306d45b18ef6fc4788f949550401309993c"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@v6",
+          "with": {
+            "ref": "${{ matrix.sha }}",
+            "persist-credentials": false
+          }
+        },
+        {
+          "name": "Verify exact source commit",
+          "shell": "bash",
+          "run": "test \"$(git rev-parse HEAD)\" = \"${{ matrix.sha }}\"\necho \"Validated source ${{ matrix.sha }}\""
+        },
+        {
+          "uses": "actions/setup-node@v6",
+          "with": {
+            "node-version": 22,
+            "cache": "npm"
+          }
+        },
+        {
+          "run": "npm ci"
+        },
+        {
+          "name": "Build fresh native kernel after all portable suites",
+          "run": "bash scripts/build-kernel.sh --target x86_64-unknown-linux-gnu"
+        },
+        {
+          "run": "npm run build"
+        },
+        {
+          "name": "Verify native contract",
+          "run": "test -s codegraph-kernel/prebuilds/linux-x64/codegraph-kernel.node\nnode -e \"const k=require('./dist/extraction/kernel/loader').getKernel();if(!k)throw Error('Native kernel missing');console.log(JSON.stringify(k.contractInfo()));\""
+        },
+        {
+          "name": "Native parity, language and Android regressions",
+          "env": {
+            "CODEGRAPH_KERNEL_EXPECT": "1"
+          },
+          "run": "python3 - <<'PY'\nimport glob,subprocess\npatterns=['kernel-*.test.ts', 'kotlin-*.test.ts', 'java-*.test.ts', 'aosp-*.test.ts', 'rust-*.test.ts', 'ruby-*.test.ts', 'go-*.test.ts', 'pascal-*.test.ts', 'extraction.test.ts', 'resolution.test.ts', 'function-ref*.test.ts', 'generic-supertypes.test.ts', 'override-overload-pairing.test.ts', 'mcp-project-cache.test.ts', 'security.test.ts', 'mcp-tool-allowlist.test.ts', 'mcp-initialize.test.ts']\nfiles=sorted({p for pat in patterns for p in glob.glob('__tests__/'+pat)})\nassert files\nsubprocess.run(['npx','vitest','run',*files,'--maxWorkers=2','--minWorkers=1'],check=True)\nPY"
+        }
+      ]
+    },
+    "checks": {
+      "name": "All contribution validation complete",
+      "if": "always()",
+      "needs": [
+        "guard",
+        "portable",
+        "windows",
+        "native"
+      ],
+      "runs-on": "ubuntu-latest",
+      "steps": [
+        {
+          "env": {
+            "GUARD": "${{ needs.guard.result }}",
+            "PORTABLE": "${{ needs.portable.result }}",
+            "WINDOWS": "${{ needs.windows.result }}",
+            "NATIVE": "${{ needs.native.result }}"
+          },
+          "run": "test \"$GUARD\" = success\ntest \"$PORTABLE\" = success\ntest \"$WINDOWS\" = success\ntest \"$NATIVE\" = success"
+        }
+      ]
+    }
+  }
+}
