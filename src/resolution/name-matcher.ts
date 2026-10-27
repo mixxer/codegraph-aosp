@@ -5903,6 +5903,60 @@ const CSHARP_STD_METHODS: ReadonlySet<string> = new Set([
 const VBNET_STD_METHODS: ReadonlySet<string> = new Set([...CSHARP_STD_METHODS].map((m) => m.toLowerCase()));
 
 /**
+ * Python's dict / list / set / str / file / `re` methods. On an untyped
+ * receiver (`options.setdefault(…)`, `d.copy()`) they are the builtin
+ * type's, never a same-named project method the call happens to share a
+ * file with.
+ */
+const PYTHON_STD_METHODS: ReadonlySet<string> = new Set([
+  'get', 'setdefault', 'pop', 'popitem', 'update', 'items', 'keys', 'values', 'copy', 'clear',
+  'append', 'extend', 'insert', 'remove', 'index', 'count', 'sort', 'reverse', 'add', 'discard',
+  'union', 'intersection', 'difference', 'split', 'rsplit', 'join', 'strip', 'lstrip', 'rstrip',
+  'replace', 'startswith', 'endswith', 'lower', 'upper', 'format', 'encode', 'decode', 'find',
+  'rfind', 'splitlines', 'read', 'readline', 'readlines', 'write', 'writelines', 'close', 'seek',
+  'flush', 'group', 'groups', 'match', 'search', 'sub', 'findall', 'fullmatch',
+]);
+
+/**
+ * Scala's collection / Option / Future methods and the `java.*` calls Scala
+ * code makes. On Play, ~2,500 `map` / `get` / `foreach` calls on untyped
+ * values landed on unrelated project methods.
+ */
+const SCALA_STD_METHODS: ReadonlySet<string> = new Set([
+  'map', 'flatMap', 'filter', 'filterNot', 'foreach', 'fold', 'foldLeft', 'foldRight', 'reduce',
+  'collect', 'collectFirst', 'find', 'exists', 'forall', 'count', 'get', 'getOrElse', 'orElse',
+  'orNull', 'isEmpty', 'nonEmpty', 'isDefined', 'contains', 'headOption', 'head', 'tail', 'last',
+  'lastOption', 'take', 'drop', 'groupBy', 'sortBy', 'sorted', 'mkString', 'toList', 'toSeq',
+  'toSet', 'toMap', 'toVector', 'toArray', 'zip', 'zipWithIndex', 'size', 'length', 'update',
+  'updated', 'recover', 'recoverWith', 'transform', 'andThen', 'compose', 'onComplete', 'asScala',
+  'asJava', 'getOrElseUpdate', 'put', 'remove', 'add', 'append', 'replace', 'split', 'trim',
+  'startsWith', 'endsWith', 'format', 'equals', 'hashCode', 'toString', 'set', 'build', 'execute',
+  'of', 'encode', 'decode', 'max', 'min',
+]);
+
+/**
+ * `java.lang` / `java.util` / streams and the Android framework calls Java
+ * code makes on values whose type the resolver cannot see — a lambda
+ * parameter, a `var`, a call result, an inherited field. On Play ~1,100
+ * test-map `put` calls landed on a test class's `RejectingMap::put`. Names
+ * Java projects commonly declare themselves (`post`, `of`, `apply`, `run`,
+ * `start`, `getId`) stay out.
+ */
+const JAVA_STD_METHODS: ReadonlySet<string> = new Set([
+  'equals', 'hashCode', 'toString', 'getClass', 'compareTo',
+  'get', 'put', 'add', 'remove', 'contains', 'containsKey', 'containsValue', 'size', 'isEmpty',
+  'clear', 'iterator', 'hasNext', 'next', 'stream', 'forEach', 'keySet', 'values', 'entrySet',
+  'addAll', 'removeAll', 'putAll', 'putIfAbsent', 'getOrDefault', 'computeIfAbsent', 'indexOf',
+  'toArray', 'subList',
+  'length', 'charAt', 'substring', 'trim', 'split', 'startsWith', 'endsWith', 'equalsIgnoreCase',
+  'toLowerCase', 'toUpperCase', 'replace', 'format', 'valueOf',
+  'map', 'filter', 'orElse', 'orElseGet', 'orElseThrow', 'ifPresent', 'isPresent', 'collect',
+  'findFirst', 'anyMatch', 'allMatch',
+  'postDelayed', 'removeCallbacks', 'obtainMessage', 'getResources', 'getSystemService',
+  'findViewById', 'setVisibility', 'startActivity',
+]);
+
+/**
  * A request handler the web framework dispatches to: a Django / DRF / Flask
  * view's `get` / `post` / …, a controller's `index` / `store` / `update` /
  * `destroy`. Nothing calls one through an instance by name, so a guess from
@@ -5948,6 +6002,9 @@ function stdMethodNames(language: string): ReadonlySet<string> | null {
     case 'csharp': return CSHARP_STD_METHODS;
     case 'vbnet': return VBNET_STD_METHODS;
     case 'dart': return DART_STD_METHODS;
+    case 'python': return PYTHON_STD_METHODS;
+    case 'scala': return SCALA_STD_METHODS;
+    case 'java': return JAVA_STD_METHODS;
     default: return null;
   }
 }
@@ -11866,6 +11923,8 @@ export function matchByExactName(
   const inheritanceRef = isInheritanceRef(ref);
   // Read once, and only for a candidate in another file: it scans the file.
   let bareTypeName: boolean | undefined;
+  // Every candidate uses the same binding key. Keep this check lazy.
+  let locallyBoundJsName: boolean | undefined;
   const tsBareTypeName = (): boolean => (bareTypeName ??= isTsBareTypeName(ref, context));
   const sameName = outOfRepoCall
     ? innerScopeShadows(context.getNodesByName(ref.referenceName), ref, context)
@@ -12008,7 +12067,7 @@ export function matchByExactName(
       !ESM_FAMILY.has(n.language) || !isSealedModule(n.filePath, context)) &&
     // A name the file binds itself (a parameter, a const) shadows every other
     // file's symbol of that name, so a bare call has no cross-file candidate.
-    !(bareJs && n.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context))
+    !(bareJs && n.filePath !== ref.filePath && (locallyBoundJsName ??= isLocallyBoundJsName(ref.referenceName, ref.filePath, context)))
   );
   const ranked = dartBare ? nearestDartMembers(preferOwnDartLibrary(filtered, ref, context), ref, context)
     : dartTypeRef && dartPrefix === null ? preferOwnDartLibrary(filtered, ref, context)
@@ -12049,8 +12108,19 @@ export function matchByExactName(
   if (bestMatch && isCrossFileReachable(bestMatch, ref, context)) {
     // Lower confidence when the match is from a distant/unrelated module
     const proximity = computePathProximity(ref.filePath, bestMatch.filePath);
+    // Every candidate is a copy of one symbol and this is the caller's own
+    // copy: the name itself is not ambiguous, only which copy — so rank it
+    // above a proximity guess, but below a unique name or the file's own
+    // definition (0.9). The candidates are those findBestMatch weighed: a
+    // namesake in another language never wins while one in the reference's
+    // own language exists. The caller's own copy being the caller itself is
+    // no evidence, as for a same-file match (isDecisiveSameFileMatch).
+    const weighed = candidates.some((c) => c.language === ref.language)
+      ? candidates.filter((c) => c.language === ref.language)
+      : candidates;
     const confidence = isDecisiveSameFileMatch(bestMatch, ref, candidates, context)
       ? 0.9
+      : bestMatch.id !== ref.fromNodeId && closestCopy(ref, weighed) === bestMatch ? 0.8
       : proximity >= 30 ? 0.7 : 0.4;
     return {
       original: ref,
@@ -20743,7 +20813,11 @@ export function matchMethodCall(
           if (!target || (target.qualifiedName.startsWith(`${inferredType}::`) && target.filePath !== awaited.filePath)) return null;
           return { ...typedMatch, original: ref };
         }
-        return typedMatch;
+        // A Scala call never lands on another language's constructor here: a
+        // `def f(): T = T.Inner(...)` return annotation reads as `T`'s type and
+        // hands `Inner::Inner` over. Fall through to the Scala type lookup.
+        const target = ref.language === 'scala' ? context.getNodeById?.(typedMatch.targetNodeId) : null;
+        if (!target || !isOtherLanguageConstructor(target, ref.language)) return typedMatch;
       }
       if (awaited) return null;
       // A known JS/TS builtin receiver is external when it has no project
@@ -21257,6 +21331,24 @@ export function matchMethodCall(
     if (strat2) return strat2;
   }
 
+  // Scala `Outer.Inner(args)`: a case-class / companion `apply` on the nested
+  // Scala type `Outer::Inner` (Scala qualified names carry no package). Taken
+  // only when every match sits in one file (a class and its companion share
+  // the name), or else from the call site's own file. A Scala `object` is a
+  // `module`; a class / trait of the same name is preferred over it.
+  if (ref.language === 'scala' && dotMatch && /^[A-Z]/.test(methodName!)) {
+    const typeQn = `${objectOrClass!.replace(/\./g, '::')}::${methodName}`;
+    const types = context
+      .getNodesByQualifiedName(typeQn)
+      .filter((n) => n.language === 'scala' && (n.kind === 'class' || n.kind === 'trait' || n.kind === 'module'))
+      .sort((a, b) => Number(a.kind === 'module') - Number(b.kind === 'module'));
+    const oneFile = types.length > 0 && types.every((n) => n.filePath === types[0]!.filePath);
+    const chosen = oneFile ? types[0] : types.find((n) => n.filePath === ref.filePath);
+    if (chosen) {
+      return { original: ref, targetNodeId: chosen.id, confidence: 0.85, resolvedBy: 'qualified-name' };
+    }
+  }
+
   // Strategy 3: Find methods by name across the codebase, match by receiver
   // name similarity with the containing class. Handles abbreviated variable
   // names like permissionEngine → PermissionRuleEngine.
@@ -21356,9 +21448,10 @@ export function matchMethodCall(
         // `json` of its `MockedResponse`.
         !isUnnamedTestDouble(targetMethods[0]!, objectOrClass!, ref, context) &&
         !((ref.language === 'lua' || ref.language === 'luau') && isLuaLibraryCall(objectOrClass!, methodName!, ref, targetMethods[0]!)) &&
-        // Rust / Go / Kotlin / C# / VB.NET: a standard-library method name on
-        // an untyped receiver (`sym.map(…)`, `w.Header().Get(…)`,
-        // `reader.Value.ToString()`) is the library type's.
+        // Rust / Go / Kotlin / C# / VB.NET / Python / Scala / Java: a
+        // standard-library method name on an untyped receiver (`sym.map(…)`,
+        // `w.Header().Get(…)`, `reader.Value.ToString()`,
+        // `options.setdefault(…)`) is the library type's.
         !(isStdMethodName(ref.language, methodName!) &&
           !/^(?:self|Self|this|base)$/.test(objectOrClass!) && !receiverNamesOwner(receiverLink(objectOrClass!), targetMethods[0]!, context)) &&
         !(UNTYPED_RECEIVER_LANGUAGES.has(ref.language) && !/^(?:self|self\.class|this|super|weak_?self|strong_?self)$/i.test(objectOrClass!) &&
@@ -21366,6 +21459,7 @@ export function matchMethodCall(
           !(ref.language === 'objc' && objcReceiverReaches(objectOrClass!, targetMethods[0]!, context)) &&
           !(ref.language === 'php' && phpReceiverReaches(objectOrClass!, targetMethods[0]!, context)))) {
       if (throughCppNamespace() && !isCppConstructorThrough(objectOrClass!, targetMethods[0]!, context)) return null;
+      if (isForeignReceiverSelfLoop(targetMethods[0]!, objectOrClass!, ref)) return null;
       return {
         original: ref,
         targetNodeId: targetMethods[0]!.id,
@@ -21678,6 +21772,30 @@ function importBindsOther(candidate: Node, ref: UnresolvedRef, context: Resoluti
   if (!node || node.kind === 'function' || node.kind === 'method' || node.filePath === candidate.filePath) return false;
   const lines = (context.getFileLines?.(node.filePath) ?? context.readFile(node.filePath)?.split(/\r?\n/)) ?? [];
   return !/\bimport\s*\(/.test(lines.slice(node.startLine - 1, Math.min(node.endLine, node.startLine + 15)).join('\n'));
+}
+
+/** Receivers that name the current object (or its own class/base) — a call
+ * through one of these may genuinely recurse into the enclosing method. */
+const SELF_RECEIVERS = new Set(['this', 'self', 'Self', 'super', 'cls']);
+
+/**
+ * Strategy 3's single-candidate branch matches by method NAME alone, so a
+ * delegating wrapper whose method is the only one of that name —
+ * `wrapped.unbind(v)` inside `unbind(v)` — name-matches the method it is
+ * written in and the resolver emitted a self-loop. (The word-overlap branch
+ * already refuses the caller itself.) A receiver that is an explicit, other
+ * object is by construction not the enclosing method's own instance, so that
+ * candidate is the one guess we know is wrong: no edge beats a wrong edge.
+ * Real recursion (`this.foo()`, `self.foo()`, bare `foo()`) is kept; Go's
+ * named method receiver (`r.foo()`) is typed and never gets here. Go is left
+ * out altogether: a method's receiver and a struct's fields are typed before
+ * this point, so a Go call that still arrives here is on a local the
+ * resolver could not type, mostly a range variable over the type's own
+ * children — cobra's `sub.checkCommandGroups()` over `c.commands`, etcd's
+ * `child.Repr(…)` — which is real recursion.
+ */
+function isForeignReceiverSelfLoop(candidate: Node, receiver: string, ref: UnresolvedRef): boolean {
+  return candidate.id === ref.fromNodeId && !SELF_RECEIVERS.has(receiver) && ref.language !== 'go';
 }
 
 /** The directory of a Go file, which is its package: Go keeps one package per directory. */
@@ -24920,6 +25038,17 @@ export function pythonAttrRefResolves(ref: UnresolvedRef, context: ResolutionCon
   return !!matchPythonAttrCall(receiver, ref.referenceName.slice(dot + 1), ref, context);
 }
 
+/**
+ * A constructor node of another language: a method named like its owner
+ * (`pkg::Outer::Inner::Inner`), which is how the Java/Kotlin extractors record
+ * an explicit constructor.
+ */
+function isOtherLanguageConstructor(node: Node, language: string): boolean {
+  if (node.language === language) return false;
+  const segs = node.qualifiedName.split('::');
+  return segs.length >= 2 && segs[segs.length - 1] === segs[segs.length - 2];
+}
+
 /** Go builtin/primitive field types that can never carry a project method. */
 const GO_BUILTIN_FIELD_TYPES = new Set([
   'string', 'bool', 'byte', 'rune', 'error', 'any',
@@ -26731,7 +26860,11 @@ function tsFieldCall(
       while (i < dirs.length && i < callDirs.length && dirs[i] === callDirs[i]) i++;
       return i;
     };
-    const nearest = [...declared].sort((a, b) => shared(b.filePath) - shared(a.filePath) || a.filePath.localeCompare(b.filePath))[0]!;
+    // Ties break by code-unit order, not localeCompare: ICU collation
+    // depends on the host locale, so the same index could pick a
+    // different target on another machine.
+    const nearest = [...declared].sort((a, b) => shared(b.filePath) - shared(a.filePath) ||
+      (a.filePath < b.filePath ? -1 : a.filePath > b.filePath ? 1 : 0))[0]!;
     return { original: ref, targetNodeId: nearest.id, confidence: 0.85, resolvedBy: 'instance-method' };
   }
   return resolveMethodOnType(typeName, methodName, ref, context, 0.85, 'instance-method', imported);
@@ -27593,6 +27726,7 @@ function findBestMatch(
 
   let bestScore = -1;
   let bestNode: Node | null = null;
+  let tied: Node[] = [];
 
   // Split the ref's path once (it's the same across every candidate) instead of
   // re-splitting it inside computePathProximity per candidate (#915 hot spot).
@@ -27683,10 +27817,63 @@ function findBestMatch(
     if (score > bestScore) {
       bestScore = score;
       bestNode = candidate;
+      tied = [candidate];
+    } else if (score === bestScore) {
+      tied.push(candidate);
     }
   }
 
-  return bestNode;
+  // Proximity is capped, so on deep trees two copies of the same symbol in
+  // sibling modules can tie; the caller's own copy, if uniquely closest, wins.
+  return (tied.length > 1 && closestCopy(ref, tied)) || bestNode;
+}
+
+/**
+ * Number of leading directory segments two file paths share (uncapped).
+ */
+function sharedDirDepth(filePath1: string, filePath2: string): number {
+  const a = filePath1.split('/');
+  const b = filePath2.split('/');
+  a.pop();
+  b.pop();
+  let shared = 0;
+  while (shared < a.length && shared < b.length && a[shared] === b[shared]) shared++;
+  return shared;
+}
+
+/**
+ * When every candidate is a copy of the same symbol — same qualified name, kind
+ * and file basename, as when a module is duplicated under another source root
+ * (`rc2/flymod/src/…` vs `rcpro2/flymod/src/…`) — return the copy whose file
+ * shares the longest directory prefix with the reference, i.e. the one in the
+ * caller's own module. Returns null when the candidates are not all copies or
+ * no copy is uniquely closest, so callers keep their existing choice.
+ */
+function closestCopy(ref: UnresolvedRef, candidates: Node[]): Node | null {
+  if (candidates.length < 2) return null;
+  const first = candidates[0]!;
+  const base = path.posix.basename(first.filePath);
+  let best: Node | null = null;
+  let bestDepth = -1;
+  let unique = false;
+  for (const c of candidates) {
+    if (
+      c.qualifiedName !== first.qualifiedName ||
+      c.kind !== first.kind ||
+      path.posix.basename(c.filePath) !== base
+    ) {
+      return null;
+    }
+    const depth = sharedDirDepth(ref.filePath, c.filePath);
+    if (depth > bestDepth) {
+      bestDepth = depth;
+      best = c;
+      unique = true;
+    } else if (depth === bestDepth) {
+      unique = false;
+    }
+  }
+  return unique ? best : null;
 }
 
 /**

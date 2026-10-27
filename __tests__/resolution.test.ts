@@ -5459,6 +5459,134 @@ object Main {
       // Bar has no onlyOther() — must not mis-attach to the same-named Other::onlyOther.
       expect(callerNamesOf('Other::onlyOther')).toEqual([]);
     });
+
+    describe('Scala Outer.Inner(args) apply vs a Java constructor', () => {
+      function write(rel: string, body: string): void {
+        fs.mkdirSync(path.dirname(path.join(tempDir, rel)), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, rel), body);
+      }
+      function edgesFrom(name: string): { kind: string; qn: string; lang: string }[] {
+        const from = cg.getNodesByKind('method').find((n) => n.name === name);
+        if (!from) return [];
+        return cg
+          .getOutgoingEdges(from.id)
+          .filter((e) => e.kind !== 'contains' && e.kind !== 'references')
+          .map((e) => {
+            const t = cg.getNode(e.target)!;
+            return { kind: e.kind, qn: t.qualifiedName, lang: t.language };
+          });
+      }
+
+      beforeEach(() => {
+        write('java/com/acme/http/WebSocket.java', `package com.acme.http;
+public abstract class WebSocket {
+  public static WebSocket fromString(String s) { return null; }
+  public static class Accepted {
+    public Accepted(String flow) {}
+  }
+}
+`);
+        // A second Java class sharing the method names, so the receiver-word
+        // strategy (not a unique-name shortcut) is what decides.
+        write('java/com/acme/http/Other.java', `package com.acme.http;
+public class Other {
+  public static Other fromString(String s) { return null; }
+  public static class Accepted {
+    public Accepted(String flow) {}
+  }
+}
+`);
+      });
+
+      it('resolves WebSocket.Accepted(...) to the Scala case class, never the Java constructor', async () => {
+        write('scala/app/WebSocket.scala', `package app
+trait WebSocket
+object WebSocket {
+  final case class Accepted[In, Out](flow: String, sub: Option[String])
+}
+`);
+        write('scala/app/Use.scala', `package app
+class Use {
+  def accept(): Unit = { WebSocket.Accepted("f", None) }
+}
+`);
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const out = edgesFrom('accept');
+        expect(out.filter((e) => e.lang === 'java')).toEqual([]);
+        expect(out).toContainEqual({ kind: 'instantiates', qn: 'WebSocket::Accepted', lang: 'scala' });
+      });
+
+      it('does not take a Java constructor from a return-type annotation read as the receiver type', async () => {
+        // `def f(): WebSocket = WebSocket.Accepted(...)` — the local-declaration
+        // pattern reads `WebSocket = WebSocket.Accepted` as the receiver's type.
+        write('scala/app/WebSocket.scala', `package app
+trait WebSocket
+object WebSocket {
+  final case class Accepted(flow: String) extends WebSocket
+}
+`);
+        write('scala/app/Use.scala', `package app
+class Use {
+  def accept(flow: String): WebSocket = WebSocket.Accepted(flow)
+}
+`);
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const out = edgesFrom('accept');
+        expect(out.filter((e) => e.lang === 'java')).toEqual([]);
+        expect(out).toContainEqual({ kind: 'instantiates', qn: 'WebSocket::Accepted', lang: 'scala' });
+      });
+
+      it('still resolves a Scala call to a real Java static method', async () => {
+        write('scala/app/Use.scala', `package app
+class Use {
+  def load(): Unit = { WebSocket.fromString("y") }
+}
+`);
+        cg = await CodeGraph.init(tempDir, { index: true });
+        expect(edgesFrom('load')).toContainEqual({ kind: 'calls', qn: 'com.acme.http::WebSocket::fromString', lang: 'java' });
+      });
+
+      it('resolves Outer.Inner(...) to a nested Scala object that defines apply', async () => {
+        // A Scala `object` is indexed as a `module`, not a class.
+        write('scala/app/WebSocket.scala', `package app
+object WebSocket {
+  object Accepted {
+    def apply(flow: String): String = flow
+  }
+}
+`);
+        write('scala/app/Use.scala', `package app
+class Use {
+  def accept(): Unit = { WebSocket.Accepted("f") }
+}
+`);
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const out = edgesFrom('accept');
+        expect(out.filter((e) => e.lang === 'java')).toEqual([]);
+        expect(out).toContainEqual({ kind: 'calls', qn: 'WebSocket::Accepted', lang: 'scala' });
+      });
+
+      it('prefers the case class over its companion object declared first', async () => {
+        write('scala/app/WebSocket.scala', `package app
+object WebSocket {
+  object Accepted {
+    def apply(): Accepted = Accepted("default")
+  }
+  final case class Accepted(flow: String)
+}
+`);
+        write('scala/app/Use.scala', `package app
+class Use {
+  def accept(): Unit = { WebSocket.Accepted("f") }
+}
+`);
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const out = edgesFrom('accept');
+        expect(out.filter((e) => e.lang === 'java')).toEqual([]);
+        expect(out).toContainEqual({ kind: 'instantiates', qn: 'WebSocket::Accepted', lang: 'scala' });
+        expect(out).not.toContainEqual({ kind: 'calls', qn: 'WebSocket::Accepted', lang: 'scala' });
+      });
+    });
   });
 
   describe('Scala companion object vs extends resolution', () => {
@@ -6732,5 +6860,81 @@ class UiModeManagerService {
       ).all() as Array<{ target: string }>;
       expect(rows).toEqual([]);
     });
+  });
+
+  describe('Name-only method match never binds a delegating call to its own caller', () => {
+    const selfLoops = (g: CodeGraph, file: string): string[] =>
+      g.getNodesInFile(file)
+        .filter((n) => n.kind === 'method' || n.kind === 'function')
+        .flatMap((n) => g.getOutgoingEdges(n.id)
+          .filter((e) => e.kind === 'calls' && e.target === n.id)
+          .map(() => n.name));
+
+    it('drops the self-loop for a Scala delegating wrapper', async () => {
+      fs.writeFileSync(path.join(tempDir, 'Form.scala'), `
+package play.api.data
+class WrappedMapping(wrapped: Mapping) {
+  def unbind(value: String): String = wrapped.unbind(value)
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+      expect(selfLoops(cg, 'Form.scala')).toEqual([]);
+    }, 30000);
+
+    it('drops the self-loop for a TypeScript wrapper handing its call to a parameter', async () => {
+      fs.writeFileSync(path.join(tempDir, 'wrapped.ts'), `
+export class WrappedMapping {
+  unbind(wrapped, value: string): string {
+    return wrapped.unbind(value);
+  }
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+      expect(selfLoops(cg, 'wrapped.ts')).toEqual([]);
+    }, 30000);
+
+    it('keeps real recursion through this./bare calls and a Go named receiver', async () => {
+      fs.writeFileSync(path.join(tempDir, 'Tree.java'), `
+public class Tree {
+  public int depth(int n) { return n == 0 ? 0 : this.depth(n - 1); }
+  public int size(int n) { return n == 0 ? 0 : size(n - 1); }
+}
+`);
+      fs.writeFileSync(path.join(tempDir, 'relay.go'), `
+package relay
+type relayClient struct{}
+func (r *relayClient) sendBatchAttempt(retry bool) error {
+	if retry {
+		return r.sendBatchAttempt(false)
+	}
+	return nil
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+      expect(selfLoops(cg, 'Tree.java').sort()).toEqual(['depth', 'size']);
+      expect(selfLoops(cg, 'relay.go')).toEqual(['sendBatchAttempt']);
+    }, 30000);
+
+    it('keeps Go recursion through a range variable over the type\'s own children', async () => {
+      // cobra's `sub.checkCommandGroups()` over `c.commands`, etcd's
+      // `child.Repr(…)`: the loop variable is untyped, and it is the caller's type.
+      fs.writeFileSync(path.join(tempDir, 'node.go'), `
+package tree
+type Node struct{ children []*Node }
+func (n *Node) Size() int {
+	total := 1
+	for _, child := range n.children {
+		total += child.Size()
+	}
+	return total
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+      expect(selfLoops(cg, 'node.go')).toEqual(['Size']);
+    }, 30000);
   });
 });
