@@ -79,6 +79,11 @@
           "run": "npm run build"
         },
         {
+          "name": "Use an unambiguous Windows test temp path",
+          "shell": "pwsh",
+          "run": "$testTemp = Join-Path $env:RUNNER_TEMP 'codegraph-tests'\nNew-Item -ItemType Directory -Force $testTemp | Out-Null\n\"TEMP=$testTemp\" >> $env:GITHUB_ENV\n\"TMP=$testTemp\" >> $env:GITHUB_ENV\nWrite-Output \"Test temporary directory: $testTemp\"\n"
+        },
+        {
           "name": "Windows path guards and MCP regressions",
           "shell": "bash",
           "env": {
