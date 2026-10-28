@@ -81,6 +81,8 @@ jobs:
           __tests__/same-file-match-confidence.test.ts
           __tests__/mcp-idle-release-order.test.ts
           __tests__/aosp-*.test.ts
+          __tests__/android-platform-language-coverage.test.ts
+          __tests__/sync-import-retry.test.ts
           __tests__/kotlin-object-literal.test.ts
           __tests__/extraction.test.ts
           __tests__/resolution.test.ts
