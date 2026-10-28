@@ -69,6 +69,8 @@ jobs:
         run: >-
           npx vitest run
           __tests__/kernel-*.test.ts
+          __tests__/enclosing-class-member-call.test.ts
+          __tests__/watcher.test.ts
           __tests__/sync-framework-detection.test.ts
           __tests__/frameworks-integration.test.ts
           __tests__/same-file-match-confidence.test.ts
