@@ -32,7 +32,7 @@
             "GH_TOKEN": "${{ github.token }}",
             "VALIDATION_STAGE": "${{ inputs.stage }}"
           },
-          "run": "python3 - <<'PY'\nimport json,os,urllib.request\ndef get(path):\n req=urllib.request.Request('https://api.github.com/repos/'+path,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN']})\n with urllib.request.urlopen(req,timeout=30) as f:return json.load(f)\nrows=get('mixxer/codegraph-aosp/git/matching-refs/heads')\nrefs={v['ref'].removeprefix('refs/heads/'):v['object']['sha'] for v in rows}\nexpected={'fix/java-kotlin-inheritance': 'e817803bb79fc461d19075758ba1e128529d3ba7', 'feat/android-platform-tools': 'def81a76163fb0fb469f7959e1b6c1af1c69228d', 'fix/mcp-project-cache-lifetime': 'a2e01c915470518c9d457f6de71095adfecfcd2d', 'docs/contributing-guide': '55f9761bd0f437351c11f65e65c949a84978cf05', 'fix/kotlin-imported-type-calls': '08c716f16b16ee0f55284264b8e0dacef4d018b3', 'fix/java-static-field-calls': 'a3e7dcdfa94eaad866d5c873be307eeb05b353ef'} if os.environ['VALIDATION_STAGE']=='published' else {'fix/java-kotlin-inheritance': '7afee836d8488b9533a18f3dcd11c9df708462a5', 'feat/android-platform-tools': '231f959da16f809244bfaafb5e1959162c7d7235', 'fix/mcp-project-cache-lifetime': 'af5e560ba2414df15fd231b753032dc46403713b', 'docs/contributing-guide': '691f067c012e7708f5241cfb8a74c2d2c4c9634c', 'fix/kotlin-imported-type-calls': '7d0faad04295c6d1dd93bc3cfd663340cbd86f9a', 'fix/java-static-field-calls': '261cc306d45b18ef6fc4788f949550401309993c'}\nprotected={'main': '0d7bf8b0cd91aff2d940c8e04a99385225308ce0', 'fix/android-platform-language-coverage': 'f7bc8ab31dc4e0b69955eeba046b9f61ecc7d0d4', 'fix/project-path-realpath': '4c8f64415f47228986dcac7e4ad2c7ca6e886797'}\nfor b,h in {**expected,**protected}.items(): assert refs.get(b)==h,(b,h,refs.get(b))\nassert get('colbymchenry/codegraph/branches/main')['commit']['sha']=='01e0ac3aa7419a7ab75583963e8a95359f3af1d3'\nassert get('colbymchenry/codegraph/pulls/2258')['head']['sha']=='77814af1278ff01c860a276e7262d4ffcdba7126'\nprint('Exact feature refs, protected downstream refs, current upstream and unchanged PR2258 confirmed.')\nPY"
+          "run": "python3 - <<'PY'\nimport json,os,urllib.request\ndef get(path):\n req=urllib.request.Request('https://api.github.com/repos/'+path,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN']})\n with urllib.request.urlopen(req,timeout=30) as f:return json.load(f)\nrows=get('mixxer/codegraph-aosp/git/matching-refs/heads')\nrefs={v['ref'].removeprefix('refs/heads/'):v['object']['sha'] for v in rows}\nexpected={'fix/java-kotlin-inheritance': 'e817803bb79fc461d19075758ba1e128529d3ba7', 'feat/android-platform-tools': '2031f201e6d2cf1afb92bee22e3fde200e9caa82', 'fix/mcp-project-cache-lifetime': 'a2e01c915470518c9d457f6de71095adfecfcd2d', 'docs/contributing-guide': '55f9761bd0f437351c11f65e65c949a84978cf05', 'fix/kotlin-imported-type-calls': '08c716f16b16ee0f55284264b8e0dacef4d018b3', 'fix/java-static-field-calls': 'a3e7dcdfa94eaad866d5c873be307eeb05b353ef'} if os.environ['VALIDATION_STAGE']=='published' else {'fix/java-kotlin-inheritance': '7afee836d8488b9533a18f3dcd11c9df708462a5', 'feat/android-platform-tools': '231f959da16f809244bfaafb5e1959162c7d7235', 'fix/mcp-project-cache-lifetime': 'af5e560ba2414df15fd231b753032dc46403713b', 'docs/contributing-guide': '691f067c012e7708f5241cfb8a74c2d2c4c9634c', 'fix/kotlin-imported-type-calls': '7d0faad04295c6d1dd93bc3cfd663340cbd86f9a', 'fix/java-static-field-calls': '261cc306d45b18ef6fc4788f949550401309993c'}\nprotected={'main': '0d7bf8b0cd91aff2d940c8e04a99385225308ce0', 'fix/android-platform-language-coverage': 'f7bc8ab31dc4e0b69955eeba046b9f61ecc7d0d4', 'fix/project-path-realpath': '4c8f64415f47228986dcac7e4ad2c7ca6e886797'}\nfor b,h in {**expected,**protected}.items(): assert refs.get(b)==h,(b,h,refs.get(b))\nassert get('colbymchenry/codegraph/branches/main')['commit']['sha']=='01e0ac3aa7419a7ab75583963e8a95359f3af1d3'\nassert get('colbymchenry/codegraph/pulls/2258')['head']['sha']=='77814af1278ff01c860a276e7262d4ffcdba7126'\nprint('Exact feature refs, protected downstream refs, current upstream and unchanged PR2258 confirmed.')\nPY"
         }
       ]
     },
@@ -45,88 +45,7 @@
         "fail-fast": false,
         "max-parallel": 8,
         "matrix": {
-          "include": [
-            {
-              "target": "baseline",
-              "sha": "01e0ac3aa7419a7ab75583963e8a95359f3af1d3",
-              "node": 22
-            },
-            {
-              "target": "baseline",
-              "sha": "01e0ac3aa7419a7ab75583963e8a95359f3af1d3",
-              "node": 24
-            },
-            {
-              "target": "1927",
-              "sha": "e817803bb79fc461d19075758ba1e128529d3ba7",
-              "node": 22
-            },
-            {
-              "target": "1927",
-              "sha": "e817803bb79fc461d19075758ba1e128529d3ba7",
-              "node": 24
-            },
-            {
-              "target": "1928",
-              "sha": "def81a76163fb0fb469f7959e1b6c1af1c69228d",
-              "node": 22
-            },
-            {
-              "target": "1928",
-              "sha": "def81a76163fb0fb469f7959e1b6c1af1c69228d",
-              "node": 24
-            },
-            {
-              "target": "1929",
-              "sha": "a2e01c915470518c9d457f6de71095adfecfcd2d",
-              "node": 22
-            },
-            {
-              "target": "1929",
-              "sha": "a2e01c915470518c9d457f6de71095adfecfcd2d",
-              "node": 24
-            },
-            {
-              "target": "1931",
-              "sha": "55f9761bd0f437351c11f65e65c949a84978cf05",
-              "node": 22
-            },
-            {
-              "target": "1931",
-              "sha": "55f9761bd0f437351c11f65e65c949a84978cf05",
-              "node": 24
-            },
-            {
-              "target": "1948",
-              "sha": "08c716f16b16ee0f55284264b8e0dacef4d018b3",
-              "node": 22
-            },
-            {
-              "target": "1948",
-              "sha": "08c716f16b16ee0f55284264b8e0dacef4d018b3",
-              "node": 24
-            },
-            {
-              "target": "1949",
-              "sha": "a3e7dcdfa94eaad866d5c873be307eeb05b353ef",
-              "node": 22
-            },
-            {
-              "target": "1949",
-              "sha": "a3e7dcdfa94eaad866d5c873be307eeb05b353ef",
-              "node": 24
-            },
-            {
-              "target": "compat1948-2258",
-              "sha": "d6300550c37d6984e0116e80b5572b5c22fa41e3",
-              "node": 22
-            },
-            {
-              "target": "compat1948-2258",
-              "sha": "d6300550c37d6984e0116e80b5572b5c22fa41e3",
-              "node": 24
-            }
-          ]
+          "include": "${{ fromJSON(inputs.stage == 'published' && '[{\"target\":\"baseline\",\"sha\":\"01e0ac3aa7419a7ab75583963e8a95359f3af1d3\",\"node\":22},{\"target\":\"baseline\",\"sha\":\"01e0ac3aa7419a7ab75583963e8a95359f3af1d3\",\"node\":24},{\"target\":\"1927\",\"sha\":\"e817803bb79fc461d19075758ba1e128529d3ba7\",\"node\":22},{\"target\":\"1927\",\"sha\":\"e817803bb79fc461d19075758ba1e128529d3ba7\",\"node\":24},{\"target\":\"1928\",\"sha\":\"2031f201e6d2cf1afb92bee22e3fde200e9caa82\",\"node\":22},{\"target\":\"1928\",\"sha\":\"2031f201e6d2cf1afb92bee22e3fde200e9caa82\",\"node\":24},{\"target\":\"1929\",\"sha\":\"a2e01c915470518c9d457f6de71095adfecfcd2d\",\"node\":22},{\"target\":\"1929\",\"sha\":\"a2e01c915470518c9d457f6de71095adfecfcd2d\",\"node\":24},{\"target\":\"1931\",\"sha\":\"55f9761bd0f437351c11f65e65c949a84978cf05\",\"node\":22},{\"target\":\"1931\",\"sha\":\"55f9761bd0f437351c11f65e65c949a84978cf05\",\"node\":24},{\"target\":\"1948\",\"sha\":\"08c716f16b16ee0f55284264b8e0dacef4d018b3\",\"node\":22},{\"target\":\"1948\",\"sha\":\"08c716f16b16ee0f55284264b8e0dacef4d018b3\",\"node\":24},{\"target\":\"1949\",\"sha\":\"a3e7dcdfa94eaad866d5c873be307eeb05b353ef\",\"node\":22},{\"target\":\"1949\",\"sha\":\"a3e7dcdfa94eaad866d5c873be307eeb05b353ef\",\"node\":24},{\"target\":\"compat1948-2258\",\"sha\":\"d6300550c37d6984e0116e80b5572b5c22fa41e3\",\"node\":22},{\"target\":\"compat1948-2258\",\"sha\":\"d6300550c37d6984e0116e80b5572b5c22fa41e3\",\"node\":24}]' || '[{\"target\":\"1928\",\"sha\":\"2031f201e6d2cf1afb92bee22e3fde200e9caa82\",\"node\":22},{\"target\":\"1928\",\"sha\":\"2031f201e6d2cf1afb92bee22e3fde200e9caa82\",\"node\":24}]') }}"
         }
       },
       "steps": [
@@ -170,8 +89,7 @@
           "if": "matrix.target == '1931'",
           "run": "node <<'JS'\nconst fs=require('fs'),p=require('path');for(const f of ['CONTRIBUTING.md','README.md','docs/README.md'])for(const m of fs.readFileSync(f,'utf8').matchAll(/\\]\\(([^)]+)\\)/g)){const u=m[1];if(u.includes('://')||u.startsWith('#')||u.startsWith('mailto:'))continue;if(!fs.existsSync(p.resolve(p.dirname(f),u.split(/[?#]/)[0])))throw Error(f+': '+u)}console.log('Documentation links resolve.');\nJS"
         }
-      ],
-      "if": "inputs.stage == 'published'"
+      ]
     },
     "windows": {
       "name": "${{ matrix.target }} Windows Node ${{ matrix.node }}",
@@ -182,38 +100,7 @@
         "fail-fast": false,
         "max-parallel": 4,
         "matrix": {
-          "include": [
-            {
-              "target": "baseline",
-              "sha": "01e0ac3aa7419a7ab75583963e8a95359f3af1d3",
-              "node": 22
-            },
-            {
-              "target": "baseline",
-              "sha": "01e0ac3aa7419a7ab75583963e8a95359f3af1d3",
-              "node": 24
-            },
-            {
-              "target": "1928",
-              "sha": "def81a76163fb0fb469f7959e1b6c1af1c69228d",
-              "node": 22
-            },
-            {
-              "target": "1928",
-              "sha": "def81a76163fb0fb469f7959e1b6c1af1c69228d",
-              "node": 24
-            },
-            {
-              "target": "1929",
-              "sha": "a2e01c915470518c9d457f6de71095adfecfcd2d",
-              "node": 22
-            },
-            {
-              "target": "1929",
-              "sha": "a2e01c915470518c9d457f6de71095adfecfcd2d",
-              "node": 24
-            }
-          ]
+          "include": "${{ fromJSON(inputs.stage == 'published' && '[{\"target\":\"baseline\",\"sha\":\"01e0ac3aa7419a7ab75583963e8a95359f3af1d3\",\"node\":22},{\"target\":\"baseline\",\"sha\":\"01e0ac3aa7419a7ab75583963e8a95359f3af1d3\",\"node\":24},{\"target\":\"1928\",\"sha\":\"2031f201e6d2cf1afb92bee22e3fde200e9caa82\",\"node\":22},{\"target\":\"1928\",\"sha\":\"2031f201e6d2cf1afb92bee22e3fde200e9caa82\",\"node\":24},{\"target\":\"1929\",\"sha\":\"a2e01c915470518c9d457f6de71095adfecfcd2d\",\"node\":22},{\"target\":\"1929\",\"sha\":\"a2e01c915470518c9d457f6de71095adfecfcd2d\",\"node\":24}]' || '[{\"target\":\"1928\",\"sha\":\"2031f201e6d2cf1afb92bee22e3fde200e9caa82\",\"node\":22},{\"target\":\"1928\",\"sha\":\"2031f201e6d2cf1afb92bee22e3fde200e9caa82\",\"node\":24}]') }}"
         }
       },
       "steps": [
@@ -283,7 +170,7 @@
             },
             {
               "target": "1928",
-              "sha": "def81a76163fb0fb469f7959e1b6c1af1c69228d"
+              "sha": "2031f201e6d2cf1afb92bee22e3fde200e9caa82"
             },
             {
               "target": "1929",
@@ -353,7 +240,7 @@
           "run": "python3 - <<'PY'\nimport glob,subprocess\npatterns=['kernel-*.test.ts', 'kotlin-*.test.ts', 'java-*.test.ts', 'aosp-*.test.ts', 'rust-*.test.ts', 'ruby-*.test.ts', 'go-*.test.ts', 'pascal-*.test.ts', 'frameworks-integration.test.ts', 'extraction.test.ts', 'resolution.test.ts', 'function-ref*.test.ts', 'generic-supertypes.test.ts', 'override-overload-pairing.test.ts', 'mcp-project-cache.test.ts', 'mcp-idle-release-order.test.ts', 'security.test.ts', 'mcp-tool-allowlist.test.ts', 'mcp-initialize.test.ts', 'mcp-roots.test.ts', 'watcher.test.ts', 'enclosing-class-member-call.test.ts', 'sync-framework-detection.test.ts', 'path-alias-overlap.test.ts']\nfiles=sorted({p for pat in patterns for p in glob.glob('__tests__/'+pat)})\nassert files\nsubprocess.run(['npx','vitest','run',*files,'--maxWorkers=2','--minWorkers=1'],check=True)\nPY"
         }
       ],
-      "if": "always() && needs.guard.result == 'success' && needs.windows.result == 'success' && ((inputs.stage == 'candidate' && needs.prior.result == 'success') || (inputs.stage == 'published' && needs.portable.result == 'success'))"
+      "if": "always() && needs.guard.result == 'success' && needs.portable.result == 'success' && needs.windows.result == 'success' && ((inputs.stage == 'candidate' && needs.prior.result == 'success') || (inputs.stage == 'published' && needs.prior.result == 'skipped'))"
     },
     "checks": {
       "name": "All external contribution validation complete",
@@ -376,12 +263,12 @@
             "NATIVE": "${{ needs.native.result }}",
             "STAGE": "${{ inputs.stage }}"
           },
-          "run": "test \"$GUARD\" = success\ntest \"$WINDOWS\" = success\ntest \"$NATIVE\" = success\nif test \"$STAGE\" = candidate; then\n  test \"$PRIOR\" = success\n  test \"$PORTABLE\" = skipped\nelse\n  test \"$PORTABLE\" = success\n  test \"$PRIOR\" = skipped\nfi"
+          "run": "test \"$GUARD\" = success\ntest \"$PORTABLE\" = success\ntest \"$WINDOWS\" = success\ntest \"$NATIVE\" = success\nif test \"$STAGE\" = candidate; then\n  test \"$PRIOR\" = success\nelse\n  test \"$PRIOR\" = skipped\nfi"
         }
       ]
     },
     "prior": {
-      "name": "Verify prior full portable results",
+      "name": "Verify unchanged exact-source prior results",
       "if": "inputs.stage == 'candidate'",
       "needs": "guard",
       "runs-on": "ubuntu-latest",
@@ -391,7 +278,7 @@
           "env": {
             "GH_TOKEN": "${{ github.token }}"
           },
-          "run": "python3 - <<'PY'\nimport json,os,time,urllib.request\nexpected={'baseline portable Node 22': '01e0ac3aa7419a7ab75583963e8a95359f3af1d3', 'baseline portable Node 24': '01e0ac3aa7419a7ab75583963e8a95359f3af1d3', '1927 portable Node 22': 'e817803bb79fc461d19075758ba1e128529d3ba7', '1927 portable Node 24': 'e817803bb79fc461d19075758ba1e128529d3ba7', '1928 portable Node 22': 'def81a76163fb0fb469f7959e1b6c1af1c69228d', '1928 portable Node 24': 'def81a76163fb0fb469f7959e1b6c1af1c69228d', '1929 portable Node 22': 'a2e01c915470518c9d457f6de71095adfecfcd2d', '1929 portable Node 24': 'a2e01c915470518c9d457f6de71095adfecfcd2d', '1931 portable Node 22': '55f9761bd0f437351c11f65e65c949a84978cf05', '1931 portable Node 24': '55f9761bd0f437351c11f65e65c949a84978cf05', '1948 portable Node 22': '08c716f16b16ee0f55284264b8e0dacef4d018b3', '1948 portable Node 24': '08c716f16b16ee0f55284264b8e0dacef4d018b3', '1949 portable Node 22': 'a3e7dcdfa94eaad866d5c873be307eeb05b353ef', '1949 portable Node 24': 'a3e7dcdfa94eaad866d5c873be307eeb05b353ef', 'compat1948-2258 portable Node 22': 'd6300550c37d6984e0116e80b5572b5c22fa41e3', 'compat1948-2258 portable Node 24': 'd6300550c37d6984e0116e80b5572b5c22fa41e3'}\ndef get(path):\n req=urllib.request.Request('https://api.github.com/repos/mixxer/codegraph-aosp/'+path,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN']})\n with urllib.request.urlopen(req,timeout=30) as f:return json.load(f)\nrun=get('actions/runs/40628202511')\nassert run['head_sha']=='c8dea6ccaa8593dee1685ea3f0aadd9a09413136'\nfor attempt in range(90):\n jobs={j['name']:j for j in get('actions/runs/40628202511/jobs?per_page=100')['jobs']}\n failed=[n for n in expected if n in jobs and jobs[n]['status']=='completed' and jobs[n]['conclusion']!='success']\n assert not failed,failed\n if all(n in jobs and jobs[n]['conclusion']=='success' for n in expected):break\n time.sleep(20)\nelse:raise RuntimeError('Prior exact-source full portable jobs still pending')\nfor name,sha in expected.items():\n j=jobs[name];steps={v['name']:v['conclusion'] for v in j['steps']}\n assert steps['Verify exact source commit']=='success' and steps['Full portable engine and viewer']=='success'\n if name.startswith('1931 '):assert steps['Documentation links']=='success'\n print('Reused successful exact-source full portable',name,sha,'job',j['id'])\nprint('All sixteen full portable validations confirmed; unrelated Windows launcher failures are not treated as test successes.')\nPY"
+          "run": "python3 - <<'PY'\nimport json,os,time,urllib.request\nexpectedPortable={'baseline portable Node 22': '01e0ac3aa7419a7ab75583963e8a95359f3af1d3', 'baseline portable Node 24': '01e0ac3aa7419a7ab75583963e8a95359f3af1d3', '1927 portable Node 22': 'e817803bb79fc461d19075758ba1e128529d3ba7', '1927 portable Node 24': 'e817803bb79fc461d19075758ba1e128529d3ba7', '1929 portable Node 22': 'a2e01c915470518c9d457f6de71095adfecfcd2d', '1929 portable Node 24': 'a2e01c915470518c9d457f6de71095adfecfcd2d', '1931 portable Node 22': '55f9761bd0f437351c11f65e65c949a84978cf05', '1931 portable Node 24': '55f9761bd0f437351c11f65e65c949a84978cf05', '1948 portable Node 22': '08c716f16b16ee0f55284264b8e0dacef4d018b3', '1948 portable Node 24': '08c716f16b16ee0f55284264b8e0dacef4d018b3', '1949 portable Node 22': 'a3e7dcdfa94eaad866d5c873be307eeb05b353ef', '1949 portable Node 24': 'a3e7dcdfa94eaad866d5c873be307eeb05b353ef', 'compat1948-2258 portable Node 22': 'd6300550c37d6984e0116e80b5572b5c22fa41e3', 'compat1948-2258 portable Node 24': 'd6300550c37d6984e0116e80b5572b5c22fa41e3'}\nexpectedWindows={'baseline Windows Node 22': '01e0ac3aa7419a7ab75583963e8a95359f3af1d3', 'baseline Windows Node 24': '01e0ac3aa7419a7ab75583963e8a95359f3af1d3', '1929 Windows Node 22': 'a2e01c915470518c9d457f6de71095adfecfcd2d', '1929 Windows Node 24': 'a2e01c915470518c9d457f6de71095adfecfcd2d'}\ndef get(path):\n req=urllib.request.Request('https://api.github.com/repos/mixxer/codegraph-aosp/'+path,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN']})\n with urllib.request.urlopen(req,timeout=30) as f:return json.load(f)\nfor runid,driver,expected,required in [\n (40628202511,'c8dea6ccaa8593dee1685ea3f0aadd9a09413136',expectedPortable,'Full portable engine and viewer'),\n (40629139483,'10168b0522e84a7af1c34026e8fa3628be5dd8f4',expectedWindows,'Windows path, watcher, MCP lifetime and Android regressions'),\n]:\n assert get('actions/runs/'+str(runid))['head_sha']==driver\n for attempt in range(90):\n  jobs={j['name']:j for j in get('actions/runs/'+str(runid)+'/jobs?per_page=100')['jobs']}\n  failed=[n for n in expected if n in jobs and jobs[n]['status']=='completed' and jobs[n]['conclusion']!='success']\n  assert not failed,failed\n  if all(n in jobs and jobs[n]['conclusion']=='success' for n in expected):break\n  time.sleep(20)\n else:raise RuntimeError('Prior exact-source jobs still pending')\n for name,sha in expected.items():\n  j=jobs[name];steps={v['name']:v['conclusion'] for v in j['steps']}\n  assert steps['Verify exact source commit']=='success' and steps[required]=='success'\n  if name.startswith('1931 '):assert steps['Documentation links']=='success'\n  print('Reused exact-source success',name,sha,'run',runid,'job',j['id'])\nprint('Fourteen unchanged full portable and four unchanged Windows checks confirmed; changed PR1928 is validated afresh.')\nPY"
         }
       ]
     }
