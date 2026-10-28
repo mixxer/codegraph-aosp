@@ -170,7 +170,8 @@
           "if": "matrix.target == '1931'",
           "run": "node <<'JS'\nconst fs=require('fs'),p=require('path');for(const f of ['CONTRIBUTING.md','README.md','docs/README.md'])for(const m of fs.readFileSync(f,'utf8').matchAll(/\\]\\(([^)]+)\\)/g)){const u=m[1];if(u.includes('://')||u.startsWith('#')||u.startsWith('mailto:'))continue;if(!fs.existsSync(p.resolve(p.dirname(f),u.split(/[?#]/)[0])))throw Error(f+': '+u)}console.log('Documentation links resolve.');\nJS"
         }
-      ]
+      ],
+      "if": "inputs.stage == 'published'"
     },
     "windows": {
       "name": "${{ matrix.target }} Windows Node ${{ matrix.node }}",
@@ -253,13 +254,15 @@
             "CODEGRAPH_KERNEL": "0",
             "VALIDATION_TARGET": "${{ matrix.target }}"
           },
-          "run": "python - <<'PY'\nimport glob,os,subprocess\npatterns=['security.test.ts','mcp-nested-repo-projectpath.test.ts','mcp-roots.test.ts','mcp-initialize.test.ts','mcp-project-cache.test.ts','mcp-idle-release-order.test.ts','worktree-detection.test.ts','watcher.test.ts','ui-server.test.ts','cli-ui-command.test.ts']\nif os.environ['VALIDATION_TARGET']=='1928': patterns+=['aosp-*.test.ts','mcp-tool-allowlist.test.ts']\nfiles=sorted({p for pat in patterns for p in glob.glob('__tests__/'+pat)})\nassert files\nsubprocess.run(['npx','vitest','run',*files,'--maxWorkers=2','--minWorkers=1'],check=True)\nPY"
+          "run": "python - <<'PY'\nimport glob,os,subprocess,shutil\npatterns=['security.test.ts','mcp-nested-repo-projectpath.test.ts','mcp-roots.test.ts','mcp-initialize.test.ts','mcp-project-cache.test.ts','mcp-idle-release-order.test.ts','worktree-detection.test.ts','watcher.test.ts','ui-server.test.ts','cli-ui-command.test.ts']\nif os.environ['VALIDATION_TARGET']=='1928': patterns+=['aosp-*.test.ts','mcp-tool-allowlist.test.ts']\nfiles=sorted({p for pat in patterns for p in glob.glob('__tests__/'+pat)})\nassert files\nnode=shutil.which('node'); assert node\ncli=os.path.abspath('node_modules/vitest/vitest.mjs'); assert os.path.isfile(cli)\nenv={**os.environ,'PATH':os.path.abspath('node_modules/.bin')+os.pathsep+os.environ['PATH']}\nsubprocess.run([node,cli,'run',*files,'--maxWorkers=2','--minWorkers=1'],env=env,check=True)\nPY"
         }
       ]
     },
     "native": {
       "name": "${{ matrix.target }} native kernel and language regressions",
       "needs": [
+        "guard",
+        "prior",
         "portable",
         "windows"
       ],
@@ -349,13 +352,15 @@
           },
           "run": "python3 - <<'PY'\nimport glob,subprocess\npatterns=['kernel-*.test.ts', 'kotlin-*.test.ts', 'java-*.test.ts', 'aosp-*.test.ts', 'rust-*.test.ts', 'ruby-*.test.ts', 'go-*.test.ts', 'pascal-*.test.ts', 'frameworks-integration.test.ts', 'extraction.test.ts', 'resolution.test.ts', 'function-ref*.test.ts', 'generic-supertypes.test.ts', 'override-overload-pairing.test.ts', 'mcp-project-cache.test.ts', 'mcp-idle-release-order.test.ts', 'security.test.ts', 'mcp-tool-allowlist.test.ts', 'mcp-initialize.test.ts', 'mcp-roots.test.ts', 'watcher.test.ts', 'enclosing-class-member-call.test.ts', 'sync-framework-detection.test.ts', 'path-alias-overlap.test.ts']\nfiles=sorted({p for pat in patterns for p in glob.glob('__tests__/'+pat)})\nassert files\nsubprocess.run(['npx','vitest','run',*files,'--maxWorkers=2','--minWorkers=1'],check=True)\nPY"
         }
-      ]
+      ],
+      "if": "always() && needs.guard.result == 'success' && needs.windows.result == 'success' && ((inputs.stage == 'candidate' && needs.prior.result == 'success') || (inputs.stage == 'published' && needs.portable.result == 'success'))"
     },
     "checks": {
       "name": "All external contribution validation complete",
       "if": "always()",
       "needs": [
         "guard",
+        "prior",
         "portable",
         "windows",
         "native"
@@ -365,11 +370,28 @@
         {
           "env": {
             "GUARD": "${{ needs.guard.result }}",
+            "PRIOR": "${{ needs.prior.result }}",
             "PORTABLE": "${{ needs.portable.result }}",
             "WINDOWS": "${{ needs.windows.result }}",
-            "NATIVE": "${{ needs.native.result }}"
+            "NATIVE": "${{ needs.native.result }}",
+            "STAGE": "${{ inputs.stage }}"
           },
-          "run": "test \"$GUARD\" = success\ntest \"$PORTABLE\" = success\ntest \"$WINDOWS\" = success\ntest \"$NATIVE\" = success"
+          "run": "test \"$GUARD\" = success\ntest \"$WINDOWS\" = success\ntest \"$NATIVE\" = success\nif test \"$STAGE\" = candidate; then\n  test \"$PRIOR\" = success\n  test \"$PORTABLE\" = skipped\nelse\n  test \"$PORTABLE\" = success\n  test \"$PRIOR\" = skipped\nfi"
+        }
+      ]
+    },
+    "prior": {
+      "name": "Verify prior full portable results",
+      "if": "inputs.stage == 'candidate'",
+      "needs": "guard",
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": 35,
+      "steps": [
+        {
+          "env": {
+            "GH_TOKEN": "${{ github.token }}"
+          },
+          "run": "python3 - <<'PY'\nimport json,os,time,urllib.request\nexpected={'baseline portable Node 22': '01e0ac3aa7419a7ab75583963e8a95359f3af1d3', 'baseline portable Node 24': '01e0ac3aa7419a7ab75583963e8a95359f3af1d3', '1927 portable Node 22': 'e817803bb79fc461d19075758ba1e128529d3ba7', '1927 portable Node 24': 'e817803bb79fc461d19075758ba1e128529d3ba7', '1928 portable Node 22': 'def81a76163fb0fb469f7959e1b6c1af1c69228d', '1928 portable Node 24': 'def81a76163fb0fb469f7959e1b6c1af1c69228d', '1929 portable Node 22': 'a2e01c915470518c9d457f6de71095adfecfcd2d', '1929 portable Node 24': 'a2e01c915470518c9d457f6de71095adfecfcd2d', '1931 portable Node 22': '55f9761bd0f437351c11f65e65c949a84978cf05', '1931 portable Node 24': '55f9761bd0f437351c11f65e65c949a84978cf05', '1948 portable Node 22': '08c716f16b16ee0f55284264b8e0dacef4d018b3', '1948 portable Node 24': '08c716f16b16ee0f55284264b8e0dacef4d018b3', '1949 portable Node 22': 'a3e7dcdfa94eaad866d5c873be307eeb05b353ef', '1949 portable Node 24': 'a3e7dcdfa94eaad866d5c873be307eeb05b353ef', 'compat1948-2258 portable Node 22': 'd6300550c37d6984e0116e80b5572b5c22fa41e3', 'compat1948-2258 portable Node 24': 'd6300550c37d6984e0116e80b5572b5c22fa41e3'}\ndef get(path):\n req=urllib.request.Request('https://api.github.com/repos/mixxer/codegraph-aosp/'+path,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN']})\n with urllib.request.urlopen(req,timeout=30) as f:return json.load(f)\nrun=get('actions/runs/40628202511')\nassert run['head_sha']=='c8dea6ccaa8593dee1685ea3f0aadd9a09413136'\nfor attempt in range(90):\n jobs={j['name']:j for j in get('actions/runs/40628202511/jobs?per_page=100')['jobs']}\n failed=[n for n in expected if n in jobs and jobs[n]['status']=='completed' and jobs[n]['conclusion']!='success']\n assert not failed,failed\n if all(n in jobs and jobs[n]['conclusion']=='success' for n in expected):break\n time.sleep(20)\nelse:raise RuntimeError('Prior exact-source full portable jobs still pending')\nfor name,sha in expected.items():\n j=jobs[name];steps={v['name']:v['conclusion'] for v in j['steps']}\n assert steps['Verify exact source commit']=='success' and steps['Full portable engine and viewer']=='success'\n if name.startswith('1931 '):assert steps['Documentation links']=='success'\n print('Reused successful exact-source full portable',name,sha,'job',j['id'])\nprint('All sixteen full portable validations confirmed; unrelated Windows launcher failures are not treated as test successes.')\nPY"
         }
       ]
     }
