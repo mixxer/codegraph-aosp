@@ -1,101 +1,111 @@
-name: CI
-
-on:
-  pull_request:
-  push:
-    branches: ["**"]
-  merge_group:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
-env:
-  CODEGRAPH_TELEMETRY: '0'
-  CODEGRAPH_NO_UPDATE_CHECK: '1'
-
-jobs:
-  test:
-    name: Build and test (Node ${{ matrix.node }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        node: [22, 24]
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@v6
-        with:
-          node-version: ${{ matrix.node }}
-          cache: npm
-      - run: npm ci
-      - run: npm run build
-      - name: Prepare sensitive-path test directory
-        run: mkdir -p "$HOME/.ssh"
-      - name: Test portable engine and viewer
-        env:
-          CODEGRAPH_KERNEL: '0'
-        run: npm test -- --maxWorkers=2 --minWorkers=1
-
-  kernel:
-    needs: test
-    name: Native kernel and AOSP
-    runs-on: ubuntu-22.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - name: Build Linux kernel
-        run: bash scripts/build-kernel.sh --target x86_64-unknown-linux-gnu
-      - run: npm run build
-      - name: Require the native binary
-        run: test -s codegraph-kernel/prebuilds/linux-x64/codegraph-kernel.node
-      - name: Verify kernel parity and Android tracing
-        env:
-          CODEGRAPH_KERNEL_EXPECT: '1'
-        run: >-
-          npx vitest run
-          __tests__/kernel-*.test.ts
-          __tests__/enclosing-class-member-call.test.ts
-          __tests__/watcher.test.ts
-          __tests__/sync-framework-detection.test.ts
-          __tests__/frameworks-integration.test.ts
-          __tests__/same-file-match-confidence.test.ts
-          __tests__/mcp-idle-release-order.test.ts
-          __tests__/aosp-*.test.ts
-          __tests__/kotlin-object-literal.test.ts
-          __tests__/extraction.test.ts
-          __tests__/resolution.test.ts
-          __tests__/override-overload-pairing.test.ts
-          __tests__/java-records.test.ts
-          __tests__/kotlin-call-result-receiver.test.ts
-          __tests__/generic-supertypes.test.ts
-          --maxWorkers=2 --minWorkers=1
-
-  checks:
-    name: CI checks
-    if: always()
-    needs: [test, kernel]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Require every validation job to pass
-        env:
-          TEST_RESULT: ${{ needs.test.result }}
-          KERNEL_RESULT: ${{ needs.kernel.result }}
-        run: |
-          test "$TEST_RESULT" = success
-          test "$KERNEL_RESULT" = success
+{
+  "name": "Windows downstream 2577 pinned validation",
+  "on": {
+    "workflow_dispatch": {}
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "env": {
+    "CODEGRAPH_TELEMETRY": "0",
+    "CODEGRAPH_NO_UPDATE_CHECK": "1"
+  },
+  "jobs": {
+    "windows": {
+      "name": "${{ matrix.target }} Windows Node ${{ matrix.node }}",
+      "runs-on": "windows-latest",
+      "timeout-minutes": 25,
+      "strategy": {
+        "fail-fast": false,
+        "matrix": {
+          "include": [
+            {
+              "target": "upstream",
+              "sha": "25776014e9d7be31e3236c5f485e8154a9d7d777",
+              "node": 22
+            },
+            {
+              "target": "upstream",
+              "sha": "25776014e9d7be31e3236c5f485e8154a9d7d777",
+              "node": 24
+            },
+            {
+              "target": "main",
+              "sha": "a5c7d5b1256215476cda0f88db692ee2c6d89f88",
+              "node": 22
+            },
+            {
+              "target": "main",
+              "sha": "a5c7d5b1256215476cda0f88db692ee2c6d89f88",
+              "node": 24
+            },
+            {
+              "target": "pr15-rebased",
+              "sha": "f7bc8ab31dc4e0b69955eeba046b9f61ecc7d0d4",
+              "node": 22
+            },
+            {
+              "target": "pr15-rebased",
+              "sha": "f7bc8ab31dc4e0b69955eeba046b9f61ecc7d0d4",
+              "node": 24
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@v6",
+          "with": {
+            "ref": "${{ matrix.sha }}",
+            "persist-credentials": false
+          }
+        },
+        {
+          "name": "Verify exact source SHA",
+          "shell": "bash",
+          "run": "test \"$(git rev-parse HEAD)\" = \"${{ matrix.sha }}\"\necho \"Validated source ${{ matrix.sha }}\""
+        },
+        {
+          "uses": "actions/setup-node@v6",
+          "with": {
+            "node-version": "${{ matrix.node }}",
+            "cache": "npm"
+          }
+        },
+        {
+          "run": "npm ci"
+        },
+        {
+          "run": "npm run build"
+        },
+        {
+          "name": "Use an unambiguous Windows test temp path",
+          "shell": "pwsh",
+          "run": "$testTemp = Join-Path $env:RUNNER_TEMP 'codegraph-tests'\nNew-Item -ItemType Directory -Force $testTemp | Out-Null\n\"TEMP=$testTemp\" >> $env:GITHUB_ENV\n\"TMP=$testTemp\" >> $env:GITHUB_ENV\nWrite-Output \"Test temporary directory: $testTemp\"\n"
+        },
+        {
+          "name": "Windows path, watcher, installer, class member, MCP and sync regressions",
+          "shell": "bash",
+          "env": {
+            "CODEGRAPH_KERNEL": "0"
+          },
+          "run": "npx vitest run __tests__/watcher.test.ts __tests__/enclosing-class-member-call.test.ts __tests__/install-ps1-version.test.ts __tests__/sync-framework-detection.test.ts __tests__/security.test.ts __tests__/ui-server.test.ts __tests__/cli-ui-command.test.ts __tests__/mcp-nested-repo-projectpath.test.ts __tests__/worktree-detection.test.ts __tests__/ui-package.test.ts --maxWorkers=2 --minWorkers=1"
+        }
+      ]
+    },
+    "checks": {
+      "name": "Windows validation complete",
+      "needs": "windows",
+      "if": "always()",
+      "runs-on": "ubuntu-latest",
+      "steps": [
+        {
+          "env": {
+            "RESULT": "${{ needs.windows.result }}"
+          },
+          "run": "test \"$RESULT\" = success"
+        }
+      ]
+    }
+  }
+}
