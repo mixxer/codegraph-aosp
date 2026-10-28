@@ -69,6 +69,11 @@ jobs:
         run: >-
           npx vitest run
           __tests__/kernel-*.test.ts
+          __tests__/go-chained-receivers.test.ts
+          __tests__/go-receiver-type.test.ts
+          __tests__/go-std-method-receivers.test.ts
+          __tests__/mpeg-ts-not-typescript.test.ts
+          __tests__/rust-module-path-call.test.ts
           __tests__/enclosing-class-member-call.test.ts
           __tests__/watcher.test.ts
           __tests__/sync-framework-detection.test.ts
