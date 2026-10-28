@@ -456,11 +456,11 @@ const LITERAL_RECEIVER_TYPES = new Set([
   'dictionary', 'dict_literal', 'object', 'tuple', 'set',
 ]);
 
+/** A Kotlin receiver chain the resolver can type: `a.b`, `this.a`, up to four segments. */
+const KOTLIN_RECEIVER_CHAIN = /^(?:this|[A-Za-z_]\w*)(?:\.[A-Za-z_]\w*){1,3}$/;
 /**
  * Languages whose member calls go through the TS/JS grammars.
  */
-/** A Kotlin receiver chain the resolver can type: `a.b`, `this.a`, up to four segments. */
-const KOTLIN_RECEIVER_CHAIN = /^(?:this|[A-Za-z_]\w*)(?:\.[A-Za-z_]\w*){1,3}$/;
 const TS_JS_CHAIN_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx']);
 
 /** Languages whose `class` node is a class expression (#2499). */

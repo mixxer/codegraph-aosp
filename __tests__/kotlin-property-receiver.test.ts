@@ -234,7 +234,7 @@ class Wiring {
     }
 }
 `);
-    cg = CodeGraph.initSync(dir);
+    cg = CodeGraph.initSync(dir, { config: { include: ['**/*.kt'], exclude: [] } });
     await cg.indexAll();
   });
 

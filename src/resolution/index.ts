@@ -1560,6 +1560,12 @@ export class ReferenceResolver {
     const themeFile = matchShopifyThemeFile(ref, this.context);
     if (themeFile !== undefined) return themeFile;
 
+    // A TS/JS `super.run(…)` runs the method of the class's parent or a
+    // nearer ancestor, or one outside the project: never a method found by
+    // its name alone (see ./js-super-calls).
+    const superCall = matchJsSuperCall(ref, this.context);
+    if (superCall !== undefined) return superCall;
+
     // A Kotlin call through a receiver chain (`engine.pump.drain()`) resolves
     // on the chain's declared type, or gets no edge when that type is a
     // library one. An untyped chain resolves as the bare method name, the ref
@@ -1572,11 +1578,6 @@ export class ReferenceResolver {
       }
       if (chain !== undefined) return this.gateLanguage(chain, ref);
     }
-    // A TS/JS `super.run(…)` runs the method of the class's parent or a
-    // nearer ancestor, or one outside the project: never a method found by
-    // its name alone (see ./js-super-calls).
-    const superCall = matchJsSuperCall(ref, this.context);
-    if (superCall !== undefined) return superCall;
 
     // Skip built-in/external references — except a python call of a
     // builtin-named method through a local or a parameter its def types as a

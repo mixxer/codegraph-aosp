@@ -69,6 +69,7 @@ jobs:
         run: >-
           npx vitest run
           __tests__/kernel-*.test.ts
+          __tests__/kotlin-property-receiver.test.ts
           __tests__/path-alias-overlap.test.ts
           __tests__/java-receiver-type.test.ts
           __tests__/go-chained-receivers.test.ts
