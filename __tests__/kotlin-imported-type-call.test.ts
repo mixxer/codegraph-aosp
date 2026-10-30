@@ -5,6 +5,39 @@ import * as path from 'path';
 import CodeGraph from '../src/index';
 
 describe('Kotlin calls through explicit imports', () => {
+  it('retains an aliased library extension without accepting the same alias for another type', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-kotlin-import-alias-'));
+    let cg: CodeGraph | undefined;
+    try {
+      for (const [file, source] of Object.entries({
+        'p/Foreign.kt': `package p
+import javax.lang.model.element.Modifier as LayoutModifier
+import androidx.compose.ui.Modifier as UnusedCompose
+fun LayoutModifier.keyword() {}`,
+        'q/Calls.kt': `package q
+import androidx.compose.ui.Modifier as LayoutModifier
+import p.keyword
+fun LayoutModifier.pad() {}
+fun caller() {
+    LayoutModifier.pad()
+    LayoutModifier.keyword()
+}`,
+      })) {
+        const target = path.join(dir, file);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, source);
+      }
+      cg = CodeGraph.initSync(dir);
+      await cg.indexAll();
+      const caller = cg.searchNodes('caller').map(r => r.node).find(n => n.name === 'caller')!;
+      expect(cg.getCallees(caller.id).filter(c => c.edge.kind === 'calls').map(c => c.node.qualifiedName))
+        .toEqual(['LayoutModifier::pad']);
+    } finally {
+      cg?.destroy();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('uses the imported type, while retaining values, extensions and nested constructors', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-kotlin-import-'));
     let cg: CodeGraph | undefined;

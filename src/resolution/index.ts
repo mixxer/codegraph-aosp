@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustPathCallReachable, rustChainedCallByName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -1571,6 +1571,14 @@ export class ReferenceResolver {
     // library one. An untyped chain resolves as the bare method name, the ref
     // the extractor emitted before it kept the chain.
     if (ref.language === 'kotlin' && ref.referenceKind === 'calls') {
+      // A chain rooted at an imported declaration, `JUtil.Nested.deep()` after
+      // `import p.JUtil`, walks that declaration's nested types whichever JVM
+      // language declares them; a chain through its properties is typed below.
+      const root = ref.referenceName.slice(0, ref.referenceName.indexOf('.'));
+      if (root && this.context.getImportMappings(ref.filePath, ref.language).some((m) => m.localName === root)) {
+        const viaImport = this.gateLanguage(resolveViaImport(ref, this.context), ref);
+        if (viaImport) return viaImport;
+      }
       const chain = matchKotlinReceiverChain(ref, this.context);
       if (chain && 'method' in chain) {
         const bare = this.resolveOneInner({ ...ref, referenceName: chain.method });
@@ -1645,6 +1653,14 @@ export class ReferenceResolver {
     // namesake by its last name.
     const rubyPath = matchRubyConstantPathRef(ref, this.context);
     if (rubyPath !== undefined) return this.gateLanguage(rubyPath, ref);
+
+    // A bare Rust name a `use` renames (`use crate::util::take as consume;
+    // consume()`) is the item its path names, which no declaration carries by
+    // that name — the pre-filter below would drop it — and a call to a name a
+    // local binds where it is written (a parameter, a `let`, a closure's) is
+    // to that local, whatever the file imports (see matchRustUseBoundName).
+    const rustBound = matchRustUseBoundName(ref, this.context);
+    if (rustBound !== undefined) return this.gateLanguage(rustBound, ref);
 
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is

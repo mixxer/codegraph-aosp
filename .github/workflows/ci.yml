@@ -63,6 +63,11 @@ jobs:
       - run: npm run build
       - name: Require the native binary
         run: test -s codegraph-kernel/prebuilds/linux-x64/codegraph-kernel.node
+      - name: Verify native language contract
+        env:
+          CODEGRAPH_KERNEL_EXPECT: '1'
+        run: >-
+          node -e "const a=require('node:assert/strict');const l=require('./dist/extraction/kernel/loader.js');const k=l.getKernel();a(k);const c=k.contractInfo();a.equal(c.languages.length,20);for(const v of c.languages)a(l.kernelSupports(v));a(!l.kernelSupports('objc'));console.log(JSON.stringify(c))"
       - name: Verify kernel parity and Android tracing
         env:
           CODEGRAPH_KERNEL_EXPECT: '1'
@@ -91,6 +96,25 @@ jobs:
           __tests__/java-records.test.ts
           __tests__/kotlin-call-result-receiver.test.ts
           __tests__/generic-supertypes.test.ts
+          __tests__/kotlin-imported-type-call.test.ts
+          __tests__/kotlin-extension-on-imported-type.test.ts
+          __tests__/jvm-cross-language-imports.test.ts
+          __tests__/cross-file-visibility.test.ts
+          __tests__/rust-use-*.test.ts
+          __tests__/rust-crate-roots.test.ts
+          __tests__/browser-host-globals.test.ts
+          __tests__/commonjs-exports.test.ts
+          __tests__/spring-route-handlers.test.ts
+          __tests__/frameworks.test.ts
+          __tests__/component-same-folder.test.ts
+          __tests__/segment-vocab.test.ts
+          __tests__/search-field-filters.test.ts
+          __tests__/qualified-lookup-boundary.test.ts
+          __tests__/dotdot-folder-names.test.ts
+          __tests__/cli-affected-filter-globs.test.ts
+          __tests__/security.test.ts
+          __tests__/mcp-nested-repo-projectpath.test.ts
+          __tests__/mcp-project-cache.test.ts
           --maxWorkers=2 --minWorkers=1
 
   checks:
