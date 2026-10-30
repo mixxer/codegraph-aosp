@@ -26,8 +26,9 @@ import { EARLY_PPID } from './early-ppid';
 import { supervisionLostReason } from './ppid-watchdog';
 import { armStartupHandshakeTimeout } from './startup-handshake';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
+import { treatStdoutFailureAsShutdown } from './stdout-teardown';
 import { CodeGraphPackageVersion, isOlderRelease } from './version';
-import { SERVER_INFO, PROTOCOL_VERSION, initializeInstructions, enabledAospAddendum } from './session';
+import { SERVER_INFO, PROTOCOL_VERSION, initializeInstructions, enabledAospAddendum, toolCallArguments, TOOL_ARGUMENTS_NOT_OBJECT } from './session';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
 import { getStaticTools } from './tools';
 import { ErrorCodes } from './transport';
@@ -360,10 +361,15 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
     let msg: JsonRpc; try { msg = JSON.parse(line) as JsonRpc; } catch { return; }
     const id = msg.id;
     if (msg.method === 'tools/call' && id !== undefined) {
+      const params = (msg.params || {}) as { name: string; arguments?: unknown };
+      const args = toolCallArguments(params);
+      if (!args) {
+        writeClient({ jsonrpc: '2.0', id, error: { code: ErrorCodes.InvalidParams, message: TOOL_ARGUMENTS_NOT_OBJECT } });
+        return;
+      }
       try {
         const local = await ensureEngine();
-        const params = (msg.params || {}) as { name: string; arguments?: Record<string, unknown> };
-        const result = await local.getToolHandler().execute(params.name, params.arguments || {}, exploreSession);
+        const result = await local.getToolHandler().execute(params.name, args, exploreSession);
         writeClient({ jsonrpc: '2.0', id, result });
         getTelemetry().recordUsage('mcp_tool', params.name, !result.isError, telemetryClient);
       } catch (err) {
@@ -443,6 +449,10 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   // instead of a clean close; destroying the stream stops a hung fd from
   // busy-spinning the event loop (#799).
   treatStdinFailureAsShutdown(shutdown);
+  // A host can also stop reading our output while it keeps stdin open and
+  // stays alive: shut down the same way, which closes only this session's
+  // daemon connection and stops its own engines (#2991).
+  treatStdoutFailureAsShutdown(shutdown);
   startPpidWatchdogNoSocket(shutdown);
   // Backstop for a launch abandoned before any of the above can see it: killed
   // launcher + held-open pipes + reparent that beat the EARLY_PPID capture

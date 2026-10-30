@@ -12,7 +12,7 @@ import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport 
 import { applyAliases, aliasAndBaseUrlCandidates } from './path-aliases';
 import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport, workspaceImportTargets, type WorkspaceImportTargets } from './workspace-packages';
-import { stripCommentsForRegex } from './strip-comments';
+import { stripCommentsForRegex, templateLiteralTextAt } from './strip-comments';
 import { makeLineAt } from './synth-utils';
 import { dartDirectiveFile } from './dart-libraries';
 import { ambientModuleDeclares, findAmbientModuleExport, findAmbientModuleFile, inBlock, isInModuleBlock, namespaceBlocks, type NamespaceBlock } from './ambient-modules';
@@ -30,7 +30,10 @@ import {
   tsImportedTypeFile,
   reExportSource,
   pythonFunctionModuleAlias,
+  pythonReceiverBinding,
+  pythonModuleImportKeys,
   isPythonFromImportModule,
+  isPythonNameFromOutside,
   tsGlobalScope,
   rustPathTarget,
   isRustNameFromStd,
@@ -130,6 +133,14 @@ interface FileExportIndex {
    * `byName`. `undefined` until first read through {@link exportedByName}.
    */
   clauseAliases?: Map<string, Node>;
+  /**
+   * Exported members of something else in the file (`export const d = { f()
+   * {} }` → `d::f`) by name: no import's first answer, only its last, after
+   * the file's own bindings, export clause and re-exports (#2945). That last
+   * answer is what reaches `d.f` through `export const { f } = d`, whose
+   * binding has no node of its own.
+   */
+  members: Map<string, Node>;
 }
 
 const DEFAULT_BINDING_KINDS = new Set<string>(['function', 'class', 'component', 'constant', 'variable']);
@@ -205,8 +216,12 @@ function readDefaultExport(code: string, at: number): { name: string; nameAt: nu
  * template whose `${…}` holds another template, or a regex with a backtick,
  * sets a masker out of step, and it blanked the real statement after it
  * (outline's 2,900-line styled-components `Styles.ts`). A statement must
- * name a node of the file instead — one a template only writes as text
- * names none — and of several statements, one that does wins.
+ * name a node of the file instead, and of several statements, one that does
+ * wins. A line of a template's text is no statement either, though it can
+ * name one: a code generator's `export default App` names the file's own
+ * `App` (#2968). So a head inside template text is skipped, when a scan that
+ * follows `${…}` nesting and regex literals closes every template; one that
+ * doesn't vouches for nothing, and every head counts.
  */
 function statedDefaultExport(filePath: string, idx: FileExportIndex, context: ResolutionContext): StatedDefault {
   if (idx.statedDefault !== undefined) return idx.statedDefault;
@@ -215,8 +230,10 @@ function statedDefaultExport(filePath: string, idx: FileExportIndex, context: Re
   if (source && /\bexport\s+default\b/.test(source)) {
     const code = stripCommentsForRegex(source, 'typescript');
     const lineAt = makeLineAt(code, 1);
+    const inTemplateText = templateLiteralTextAt(source);
     EXPORT_DEFAULT_HEAD.lastIndex = 0;
     for (let m = EXPORT_DEFAULT_HEAD.exec(code); m !== null; m = EXPORT_DEFAULT_HEAD.exec(code)) {
+      if (inTemplateText?.(m.index)) continue;
       const value = readDefaultExport(code, m.index + m[0].length);
       if (value === 'anonymous') {
         stated ??= 'anonymous';
@@ -231,9 +248,9 @@ function statedDefaultExport(filePath: string, idx: FileExportIndex, context: Re
       const to = lineAt(value.nameAt);
       const node = value.declared
         ? named.find((n) => DEFAULT_DECLARATION_KINDS.has(n.kind) && n.startLine >= from && n.startLine <= to)
-        : named
+        : moduleBindingsFirst(filePath, named
             .filter((n) => DEFAULT_BINDING_KINDS.has(n.kind))
-            .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0];
+            .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn))[0];
       if (node) {
         stated = node;
         break;
@@ -271,14 +288,19 @@ function getFileExportIndex(filePath: string, context: ResolutionContext): FileE
   }
   let idx = perFile.get(filePath);
   if (!idx) {
-    idx = { byName: new Map(), defaultComponent: undefined, defaultFnClass: undefined };
+    idx = { byName: new Map(), defaultComponent: undefined, defaultFnClass: undefined, members: new Map() };
     // Python has no export keyword: every module-level def is importable, and
     // the extractor never flags one isExported. Without this a Python named
     // import could only ever resolve through the bare-name matcher.
     const exported = PYTHON_MODULE_FILE.test(filePath)
       ? context.getNodesInFile(filePath).filter((n) => n.isExported || isPythonModuleLevelDef(n))
       : context.getExportedNodesInFile?.(filePath) ?? context.getNodesInFile(filePath).filter((n) => n.isExported);
+    const jsFamily = JS_FAMILY_FILE.test(filePath);
     for (const n of exported) {
+      if (jsFamily && n.qualifiedName !== n.name) {
+        if (!idx.members.has(n.name)) idx.members.set(n.name, n);
+        continue;
+      }
       if (!idx.byName.has(n.name)) idx.byName.set(n.name, n);
       if (idx.defaultComponent === undefined && n.kind === 'component') idx.defaultComponent = n;
       if (idx.defaultFnClass === undefined && (n.kind === 'function' || n.kind === 'class')) idx.defaultFnClass = n;
@@ -286,6 +308,19 @@ function getFileExportIndex(filePath: string, context: ResolutionContext): FileE
     perFile.set(filePath, idx);
   }
   return idx;
+}
+
+/**
+ * `nodes` with the members of something else in their JS/TS file (an
+ * object's method `d::f`) moved behind the module's own bindings. Extraction
+ * marks such a member exported, so it can share a name with what an import,
+ * export clause or default export means (#2945); it stays the last answer
+ * because `const { f } = d` gives the binding `f` no node but `d::f`.
+ */
+function moduleBindingsFirst(filePath: string, nodes: Node[]): Node[] {
+  if (!JS_FAMILY_FILE.test(filePath)) return nodes;
+  const own = nodes.filter((n) => n.qualifiedName === n.name);
+  return own.length === nodes.length ? nodes : [...own, ...nodes.filter((n) => n.qualifiedName !== n.name)];
 }
 
 /** The file's nodes named `name`, in `getNodesInFile` order. */
@@ -329,13 +364,14 @@ function exportedByName(filePath: string, idx: FileExportIndex, name: string, co
     // Bind names introduced by a local export clause to their declarations, so
     // an importer asking for the renamed name gets the real symbol instead of
     // falling through to the name-matcher (which cannot cross the rename).
-    // The declaration is the file's first node of that name, exported or not.
+    // The declaration is the file's first node of that name, exported or not,
+    // a member of something else in it only when nothing else has the name.
     idx.clauseAliases = new Map();
     const content = context.readFile(filePath);
     if (content && content.includes('export')) {
       for (const { exportedName, localName } of extractLocalExportAliases(content)) {
         if (idx.byName.has(exportedName) || idx.clauseAliases.has(exportedName)) continue;
-        const decl = nodesInFileNamed(filePath, localName, context)[0];
+        const decl = moduleBindingsFirst(filePath, nodesInFileNamed(filePath, localName, context))[0];
         if (decl) idx.clauseAliases.set(exportedName, decl);
       }
     }
@@ -3127,7 +3163,7 @@ export function resolveViaImport(
   }
 
   // Use cached import mappings (avoids re-reading and re-parsing per ref)
-  const imports = context.getImportMappings(ref.filePath, ref.language);
+  let imports = context.getImportMappings(ref.filePath, ref.language);
   if (imports.length === 0 && !context.readFile(ref.filePath)) {
     return null;
   }
@@ -3157,6 +3193,9 @@ export function resolveViaImport(
   // submodule (a file), not a symbol, so the generic symbol lookup below would
   // search the *package* for `certs` instead of looking inside the module.
   if (ref.language === 'python') {
+    // Only the imports the receiver means where it is read: none of the file's
+    // when the function binds the name itself (see pythonImportsInScope).
+    imports = pythonImportsInScope(ref, imports, context);
     const pyResult = resolvePythonModuleMember(ref, imports, context);
     if (pyResult) return pyResult;
     // Absolute dotted module import: `import conduit.apps.articles.signals`
@@ -3371,6 +3410,53 @@ export function reachesAmbientModule(ref: UnresolvedRef, specifier: string, decl
     return leadsTo(binding.source, (file) => context.getImportMappings(file, ref.language).some((m) => m.source === specifier));
   }
   return LAST_NAME_KINDS.has(ref.referenceKind) && mappings.some((m) => leadsTo(m.source, () => false));
+}
+
+/**
+ * The file's import mappings as a Python dotted reference reads them. Its
+ * receiver is the module the file imports under that name only where nothing
+ * nearer binds the name: a parameter, a local, a `with … as` / `except … as` /
+ * loop target, a `case` capture, or a lambda or comprehension variable around
+ * the reference is that value instead, and none of the receiver's mappings
+ * applies there (`def by_param(other): other.update(…)` linked to the module
+ * imported as `other`). A function-local import of the name leaves only the
+ * mappings binding it the same way: the file's mappings read from-imports at
+ * any depth, so a local `from x import y as name` is listed beside the
+ * module-level import, and a local `import pkg.sub` binds the `pkg` that a
+ * module-level `import pkg` does. Other references and receivers keep every
+ * mapping.
+ */
+export function pythonImportsInScope(ref: UnresolvedRef, imports: ImportMapping[], context: ResolutionContext): ImportMapping[] {
+  if (ref.language !== 'python' || ref.referenceKind === 'imports') return imports;
+  const dot = ref.referenceName.indexOf('.');
+  if (dot <= 0) return imports;
+  const receiver = ref.referenceName.slice(0, dot);
+  // `import pkg.mod` binds `pkg`, under a mapping named after `mod`.
+  const binds = (m: ImportMapping): boolean => m.localName === receiver ||
+    (m.isNamespace && m.source.split('.')[0] === receiver && m.localName === m.source.split('.').pop());
+  if (!imports.some(binds)) return imports;
+  const binding = pythonReceiverBinding(receiver, ref, context);
+  if (binding === 'module') {
+    // Where nothing nearer binds the name, the module's own import of it
+    // does — not a from-import written inside some other function, which the
+    // mappings list too (first, ahead of the module's `import pkg.other as
+    // other`). Asked only when the receiver's mappings disagree; with no
+    // module-level one found, every mapping stays as it was.
+    const keyOf = (m: ImportMapping): string => (m.isNamespace ? `${m.source}:*` : `${m.source}:${m.exportedName}`);
+    if (new Set(imports.filter(binds).map(keyOf)).size < 2) return imports;
+    const moduleLevel = pythonModuleImportKeys(receiver, ref.filePath, context);
+    const kept = imports.filter((m) => !binds(m) || m.isNamespace || moduleLevel.has(keyOf(m)));
+    return kept.some(binds) ? kept : imports;
+  }
+  return imports.filter((m) => {
+    if (!binds(m)) return true;
+    if (binding === 'local') return false;
+    // The module a namespace mapping binds the receiver to: `import x as
+    // receiver` / `import receiver` bind its source, `import receiver.sub`
+    // the top-level `receiver`.
+    if ('module' in binding) return m.isNamespace && (m.localName === receiver ? m.source : receiver) === binding.module;
+    return !m.isNamespace && m.source === binding.source && m.exportedName === binding.exportedName;
+  });
 }
 
 /**
@@ -4023,9 +4109,9 @@ function findExportedSymbolWalk(
       const next = resolveImportPath(commonJs.source, filePath, language, context);
       if (next) return findExportedSymbol(next, want, language, context, visited, depth + 1);
     } else if (commonJs?.name) {
-      const bound = nodesInFileNamed(filePath, commonJs.name, context)
+      const bound = moduleBindingsFirst(filePath, nodesInFileNamed(filePath, commonJs.name, context)
         .filter((n) => DEFAULT_BINDING_KINDS.has(n.kind))
-        .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0];
+        .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn))[0];
       if (bound) return bound;
     }
   } else if (want.isNamespace && want.memberName) {
@@ -4054,7 +4140,7 @@ function findExportedSymbolWalk(
 
   // 2. Re-export hit: the file forwards the symbol to another module.
   const reExports = context.getReExports?.(filePath, language) ?? [];
-  if (reExports.length === 0) return undefined;
+  if (reExports.length === 0) return exportedMember(exportIndex, want);
 
   // Look for explicit `export { want } from './other'` (with optional rename) — for
   // `ns.member` through `import * as ns`, the member is the name wanted.
@@ -4109,7 +4195,17 @@ function findExportedSymbolWalk(
     }
   }
 
-  return undefined;
+  return exportedMember(exportIndex, want);
+}
+
+/**
+ * The last answer for a named import: a member of something in the file, as
+ * `export const { f } = d` exports `d::f`, once nothing the file declares or
+ * forwards is the name (#2945).
+ */
+function exportedMember(idx: FileExportIndex, want: { isDefault: boolean; isNamespace: boolean; exportedName: string; memberName: string | null }): Node | undefined {
+  const name = want.isDefault ? null : want.isNamespace ? want.memberName : want.exportedName;
+  return name ? idx.members.get(name) : undefined;
 }
 
 /** Node kinds that own static members reachable as `Container.member`. */
@@ -4217,7 +4313,7 @@ function resolveStaticMember(
  * instead of removing it, so locality has to be checked too.
  *
  * Answers only when it can be CERTAIN, because a false "yes" deletes a real
- * edge. Two languages qualify, each with an oracle that cannot be wrong:
+ * edge. Three languages qualify, each with an oracle of its own:
  *
  *  - **Rust** — the `use` path is rooted at a standard-library crate
  *    (`std`/`core`/`alloc`/`proc_macro`), which by definition ships outside
@@ -4230,14 +4326,19 @@ function resolveStaticMember(
  *    path aliases and monorepo workspace packages, unless the specifier still
  *    names a project file through the importing app's `baseUrl` or catch-all
  *    `paths` (`import Base from 'components/Base'`).
+ *  - **Python** — `resolveImportPath`, which searches for a module the way
+ *    Python does (see {@link isPythonNameFromOutside}).
  *
- * Everything else returns false and resolves exactly as before. JVM and Python
- * imports notably do NOT go through `resolveImportPath` (they have dedicated
- * FQN/module matchers), so there is no trustworthy oracle to consult here.
+ * Everything else returns false and resolves exactly as before. JVM imports
+ * notably do NOT go through `resolveImportPath` (they have dedicated FQN
+ * matchers), so there is no trustworthy oracle to consult here.
+ *
+ * `target` is what a strategy found, when the caller has it.
  */
 export function isBoundToOutOfRepoImport(
   ref: UnresolvedRef,
-  context: ResolutionContext
+  context: ResolutionContext,
+  target?: Node | null
 ): boolean {
   const name = ref.referenceName;
   if (name.includes('::') || name.includes('.')) return false; // qualified refs resolve by path
@@ -4245,6 +4346,7 @@ export function isBoundToOutOfRepoImport(
   // (A 2015-edition crate-relative path can shadow a stdlib root with a local
   // module of the same name: a `use core::…` with a `mod core;` is the crate's.)
   if (ref.language === 'rust') return isRustNameFromStd(ref, context);
+  if (ref.language === 'python') return isPythonNameFromOutside(name, ref.filePath, target, context);
 
   if (!ESM_IMPORT_LANGUAGES.has(ref.language)) return false;
   for (const imp of context.getImportMappings(ref.filePath, ref.language)) {

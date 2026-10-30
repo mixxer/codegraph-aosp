@@ -1,29 +1,27 @@
 # Documentation
 
-For installation, CLI commands, and MCP configuration, start with the
-[project README](../README.md). To build and submit a change, see
-[Contributing](../CONTRIBUTING.md).
+To install and use CodeGraph, start with the [project README](../README.md). To build it and send a change, see [Contributing](../CONTRIBUTING.md).
 
 ## Guides
 
 | Topic | Where to start |
 |-------|----------------|
-| Architecture, build rules, and platform validation | [Project guide](../AGENTS.md) |
+| Architecture, build rules and platform validation | [Project guide](../AGENTS.md) |
 | Distribution and release packaging | [Bundling](../BUNDLING.md) |
-| Collected data and opt-out settings | [Telemetry](../TELEMETRY.md) |
-| Release history | [Changelog](../CHANGELOG.md) |
+| What telemetry collects, and how to turn it off | [Telemetry](../TELEMETRY.md) |
 | Android platform analysis, evidence contracts, and limitations | [Android platform guide](design/android-platform-analysis.md) |
-| Language and framework coverage | [Coverage matrix](design/framework-coverage.md) |
-| Dynamic dispatch and real-repository validation | [Coverage playbook](design/dynamic-dispatch-coverage-playbook.md) |
-| Agent evaluation methodology | [Validation guide](AGENTS.md) |
-| Search quality iteration | [Search quality loop](SEARCH_QUALITY_LOOP.md) |
+| Release history | [Changelog](../CHANGELOG.md) |
+| Entries held for the viewer's launch | [Viewer changelog](viewer-launch-changelog.md) |
+| What languages and frameworks cover, and what's left | [Framework coverage](design/framework-coverage.md) |
+| Validating a language or framework on real repositories | [Validation guide](AGENTS.md) and [coverage playbook](design/dynamic-dispatch-coverage-playbook.md) |
+| Checking a language by hand | [Language verification guide](SEARCH_QUALITY_LOOP.md) |
+| The browser viewer's design | [Viewer design spec](design/codegraph-ui-design-spec.md) |
+| The native extraction kernel | [Kernel design](design/native-extraction-kernel.md) |
 
 ## Supporting material
 
-- [Design](design/): architecture and feature proposals; individual documents
-  may describe planned work rather than released behavior.
-- [Benchmarks](benchmarks/): measurements and evaluation methodology. Interpret
-  results against the recorded revision, environment, and scope.
-- [Grammars](grammars/): parser grammar documentation.
-- [Plans](plans/): implementation plans and task records.
-- [Discussion notes](from-chat/): supporting discussion material.
+- [Design](design/): architecture notes and feature proposals. Some describe planned work rather than what has shipped.
+- [Benchmarks](benchmarks/): measurements and how they were taken. Read each against the revision and setup it records.
+- [Grammars](grammars/): notes and patches for the parser grammars CodeGraph builds itself.
+- [Plans](plans/): implementation plans.
+- [Discussion notes](from-chat/): supporting notes from design discussions.

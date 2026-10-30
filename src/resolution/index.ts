@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonFunctionModuleAlias, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -42,7 +42,7 @@ import { matchShopifyThemeFile } from './shopify-themes';
 import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js-super-calls';
 import { CLASS_EXPRESSION_REF_LANGUAGES, isCommonJsExportedClass, isJsClassExpression, writtenIn, type ClassExpressionIndex } from './js-class-expressions';
 import { matchRubyConstantPathRef } from './ruby-constant-paths';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, pythonImportsInScope, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks, getResolvingFrameworks } from './frameworks';
@@ -50,7 +50,8 @@ import { clearDeclaredDependencies } from './frameworks/package-deps';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
-import { loadProjectAliases, type AliasMap } from './path-aliases';
+import { createHash } from 'crypto';
+import { aliasConfigFields, loadProjectAliases, type AliasMap } from './path-aliases';
 import { findGoModuleForImport, goModulePackageDir, loadGoModule, type GoModule } from './go-module';
 import { loadWorkspacePackages, workspaceFingerprint, workspacePackageDirOf, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
@@ -246,6 +247,60 @@ const CPP_BUILT_INS = new Set([
   'move', 'forward', 'swap',
 ]);
 
+/** The module-config files at the project root a resolver reads, present or not (#2977). */
+const MODULE_CONFIG_ROOT_FILES = ['tsconfig.json', 'jsconfig.json', 'tsconfig.base.json', 'go.mod'] as const;
+
+/** Project-relative config path → digest of what resolution reads from it (see `moduleConfigDigest`), 'absent' for one not there. */
+export type ModuleConfigSnapshot = Record<string, string>;
+
+/** A stored snapshot's files (see `getModuleConfigSnapshot`); an index without one, or one an older engine wrote, has none. */
+export function parseModuleConfigSnapshot(stored: string | null): ModuleConfigSnapshot {
+  if (!stored) return {};
+  try {
+    const parsed = JSON.parse(stored) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed as Record<string, unknown>).filter(([, v]) => typeof v === 'string')) as ModuleConfigSnapshot;
+  } catch {
+    return {};
+  }
+}
+
+/** Digest each of `files` (absolute) as the project sees it now, keyed by its project-relative path. */
+function moduleConfigSnapshot(projectRoot: string, files: Iterable<string>): ModuleConfigSnapshot {
+  const snapshot: ModuleConfigSnapshot = {};
+  for (const abs of files) {
+    const rel = path.relative(projectRoot, abs).replace(/\\/g, '/');
+    // A config outside the project (an `extends` into node_modules or a parent
+    // folder) is read where it is; the key stays relative so the index moves.
+    snapshot[rel] = moduleConfigDigest(abs);
+  }
+  return snapshot;
+}
+
+/**
+ * A digest of what resolution reads from one config file, 'absent' for one not
+ * there: a go.mod's module path, a tsconfig / jsconfig's `extends`, `baseUrl`
+ * and `paths`. Not of its bytes: a dependency bump or a `strict` flag moves no
+ * import, and would re-open every one.
+ */
+function moduleConfigDigest(abs: string): string {
+  if (!fs.existsSync(abs)) return 'absent';
+  const read = path.basename(abs) === 'go.mod'
+    ? loadGoModule(path.dirname(abs))?.modulePath ?? ''
+    : aliasConfigFields(abs) ?? '';
+  return createHash('sha256').update(read).digest('hex').slice(0, 16);
+}
+
+/** The languages whose imports a changed config file governs: the ES-module family for a tsconfig / jsconfig, Go for a go.mod. */
+export function moduleConfigLanguages(changed: readonly string[]): Set<Language> {
+  const languages = new Set<Language>();
+  for (const rel of changed) {
+    if (/(?:^|\/)go\.mod$/.test(rel)) languages.add('go');
+    else for (const language of ESM_IMPORT_LANGUAGES) languages.add(language);
+  }
+  return languages;
+}
+
 /**
  * Reference Resolver
  *
@@ -358,6 +413,10 @@ export class ReferenceResolver {
   private goPackageDirs = new Map<string, string | null>();
   // Monorepo workspace member packages. Same lazy/immutable convention.
   private workspacePackages: WorkspacePackages | null | undefined = undefined;
+  // The tsconfig / jsconfig files (their `extends` chains included) and go.mod
+  // files the maps above were read from, as absolute paths. A sync compares
+  // what they say now with what the index was resolved by (#2977).
+  private moduleConfigFiles = new Set<string>();
 
   constructor(projectRoot: string, queries: QueryBuilder) {
     this.projectRoot = projectRoot;
@@ -646,6 +705,7 @@ export class ReferenceResolver {
       if (found !== undefined) break;
       walked.push(dir);
       found = loadGoModule(path.join(this.projectRoot, dir));
+      if (found) this.moduleConfigFiles.add(path.join(this.projectRoot, dir, 'go.mod'));
       if (found || dir === '') break;
       dir = goDirOf(dir);
     }
@@ -1043,7 +1103,7 @@ export class ReferenceResolver {
 
       getProjectAliases: () => {
         if (this.projectAliases === undefined) {
-          this.projectAliases = loadProjectAliases(this.projectRoot);
+          this.projectAliases = loadProjectAliases(this.projectRoot, this.moduleConfigFiles);
         }
         return this.projectAliases;
       },
@@ -1061,7 +1121,7 @@ export class ReferenceResolver {
           walked.push(dir);
           const abs = path.join(this.projectRoot, dir);
           if (['tsconfig.json', 'jsconfig.json'].some((name) => fs.existsSync(path.join(abs, name)))) {
-            const aliases = loadProjectAliases(abs);
+            const aliases = loadProjectAliases(abs, this.moduleConfigFiles);
             if (aliases) {
               found = aliases;
               break;
@@ -3051,6 +3111,36 @@ export class ReferenceResolver {
     return fingerprint;
   }
 
+  /**
+   * The module-config files the index was resolved by, with a digest of each
+   * (see `moduleConfigSnapshot`): every tsconfig / jsconfig this resolver read
+   * (`extends` chains included), every go.mod, and the root's candidates
+   * whether present or not, so one that appears is seen too. `previous` is the
+   * snapshot the index was stamped with; its files are read again, so a config
+   * this process never loaded still counts.
+   */
+  getModuleConfigSnapshot(previous: string | null): ModuleConfigSnapshot {
+    const files = new Set<string>(this.moduleConfigFiles);
+    for (const name of MODULE_CONFIG_ROOT_FILES) files.add(path.join(this.projectRoot, name));
+    for (const rel of Object.keys(parseModuleConfigSnapshot(previous))) files.add(path.join(this.projectRoot, rel));
+    return moduleConfigSnapshot(this.projectRoot, files);
+  }
+
+  /**
+   * Forget the tsconfig / jsconfig alias maps and the go.mod modules this
+   * resolver read, and every memo resolved through them, so the next reference
+   * reads the files as they are now (#2977). The caller re-opens the imports
+   * the old maps resolved.
+   */
+  resetModuleConfig(): void {
+    this.projectAliases = undefined;
+    this.dirAliases.clear();
+    this.goModuleByDir.clear();
+    this.goPackageDirs.clear();
+    this.moduleConfigFiles.clear();
+    this.clearCaches();
+  }
+
   /** The fingerprint of the workspace map this resolver resolves by (see `workspaceFingerprint`). */
   getWorkspaceFingerprint(): string {
     return workspaceFingerprint(this.context.getWorkspacePackages?.() ?? null);
@@ -3327,9 +3417,20 @@ export class ReferenceResolver {
    * Resolving the specifier is the same question resolveViaImport will ask
    * next, so a receiver that passes here is one the qualified path can actually
    * serve; anything else stays a silent miss rather than a wrong edge.
+   *
+   * Asked of the binding the reference reads, as resolveViaImport asks it, for
+   * a receiver the file imports at all: an `import a.b as receiver` inside the
+   * calling function (#2600), or the file's imports of the name unless the
+   * function binds it itself — a parameter or local named like the module
+   * (`def save(store): store.write()`) is a value, and its builtin-named call
+   * stays filtered.
    */
   private isPythonProjectModule(ref: UnresolvedRef, receiver: string): boolean {
-    for (const imp of this.context.getImportMappings(ref.filePath, ref.language)) {
+    const imports = this.context.getImportMappings(ref.filePath, ref.language);
+    if (!imports.some((imp) => imp.localName === receiver)) return false;
+    const local = pythonFunctionModuleAlias(receiver, ref, this.context);
+    if (local) return resolveImportPath(local, ref.filePath, ref.language!, this.context) !== null;
+    for (const imp of pythonImportsInScope(ref, imports, this.context)) {
       if (imp.localName !== receiver) continue;
       // `import pkg.mod` / `import pkg.mod as m` binds the module `source`
       // names. `from pkg import mod` binds `pkg.mod`, and `from . import mod`
@@ -4067,7 +4168,7 @@ export class ReferenceResolver {
       if (!type) return null;
       result = { ...result, targetNodeId: type.id };
     }
-    if (isBoundToOutOfRepoImport(ref, this.context)) return null;
+    if (isBoundToOutOfRepoImport(ref, this.context, target)) return null;
     // A Go type embedded through a package (`clientv3.KV`) is that package's.
     // When the package is none of the file's imports as indexed (clientv3
     // imported unaliased as `go.etcd.io/etcd/client/v3`), a type found by its

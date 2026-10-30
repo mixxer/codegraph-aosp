@@ -2149,9 +2149,14 @@ export class QueryBuilder {
     // so treat it as whitespace before the strip step. Otherwise queries
     // like `stage_apply::run` collapse to `stage_applyrun` (the colons
     // are stripped without splitting) and find nothing. See #173.
+    //
+    // The other FTS5 syntax characters separate words too, as they do in
+    // the index, which splits text at anything but letters and digits:
+    // `leaf(entry)` is stored as `leaf` and `entry`. Dropping them glued a
+    // pasted call into one word no symbol has (`leafentry`, #2971).
     const ftsQuery = query
       .replace(/::/g, ' ') // Rust/C++/Ruby qualifier separator
-      .replace(/['"*():^]/g, '') // Remove FTS5 special chars
+      .replace(/['"*():^]/g, ' ') // FTS5 syntax characters separate words
       .split(/\s+/)
       .filter(term => term.length > 0)
       // Strip FTS5 boolean operators to prevent query manipulation
@@ -3357,16 +3362,8 @@ export class QueryBuilder {
   /**
    * Every ordered pair of files where one reaches into the other, once each.
    *
-   * The input a cycle finder wants: file-level circular dependencies are the
-   * strongly connected components of this graph. One query instead of the
-   * dependency lookup per file that {@link GraphQueryManager.findCircularDependencies}
-   * does — which matters because a cycle report is only interesting on a large
-   * repo, and that is exactly where a query per file stops being affordable.
-   *
    * `contains` is excluded (a file "contains" its own symbols, which is not a
-   * dependency), and so are same-file edges and low-confidence name matches:
-   * a cycle conjured by a common method name is a false alarm a reader cannot
-   * check.
+   * dependency), and so are same-file edges and low-confidence name matches.
    */
   getCrossFileDependencyPairs(minConfidence: number): Array<{ source: string; target: string }> {
     return this.db
@@ -3380,6 +3377,29 @@ export class QueryBuilder {
             AND COALESCE(json_extract(e.metadata, '$.confidence'), 1) >= ?`
       )
       .all(minConfidence) as Array<{ source: string; target: string }>;
+  }
+
+  /**
+   * Every ordered pair of files where one imports the other, once each: the
+   * graph circular imports are read from. See `src/graph/file-cycles.ts`.
+   *
+   * Only `imports` edges, which the import resolver made from a statement in
+   * the file. Every other cross-file edge says something ran or was mentioned
+   * there, and a loop of those is not a circular import: an interface's call
+   * fans out to a test's fake that implements it, two pages link to each other,
+   * and the files of one Go package call each other freely.
+   */
+  getFileImportPairs(): Array<{ source: string; target: string }> {
+    return this.db
+      .prepare(
+        `SELECT DISTINCT sn.file_path AS source, tn.file_path AS target
+           FROM edges e
+           JOIN nodes sn ON sn.id = e.source
+           JOIN nodes tn ON tn.id = e.target
+          WHERE e.kind = 'imports'
+            AND sn.file_path <> tn.file_path`
+      )
+      .all() as Array<{ source: string; target: string }>;
   }
 
   /**
@@ -5640,6 +5660,28 @@ export class QueryBuilder {
     return pairs;
   }
 
+  /**
+   * The `file\0statement` pairs of the `export … from` statements in
+   * `filePaths` (#2978). Each is an import node named by the module it names,
+   * with the statement as its signature, so a re-export pointed at another
+   * module, taken away, added, or passing other names on changes a pair, and a
+   * plain `import` does not. Same shape as {@link getNodeNamePairsByFiles}.
+   */
+  getReExportStatementsByFiles(filePaths: string[]): Set<string> {
+    const pairs = new Set<string>();
+    if (filePaths.length === 0) return pairs;
+    for (let i = 0; i < filePaths.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(`SELECT DISTINCT file_path, signature FROM nodes
+                   WHERE kind = 'import' AND file_path IN (${placeholders}) AND signature LIKE 'export%'`)
+        .all(...chunk) as Array<{ file_path: string; signature: string }>;
+      for (const row of rows) pairs.add(`${row.file_path}\0${row.signature}`);
+    }
+    return pairs;
+  }
+
   // ===========================================================================
   // Statistics
   // ===========================================================================
@@ -5655,6 +5697,30 @@ export class QueryBuilder {
     return this.db
       .prepare('SELECT (SELECT COUNT(*) FROM nodes) AS nodes, (SELECT COUNT(*) FROM edges) AS edges')
       .get() as { nodes: number; edges: number };
+  }
+
+  /**
+   * For each language, how many files it has and how many yielded a symbol: a
+   * node other than the file's own. More than one stored node settles a row, so
+   * `nodes` is only probed for the few it can't, such as a file whose one symbol
+   * came from a framework pass. Probing every row costs as much as the whole of
+   * getStats() on a 14,000-file index; this costs a tenth of that. Not part of
+   * getStats() either way, because every explore runs that.
+   */
+  getParsedFileCounts(): Array<{ language: Language; files: number; parsed: number }> {
+    return this.db
+      .prepare(`
+        SELECT f.language AS language, COUNT(*) AS files,
+          SUM(CASE
+            WHEN f.node_count > 1 THEN 1
+            WHEN EXISTS (SELECT 1 FROM nodes n WHERE n.file_path = f.path AND n.kind <> 'file') THEN 1
+            ELSE 0
+          END) AS parsed
+        FROM files f
+        GROUP BY f.language
+        ORDER BY f.language
+      `)
+      .all() as Array<{ language: Language; files: number; parsed: number }>;
   }
 
   /**

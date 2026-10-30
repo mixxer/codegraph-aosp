@@ -5377,6 +5377,12 @@ import 'package:flutter/material.dart';
       ['{% liquid\n  capture bare\n    echo "Hi"\n  endcapture\n%}', 'bare', 2, 2],
       ['{% liquid\r\n  capture crlf # a note\r\n  endcapture\r\n%}', 'crlf', 2, 2],
       ["{%- liquid\n  capture 'quoted_line'\n  endcapture\n-%}", 'quoted_line', 2, 2],
+      // A name with `-` in it is one name; the `-` of `-%}` trims whitespace.
+      ['{% capture title-text %}Hi{% endcapture %}', 'title-text', 1, 0],
+      ['{% capture title-text-%}Hi{% endcapture %}', 'title-text', 1, 0],
+      ['{%- capture title-text -%}Hi{%- endcapture -%}', 'title-text', 1, 0],
+      ["{% capture 'hero-alt' %}Hi{% endcapture %}", 'hero-alt', 1, 0],
+      ['{% liquid\n  capture hero-alt\n  endcapture\n%}', 'hero-alt', 2, 2],
     ] as const)('reads a capture declaration from %j', (code, name, line, column) => {
       const result = extractFromSource('sections/card.liquid', code);
       const variables = result.nodes.filter((n) => n.kind === 'variable');
@@ -5400,10 +5406,27 @@ import 'package:flutter/material.dart';
       expect(result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name)).toEqual(['text']);
     });
 
-    it('never cuts a capture name short', () => {
-      // Liquid allows `-` and `.` in a name, which the assign rule doesn't read
-      // either; such a name gets no node rather than a wrong one.
-      const code = ['{% capture ghost-name %}x{% endcapture %}', '{% capture ghost.name %}x{% endcapture %}'].join('\n');
+    it('reads an assign name with `-` in it whole', () => {
+      const code = [
+        "{% assign title-text = 'Sale' %}",
+        '{%- assign page-title=page.title -%}',
+        '{% liquid',
+        '  assign hero-image = section.settings.image',
+        '%}',
+      ].join('\n');
+      const variables = extractFromSource('sections/card.liquid', code).nodes.filter((n) => n.kind === 'variable');
+      expect(variables.map((n) => [n.name, n.startLine])).toEqual([['title-text', 1], ['page-title', 2], ['hero-image', 4]]);
+    });
+
+    it('never cuts a name short', () => {
+      // Liquid allows `.` in a name too, which neither rule reads; such a name
+      // gets no node rather than a wrong one.
+      const code = [
+        '{% capture ghost.name %}x{% endcapture %}',
+        '{% capture ghost-name.x %}x{% endcapture %}',
+        '{% assign ghost.name = 1 %}',
+        '{% assign ghost-name.x = 1 %}',
+      ].join('\n');
       expect(extractFromSource('sections/card.liquid', code).nodes.filter((n) => n.kind === 'variable')).toEqual([]);
     });
 
@@ -10120,6 +10143,66 @@ const value = 42;
       (e) => e.source === componentNode!.id && e.kind === 'contains'
     );
     expect(containEdges.length).toBeGreaterThan(0);
+  });
+
+  it('should not let a self-closing <script /> swallow the next script (#2989)', () => {
+    const code = `---
+import { formatDate } from '../utils/format';
+const inlineScript = 'window.example = true';
+---
+<script is:inline set:html={inlineScript} />
+<time>{formatDate(new Date())}</time>
+<script>
+  const ready = true;
+  console.log(ready);
+</script>
+`;
+    const result = extractFromSource('Page.astro', code);
+
+    expect(result.errors).toEqual([]);
+    const ready = result.nodes.find((n) => n.name === 'ready');
+    expect(ready).toBeDefined();
+    expect(ready?.startLine).toBe(8);
+    // The markup between the two scripts is still scanned.
+    const call = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'formatDate' && ref.line === 6
+    );
+    expect(call).toBeDefined();
+  });
+
+  it('should not let a self-closing <style /> hide the markup after it (#2989)', () => {
+    const code = `<style is:global />
+<p>{formatDate(date)}</p>
+<style>.a { color: red; }</style>
+`;
+    const result = extractFromSource('Styled.astro', code);
+
+    const call = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'formatDate' && ref.line === 2
+    );
+    expect(call).toBeDefined();
+  });
+
+  it("still reads a call in a self-closing <script />'s attributes (#2989)", () => {
+    // A self-closing tag has no body for the template scan to skip:
+    // `set:html={…}` runs when the page renders, like any attribute expression.
+    const code = `---
+import { serializeJsonLd } from '../lib/jsonld';
+const schema = {};
+---
+<script type="application/ld+json" set:html={serializeJsonLd(schema)} />
+<script>
+  const ready = true;
+</script>
+`;
+    const result = extractFromSource('Schema.astro', code);
+
+    expect(result.errors).toEqual([]);
+    expect(result.nodes.find((n) => n.name === 'ready')?.startLine).toBe(7);
+    const call = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'serializeJsonLd' && ref.line === 5
+    );
+    expect(call).toBeDefined();
   });
 });
 

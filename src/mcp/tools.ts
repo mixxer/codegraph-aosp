@@ -44,8 +44,8 @@ import {
   type WorktreeIndexMismatch,
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
-import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
-import { isTestFile, normalizeNameToken } from '../search/query-utils';
+import type { Node, Edge, SearchResult, Subgraph, NodeKind, Language } from '../types';
+import { isTestFile, normalizeNameToken, splitAtCjkSwitches, isQueryNameToken } from '../search/query-utils';
 import { groupDefinitions, isQualifiedSymbol, lastQualifierPart, matchesSymbol, qualifiedSymbolMatches } from '../graph/symbol-lookup';
 import { goPackageReaderFor } from '../graph/go-package';
 import {
@@ -66,7 +66,10 @@ import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranc
 import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
 import { countImplementers } from '../graph/type-hierarchy';
 import { describeSynthesizedHop } from '../graph/synthesized-hop';
+import { callSiteLines, formatCallSiteLines } from '../graph/call-sites';
+import type { CallSiteRow } from '../graph/traversal';
 import { isCopybookInclude, MAX_COPYBOOK_INCLUDES, type NamedCopybook } from '../graph/cobol-copybooks';
+import { groupFilesByPackage, packageGroupTitle, packageListingTitle } from '../graph/owning-package';
 import {
   findAllSymbols,
   resolveNamedSymbolFlow,
@@ -151,7 +154,7 @@ function wslSharedIndexGuidance(err: WslSharedIndexError): string {
 export { PathRefusalError } from '../errors';
 import { PathRefusalError } from '../errors';
 import { indexedHashInput } from '../file-limits';
-import { resolve as resolvePath, relative as relativePath } from 'path';
+import { resolve as resolvePath, relative as relativePath, dirname } from 'path';
 
 /** Maximum output length to prevent context bloat (characters) */
 const MAX_OUTPUT_LENGTH = 15000;
@@ -1088,15 +1091,18 @@ export function elidedBodyNote(filePath: string, name: string, from: number, to:
 /**
  * The symbol-shaped tokens of an explore query, the way its named-symbol
  * seeding reads them: split on spaces, commas and brackets, a source-file
- * extension dropped (`Program.cs` names `Program`), at least 3 characters,
- * plain or qualified identifiers only, deduped, at most 16.
+ * extension dropped (`Program.cs` names `Program`), cut where Han, kana or
+ * Hangul meets another script (`NavMeshAgent类型`), plain or qualified names
+ * in any script of at least 3 characters, or 2 in Han, kana or Hangul
+ * (`入口`, `로그인`), deduped, at most 16.
  */
 export function exploreQueryTokens(query: string): string[] {
   const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl)$/i;
   return [...new Set(
     query.split(/[\s,()[\]]+/)
       .map((t) => t.replace(FILE_EXT, '').trim())
-      .filter((t) => t.length >= 3 && /^[A-Za-z_$][\w$]*(?:(?:::|\.)[\w$]+)*$/.test(t))
+      .flatMap(splitAtCjkSwitches)
+      .filter(isQueryNameToken)
   )].slice(0, 16);
 }
 
@@ -2032,8 +2038,8 @@ export const tools: ToolDefinition[] = [
         },
         format: {
           type: 'string',
-          description: 'Output format: "tree" (hierarchical, default), "flat" (simple list), "grouped" (by language)',
-          enum: ['tree', 'flat', 'grouped'],
+          description: 'Output format: "tree" (hierarchical, default), "flat" (simple list), "grouped" (by language), "package" (by the nearest package.json or composer.json that names a package)',
+          enum: ['tree', 'flat', 'grouped', 'package'],
           default: 'tree',
         },
         includeMetadata: {
@@ -2070,6 +2076,66 @@ export const tools: ToolDefinition[] = [
  * explore's `['query']` becomes `['query', 'projectPath']`, and a tool with no
  * `required` list (status/files) gains `['projectPath']`.
  */
+/** A path's first folder, or '' for a file at the project root. */
+function topLevelFolder(filePath: string): string {
+  const slash = filePath.indexOf('/');
+  return slash > 0 ? filePath.slice(0, slash) : '';
+}
+
+/**
+ * The order in which codegraph_node's multi-definition answer fills its
+ * capped list (#1657): the first definition in each language, then the first
+ * in each top-level folder within a language, then the rest, each tier in the
+ * order given. The index lists a name's definitions by path, so forty under an
+ * early-sorting folder used to take every slot, and a late folder's or another
+ * language's definition showed up nowhere. A set within one language and
+ * folder keeps its order.
+ */
+export function definitionCapOrder(nodes: readonly Node[]): Node[] {
+  const languages = new Set<string>();
+  const folders = new Set<string>();
+  const languageFirsts: Node[] = [];
+  const folderFirsts: Node[] = [];
+  const rest: Node[] = [];
+  for (const n of nodes) {
+    const folder = `${n.language}\0${topLevelFolder(n.filePath)}`;
+    const newFolder = !folders.has(folder);
+    folders.add(folder);
+    if (!languages.has(n.language)) {
+      languages.add(n.language);
+      languageFirsts.push(n);
+    } else if (newFolder) {
+      folderFirsts.push(n);
+    } else {
+      rest.push(n);
+    }
+  }
+  return [...languageFirsts, ...folderFirsts, ...rest];
+}
+
+/**
+ * What a capped definition list left out, by language and top-level folder,
+ * largest first: "35 typescript in client/, 2 python at the project root".
+ */
+export function describeOmittedDefinitions(nodes: readonly Node[]): string {
+  const groups = new Map<string, { language: string; folder: string; count: number }>();
+  for (const n of nodes) {
+    const folder = topLevelFolder(n.filePath);
+    const key = `${n.language}\0${folder}`;
+    const group = groups.get(key);
+    if (group) group.count++;
+    else groups.set(key, { language: n.language, folder, count: 1 });
+  }
+  const MAX_NAMED = 6;
+  const ranked = [...groups.values()].sort((a, b) => b.count - a.count);
+  const parts = ranked
+    .slice(0, MAX_NAMED)
+    .map((g) => `${g.count} ${g.language} ${g.folder ? `in ${g.folder}/` : 'at the project root'}`);
+  const elsewhere = ranked.slice(MAX_NAMED).reduce((sum, g) => sum + g.count, 0);
+  if (elsewhere > 0) parts.push(`${elsewhere} elsewhere`);
+  return parts.join(', ');
+}
+
 function withRequiredProjectPath(defs: ToolDefinition[]): ToolDefinition[] {
   return defs.map((tool) => {
     if (!tool.inputSchema.properties.projectPath) return tool;
@@ -2119,6 +2185,9 @@ export function getStaticTools(): ToolDefinition[] {
  * untouched, and `CODEGRAPH_MCP_TOOLS=explore,node,...` re-enables any of them.
  */
 const DEFAULT_MCP_TOOLS = new Set(['explore']);
+
+/** Call-site lines codegraph_callers shows per caller (#2909), so one busy caller stays one line. */
+const MCP_CALL_SITES_SHOWN = 10;
 
 /** realpath when the path exists, the path itself otherwise — never throws. */
 function canonicalPath(p: string): string {
@@ -3184,7 +3253,16 @@ export class ToolHandler {
       // serve it. Resolved on the main thread so the watcher lives here even
       // when dispatch is off-loaded to a worker.
       if (typeof pathCheck === 'string') {
-        await this.awaitProjectGate(pathCheck);
+        // A file inside a project (an agent passing the file it is looking at)
+        // stands for its directory, like any other path inside it (#2982).
+        // Rewritten here so the gate, the worker, the worktree notice and
+        // getCodeGraph all see the same directory.
+        let projectPath = pathCheck;
+        try {
+          if (statSync(pathCheck).isFile()) projectPath = dirname(pathCheck);
+        } catch { /* a missing path walks up to its .codegraph/ as before */ }
+        if (projectPath !== pathCheck) args = { ...args, projectPath };
+        await this.awaitProjectGate(projectPath);
       }
       // The `path` and `pattern` properties used by codegraph_files are
       // also path-shaped — apply the same cap.
@@ -3510,27 +3588,35 @@ export class ToolHandler {
       ? `\n\n> **Note:** no definition of "${symbol}" matches file "${fileFilter}" — showing all definitions instead.`
       : '';
 
+    // Every site of each caller (#2909): one row per caller, at the lines its
+    // calls sit on, and the symbol itself when it calls itself.
     const collect = (defNodes: Node[]) => {
-      const seen = new Set<string>();
       const callers: Node[] = [];
       const labels = new Map<string, string>();
+      const sites = new Map<string, Edge[]>();
+      const recursive = new Set<string>();
       for (const node of defNodes) {
-        for (const c of cg.getCallers(node.id)) {
-          if (!seen.has(c.node.id)) {
-            seen.add(c.node.id);
-            callers.push(c.node);
-            answerPaths.add(c.node.filePath);
-            const label = this.edgeLabel(c.edge);
-            if (label) labels.set(c.node.id, label);
+        for (const c of cg.getCallSites(node.id, 'callers')) {
+          const known = sites.get(c.node.id);
+          if (known) {
+            known.push(...c.edges);
+            continue;
           }
+          sites.set(c.node.id, [...c.edges]);
+          if (c.recursive) recursive.add(c.node.id);
+          callers.push(c.node);
+          answerPaths.add(c.node.filePath);
+          const label = this.edgeLabel(c.edges[0]!);
+          if (label) labels.set(c.node.id, label);
         }
       }
-      return { callers, labels };
+      const locations = new Map(callers.map((n) => [n.id, this.callSiteLocation(n, sites.get(n.id) ?? [])]));
+      return { callers, labels, locations, recursive };
     };
 
     // Single definition (or same-file overloads): the familiar flat list.
     if (groups.length === 1) {
-      const { callers, labels } = collect(groups[0]!);
+      const { callers, labels, locations, recursive } = collect(groups[0]!);
       if (callers.length === 0) {
         return this.answerResult(cg, `No callers found for "${symbol}"${allMatches.note}${filterNote}`, answerPaths);
       }
@@ -3542,7 +3628,7 @@ export class ToolHandler {
       const cut = callers.length > limit
         ? `\n\n> Showing ${limit} of ${callers.length} callers; pass \`limit\` (up to 100) to widen.`
         : '';
-      const formatted = this.formatNodeList(callers.slice(0, limit), `Callers of ${symbol}`, labels) + cut + note + filterNote;
+      const formatted = this.formatNodeList(callers.slice(0, limit), `Callers of ${symbol}`, labels, locations, recursive) + cut + note + filterNote;
       return this.answerResult(cg, this.truncateOutput(formatted), answerPaths);
     }
 
@@ -3553,16 +3639,14 @@ export class ToolHandler {
       `**Callers of ${symbol} — ${groups.length} distinct definitions (narrow with \`file\`)**`,
     ];
     for (const group of groups) {
-      const { callers, labels } = collect(group);
+      const { callers, labels, locations, recursive } = collect(group);
       lines.push('', this.definitionHeading(group));
       if (callers.length === 0) {
         lines.push('- (no callers)');
         continue;
       }
       for (const node of callers.slice(0, limit)) {
-        const location = node.startLine ? `:${node.startLine}` : '';
-        const label = labels.get(node.id);
-        lines.push(`- ${node.name} (${node.kind}) - ${node.filePath}${location}${label ? ` — via ${label}` : ''}`);
+        lines.push(this.formatNodeListEntry(node, labels, locations, recursive));
       }
       if (callers.length > limit) {
         lines.push(`- … +${callers.length - limit} more (pass \`limit\` to widen)`);
@@ -3593,26 +3677,30 @@ export class ToolHandler {
       ? `\n\n> **Note:** no definition of "${symbol}" matches file "${fileFilter}" — showing all definitions instead.`
       : '';
 
+    // Callees are listed at their own declarations, where a call leads; a
+    // symbol that calls itself is one of them (#2909).
     const collect = (defNodes: Node[]) => {
       const seen = new Set<string>();
       const callees: Node[] = [];
       const labels = new Map<string, string>();
+      const recursive = new Set<string>();
       for (const node of defNodes) {
-        for (const c of cg.getCallees(node.id)) {
+        for (const c of cg.getCallSites(node.id, 'callees')) {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
+            if (c.recursive) recursive.add(c.node.id);
             callees.push(c.node);
             answerPaths.add(c.node.filePath);
-            const label = this.edgeLabel(c.edge);
+            const label = this.edgeLabel(c.edges[0]!);
             if (label) labels.set(c.node.id, label);
           }
         }
       }
-      return { callees, labels };
+      return { callees, labels, recursive };
     };
 
     if (groups.length === 1) {
-      const { callees, labels } = collect(groups[0]!);
+      const { callees, labels, recursive } = collect(groups[0]!);
       if (callees.length === 0) {
         return this.answerResult(cg, `No callees found for "${symbol}"${allMatches.note}${filterNote}`, answerPaths);
       }
@@ -3624,7 +3712,7 @@ export class ToolHandler {
       const cut = callees.length > limit
         ? `\n\n> Showing ${limit} of ${callees.length} callees; pass \`limit\` (up to 100) to widen.`
         : '';
-      const formatted = this.formatNodeList(callees.slice(0, limit), `Callees of ${symbol}`, labels) + cut + note + filterNote;
+      const formatted = this.formatNodeList(callees.slice(0, limit), `Callees of ${symbol}`, labels, undefined, recursive) + cut + note + filterNote;
       return this.answerResult(cg, this.truncateOutput(formatted), answerPaths);
     }
 
@@ -3633,16 +3721,14 @@ export class ToolHandler {
       `**Callees of ${symbol} — ${groups.length} distinct definitions (narrow with \`file\`)**`,
     ];
     for (const group of groups) {
-      const { callees, labels } = collect(group);
+      const { callees, labels, recursive } = collect(group);
       lines.push('', this.definitionHeading(group));
       if (callees.length === 0) {
         lines.push('- (no callees)');
         continue;
       }
       for (const node of callees.slice(0, limit)) {
-        const location = node.startLine ? `:${node.startLine}` : '';
-        const label = labels.get(node.id);
-        lines.push(`- ${node.name} (${node.kind}) - ${node.filePath}${location}${label ? ` — via ${label}` : ''}`);
+        lines.push(this.formatNodeListEntry(node, labels, undefined, recursive));
       }
       if (callees.length > limit) {
         lines.push(`- … +${callees.length - limit} more (pass \`limit\` to widen)`);
@@ -8480,12 +8566,49 @@ export class ToolHandler {
     // FULL bodies as fit a char budget (the agent gets the one it needs in this
     // one call, no follow-up parameter to learn), and list any remainder by
     // file:line so a large overload set can't overflow the per-tool cap.
+    //
+    // The index lists a name's definitions by path, so forty under an
+    // early-sorting folder used to take every body and list slot, and the only
+    // one in a late folder or another language showed up nowhere, past a bare
+    // "+N more" (#1657). Now a language with no body gets one on top of the
+    // overloads that fit, and the list's slots go first to each language and
+    // top-level folder (`definitionCapOrder`); an overflow names the languages
+    // and folders it leaves out. Overloads that fit before still render, and
+    // what is shown keeps index order, so a set that fits every cap reads
+    // exactly as before.
     const header = `**${matches.length} definitions named "${symbol}"**`;
+    const indexOrder = new Map(matches.map((n, i) => [n, i] as const));
+    const inIndexOrder = <T>(items: T[], nodeOf: (item: T) => Node): T[] =>
+      [...items].sort((a, b) => indexOrder.get(nodeOf(a))! - indexOrder.get(nodeOf(b))!);
+    const isGenerated = cg.generatedFilePredicate(matches.map((n) => n.filePath));
+    // Generated stubs stay behind every hand-written definition (findSymbolMatches).
+    const capOrderOf = (nodes: Node[]): Node[] => [
+      ...definitionCapOrder(nodes.filter((n) => !isGenerated(n.filePath))),
+      ...definitionCapOrder(nodes.filter((n) => isGenerated(n.filePath))),
+    ];
+    const listLine = (n: Node) => `- \`${n.name}\` (${n.kind}) — ${n.filePath}:${n.startLine}`;
+    const omittedLine = (omitted: Node[]) => `- … +${omitted.length} more: ${describeOmittedDefinitions(omitted)}`;
     if (!includeCode) {
-      const list = matches.map((n) => `- \`${n.name}\` (${n.kind}) — ${n.filePath}:${n.startLine}`);
-      return this.textResult(this.truncateOutput(
-        [header, '', 'Re-query with `includeCode: true` to get every body in one call — no need to pick one first.', '', ...list].join('\n'),
-      ));
+      const prefix = [header, '', 'Re-query with `includeCode: true` to get every body in one call — no need to pick one first.', ''];
+      const prefixChars = prefix.join('\n').length + 1;
+      let list = matches.map(listLine);
+      if (prefixChars + list.join('\n').length > MAX_OUTPUT_LENGTH) {
+        // Too long for the output cap, which would cut the tail off unnamed:
+        // fill what fits in cap order, keeping room to name the rest.
+        const OMITTED_LINE_RESERVE = 1000;
+        const budget = MAX_OUTPUT_LENGTH - prefixChars - OMITTED_LINE_RESERVE;
+        const capOrder = capOrderOf(matches);
+        const shown: Node[] = [];
+        let listChars = 0;
+        for (const n of capOrder) {
+          const lineChars = listLine(n).length + 1;
+          if (listChars + lineChars > budget) break;
+          shown.push(n);
+          listChars += lineChars;
+        }
+        list = [...inIndexOrder(shown, (n) => n).map(listLine), omittedLine(capOrder.slice(shown.length))];
+      }
+      return this.textResult(this.truncateOutput([...prefix, ...list].join('\n')));
     }
 
     const BODY_BUDGET = 12000; // leaves room under MAX_OUTPUT_LENGTH for the header + list
@@ -8494,42 +8617,63 @@ export class ToolHandler {
     // render in full rather than relegating the one the agent wanted to a
     // bodiless list. Only a set of many LARGE bodies hits the char budget first.
     const HARD_CAP = 16;
-    const rendered: string[] = [];
-    const listed: Node[] = [];
+    type Body = { node: Node; section: string };
+    let rendered: Body[] = [];
+    let notRendered: Node[] = [];
     let used = 0;
     for (const n of matches) {
-      if (rendered.length >= HARD_CAP) { listed.push(n); continue; }
+      if (rendered.length >= HARD_CAP) { notRendered.push(n); continue; }
       const section = await this.renderNodeSection(cg, n, true);
       // Always emit the first; emit the rest only while within the char budget.
       if (rendered.length === 0 || used + section.length <= BODY_BUDGET) {
-        rendered.push(section);
+        rendered.push({ node: n, section });
         used += section.length;
       } else {
-        listed.push(n);
+        notRendered.push(n);
       }
     }
 
-    const out: string[] = [
-      header,
-      `Returning ${rendered.length} in full${listed.length ? `; ${listed.length} more listed below` : ''} — pick the one you need (no Read required).`,
-      '',
-      rendered.join('\n\n---\n\n'),
-    ];
-    if (listed.length) {
-      const LIST_CAP = 20;
-      const shownList = listed.slice(0, LIST_CAP);
-      out.push(
+    const LIST_CAP = 20;
+    const compose = (bodies: Body[], rest: Node[]): string => {
+      const restInCapOrder = capOrderOf(rest);
+      const listed = inIndexOrder(restInCapOrder.slice(0, LIST_CAP), (n) => n);
+      const omitted = restInCapOrder.slice(LIST_CAP);
+      const out: string[] = [
+        header,
+        `Returning ${bodies.length} in full${rest.length ? `; ${rest.length} more listed below` : ''} — pick the one you need (no Read required).`,
         '',
-        '**Other definitions**',
-        ...shownList.map((n) => `- \`${n.name}\` (${n.kind}) — ${n.filePath}:${n.startLine}`),
-      );
-      if (listed.length > LIST_CAP) out.push(`- … +${listed.length - LIST_CAP} more`);
-      out.push(
-        '',
-        `> Need one of these in full? Call codegraph_node again with \`file\` (e.g. \`"${listed[0]!.filePath.split('/').pop()}"\`) or \`line\` — do NOT Read it.`,
-      );
+        inIndexOrder(bodies, (b) => b.node).map((b) => b.section).join('\n\n---\n\n'),
+      ];
+      if (listed.length) {
+        out.push(
+          '',
+          '**Other definitions**',
+          ...listed.map(listLine),
+        );
+        if (omitted.length) out.push(omittedLine(omitted));
+        out.push(
+          '',
+          `> Need one of these in full? Call codegraph_node again with \`file\` (e.g. \`"${listed[0]!.filePath.split('/').pop()}"\`) or \`line\` — do NOT Read it.`,
+        );
+      }
+      return out.join('\n');
+    };
+
+    // Each language still without a body gets its first hand-written
+    // definition rendered on top, while the whole answer stays under the
+    // output cap; one that doesn't fit keeps its early line in the list.
+    const languagesWithBody = new Set(rendered.map((b) => b.node.language));
+    for (const n of [...notRendered]) {
+      if (languagesWithBody.has(n.language) || isGenerated(n.filePath)) continue;
+      languagesWithBody.add(n.language);
+      const bodies = [...rendered, { node: n, section: await this.renderNodeSection(cg, n, true) }];
+      const rest = notRendered.filter((m) => m !== n);
+      if (compose(bodies, rest).length <= MAX_OUTPUT_LENGTH) {
+        rendered = bodies;
+        notRendered = rest;
+      }
     }
-    return this.textResult(this.truncateOutput(out.join('\n')));
+    return this.textResult(this.truncateOutput(compose(rendered, notRendered)));
   }
 
   /**
@@ -8813,30 +8957,32 @@ export class ToolHandler {
    */
   private formatTrail(cg: CodeGraph, node: Node): string {
     const TRAIL_CAP = 12;
-    const fmt = (e: { node: Node; edge: Edge }) => {
-      const base = `${e.node.name} (${e.node.filePath}:${e.node.startLine})`;
-      const synth = this.synthEdgeNote(e.edge);
+    /** Call-site lines shown per caller, so one busy caller can't crowd the trail. */
+    const TRAIL_CALL_SITES = 3;
+    const fmt = (row: CallSiteRow, where: string) => {
+      const base = `${row.node.name} (${where})`;
+      const synth = this.synthEdgeNote(row.edges[0]!);
       return synth ? `${base} [${synth}]` : base;
     };
-    const collect = (edges: Array<{ node: Node; edge: Edge }>): Array<{ node: Node; edge: Edge }> => {
-      const seen = new Set<string>([node.id]);
-      const out: Array<{ node: Node; edge: Edge }> = [];
-      for (const e of edges) {
-        if (seen.has(e.node.id)) continue;
-        seen.add(e.node.id);
-        out.push(e);
-      }
-      return out;
-    };
-    const callees = collect(cg.getCallees(node.id));
-    const callers = collect(cg.getCallers(node.id));
+    // A callee reads at its declaration, where following it leads. A caller
+    // reads at the lines its calls sit on, every one a line to edit when this
+    // symbol changes (#2909), and a symbol that calls itself is among its own
+    // callers, once.
+    const callees = cg.getCallSites(node.id, 'callees').filter((row) => !row.recursive);
+    const callers = cg.getCallSites(node.id, 'callers');
     if (callees.length === 0 && callers.length === 0) return '';
+    const callee = (row: CallSiteRow) => fmt(row, `${row.node.filePath}:${row.node.startLine}`);
+    const caller = (row: CallSiteRow) => {
+      const sites = callSiteLines(row.edges);
+      const at = sites.length > 0 ? formatCallSiteLines(sites, TRAIL_CALL_SITES) : String(row.node.startLine);
+      return fmt(row, `${row.node.filePath}:${at}${row.recursive ? ', calls itself' : ''}`);
+    };
     const lines: string[] = ['', '**Trail — codegraph_node any of these to follow it (no Read needed)**'];
     if (callees.length > 0) {
-      lines.push(`**Calls →** ${callees.slice(0, TRAIL_CAP).map(fmt).join(', ')}${callees.length > TRAIL_CAP ? `, +${callees.length - TRAIL_CAP} more` : ''}`);
+      lines.push(`**Calls →** ${callees.slice(0, TRAIL_CAP).map(callee).join(', ')}${callees.length > TRAIL_CAP ? `, +${callees.length - TRAIL_CAP} more` : ''}`);
     }
     if (callers.length > 0) {
-      lines.push(`**Called by ←** ${callers.slice(0, TRAIL_CAP).map(fmt).join(', ')}${callers.length > TRAIL_CAP ? `, +${callers.length - TRAIL_CAP} more` : ''}`);
+      lines.push(`**Called by ←** ${callers.slice(0, TRAIL_CAP).map(caller).join(', ')}${callers.length > TRAIL_CAP ? `, +${callers.length - TRAIL_CAP} more` : ''}`);
     }
     return lines.join('\n');
   }
@@ -8863,7 +9009,9 @@ export class ToolHandler {
     // (e.g. the server resolved up from a nested worktree to the main checkout).
     // Queries then reflect that tree's branch, not the worktree being edited.
     // status shows the verbose, multi-line form; the read tools get the compact
-    // one-liner via withWorktreeNotice. Both share the cached detection.
+    // one-liner via withWorktreeNotice. Both share the cached detection, and
+    // both are worded for the agent: the user can index the worktree, the
+    // agent doesn't.
     const mismatch = this.worktreeMismatchFor(args.projectPath as string | undefined);
 
     const lines: string[] = [
@@ -8871,7 +9019,7 @@ export class ToolHandler {
       '',
     ];
     if (mismatch) {
-      lines.push(`> ⚠ ${worktreeMismatchWarning(mismatch).replace(/\n/g, '\n> ')}`, '');
+      lines.push(`> ⚠ ${worktreeMismatchWarning(mismatch, 'agent').replace(/\n/g, '\n> ')}`, '');
     }
     lines.push(
       `**Files indexed:** ${stats.fileCount}`,
@@ -8939,11 +9087,22 @@ export class ToolHandler {
       }
     }
 
+    // Beside the file count, how many yielded symbols: it is what tells a
+    // language that parsed from one that is only listed.
+    const coverage = cg.getLanguageCoverage();
     lines.push('', '**Languages:**');
     for (const [lang, count] of Object.entries(stats.filesByLanguage)) {
       if ((count as number) > 0) {
-        lines.push(`- ${lang}: ${count}`);
+        const parsed = coverage.parsedFilesByLanguage[lang as Language];
+        lines.push(parsed === undefined || parsed === count ? `- ${lang}: ${count}` : `- ${lang}: ${count} (${parsed} with symbols)`);
       }
+    }
+    if (coverage.unparsedLanguages.length > 0) {
+      lines.push(
+        '',
+        `**No symbols from:** ⚠ ${coverage.unparsedLanguages.join(', ')} ` +
+        `— those files are indexed, but nothing in them can be searched or traced; Read them directly.`
+      );
     }
 
     // Whole-index degradation (#876): when live watching has permanently
@@ -8988,7 +9147,7 @@ export class ToolHandler {
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const pathFilter = args.path as string | undefined;
     const pattern = args.pattern as string | undefined;
-    const format = (args.format as 'tree' | 'flat' | 'grouped') || 'tree';
+    const format = (args.format as 'tree' | 'flat' | 'grouped' | 'package') || 'tree';
     const includeMetadata = args.includeMetadata !== false;
     const maxDepth = args.maxDepth != null ? clamp(args.maxDepth as number, 1, 20) : undefined;
 
@@ -9033,6 +9192,9 @@ export class ToolHandler {
         break;
       case 'grouped':
         output = this.formatFilesGrouped(files, includeMetadata);
+        break;
+      case 'package':
+        output = this.formatFilesByPackage(cg.getProjectRoot(), files, includeMetadata);
         break;
       case 'tree':
       default:
@@ -9095,6 +9257,32 @@ export class ToolHandler {
       for (const file of langFiles.sort((a, b) => a.path.localeCompare(b.path))) {
         if (includeMetadata) {
           lines.push(`- ${file.path} (${file.nodeCount} symbols)`);
+        } else {
+          lines.push(`- ${file.path}`);
+        }
+      }
+      lines.push('');
+    }
+
+    return lines.join('\n');
+  }
+
+  /**
+   * Format files grouped by the package that owns them
+   */
+  private formatFilesByPackage(
+    projectRoot: string,
+    files: { path: string; language: string; nodeCount: number }[],
+    includeMetadata: boolean
+  ): string {
+    const groups = groupFilesByPackage(projectRoot, files);
+    const lines: string[] = [`**${packageListingTitle(groups)}**`, ''];
+
+    for (const group of groups) {
+      lines.push(`**${packageGroupTitle(group)}**`);
+      for (const file of group.files) {
+        if (includeMetadata) {
+          lines.push(`- ${file.path} (${file.language}, ${file.nodeCount} symbols)`);
         } else {
           lines.push(`- ${file.path}`);
         }
@@ -9268,20 +9456,45 @@ export class ToolHandler {
     return lines.join('\n');
   }
 
-  private formatNodeList(nodes: Node[], title: string, labels?: Map<string, string>): string {
+  private formatNodeList(
+    nodes: Node[],
+    title: string,
+    labels?: Map<string, string>,
+    locations?: Map<string, string>,
+    recursive?: Set<string>,
+  ): string {
     const lines: string[] = [`**${title} (${nodes.length} found)**`, ''];
-
-    for (const node of nodes) {
-      const location = node.startLine ? `:${node.startLine}` : '';
-      // Compact: just name, kind, location — plus the relationship when it
-      // isn't a plain call (callback registration, instantiation, …).
-      const label = labels?.get(node.id);
-      lines.push(
-        `- ${node.name} (${node.kind}) - ${node.filePath}${location}${label ? ` — via ${label}` : ''}`
-      );
-    }
-
+    for (const node of nodes) lines.push(this.formatNodeListEntry(node, labels, locations, recursive));
     return lines.join('\n');
+  }
+
+  /**
+   * One callers/callees entry. Compact: name, kind, location (the caller's
+   * call sites when `locations` has them, else the declaration's line), the
+   * relationship when it isn't a plain call (callback registration,
+   * instantiation, …), and whether the symbol calls itself.
+   */
+  private formatNodeListEntry(
+    node: Node,
+    labels?: Map<string, string>,
+    locations?: Map<string, string>,
+    recursive?: Set<string>,
+  ): string {
+    const location = locations?.get(node.id) ?? (node.startLine ? `:${node.startLine}` : '');
+    const label = labels?.get(node.id);
+    const itself = recursive?.has(node.id) ? ' — calls itself' : '';
+    return `- ${node.name} (${node.kind}) - ${node.filePath}${location}${label ? ` — via ${label}` : ''}${itself}`;
+  }
+
+  /**
+   * `:9, 10` — where a caller's calls sit, the lines to edit when the symbol
+   * changes (#2909), capped at {@link MCP_CALL_SITES_SHOWN}; the caller's own
+   * line when its edges carry none.
+   */
+  private callSiteLocation(node: Node, edges: readonly Edge[]): string {
+    const lines = callSiteLines(edges);
+    if (lines.length > 0) return `:${formatCallSiteLines(lines, MCP_CALL_SITES_SHOWN)}`;
+    return node.startLine ? `:${node.startLine}` : '';
   }
 
   /**

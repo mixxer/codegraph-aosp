@@ -224,11 +224,6 @@ pub struct Walker<'t> {
     fs_values: HashMap<String, u32>,
     fs_value_counts: HashMap<String, u32>,
     value_scopes: Vec<ValueScope<'t>>,
-    /// kotlinObjectScopeDepth (tree-sitter.ts:480) — >0 while inside an
-    /// `object : IFoo.Stub() { ... }` literal body, so createNode binds
-    /// member identity to the enclosing owner (two anon objects can share
-    /// both name and line).
-    kotlin_object_scope_depth: u32,
 }
 
 pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
@@ -263,7 +258,6 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
         fs_values: HashMap::new(),
         fs_value_counts: HashMap::new(),
         value_scopes: Vec::new(),
-        kotlin_object_scope_depth: 0,
     };
 
     let line_count = source.bytes().filter(|b| *b == b'\n').count() as u32 + 1;
@@ -902,10 +896,10 @@ impl<'t> Walker<'t> {
         } else if kind == "infix_expression" {
             self.extract_infix_call(node);
         } else if kind == "object_literal" {
-            // Kotlin `object : IFoo.Stub() { ... }` — AIDL Stub implementation
-            // idiom (tree-sitter.ts extractKotlinObjectLiteral, 2026-09-11).
-            self.extract_kotlin_object_literal(node);
-            skip_children = true;
+            // `object : Api.Listener { … }` — an anonymous class.
+            if self.extract_object_literal(node, false) {
+                skip_children = true;
+            }
         }
         // companion_object, anonymous_initializer, secondary_constructor,
         // getter/setter siblings, file_annotation, if/when at top level: no
@@ -941,6 +935,12 @@ impl<'t> Walker<'t> {
 
         self.extract_static_member_ref(node);
 
+        // `object : Api.Listener { … }` in a body or an initializer — an
+        // anonymous class; its header is this body's code.
+        if kind == "object_literal" && self.extract_object_literal(node, true) {
+            return;
+        }
+
         if kind == "function_declaration" {
             let name = self.extract_name(node);
             if name != "<anonymous>" {
@@ -974,10 +974,6 @@ impl<'t> Walker<'t> {
         // object_declaration is NOT dispatched here — a body-local object's
         // `fun`s hit the function branch above and leak out as FUNCTIONS
         // under the enclosing fn; its properties mint nothing (quirk).
-        if kind == "object_literal" {
-            self.extract_kotlin_object_literal(node);
-            return;
-        }
 
         for i in 0..node.named_child_count() {
             if let Some(c) = node.named_child(i) {
@@ -1375,10 +1371,10 @@ impl<'t> Walker<'t> {
     }
 
     /// extractInheritance — delegation_specifier: user_type ?? its
-    /// constructor_invocation's user_type → FIRST type_identifier → ONE
-    /// `extends` ref at the typeId (interfaces ride extends too; qualified
-    /// supertypes take the FIRST segment — `com`; `by`-delegation emits
-    /// NOTHING).
+    /// constructor_invocation's user_type → ONE `extends` ref named by the
+    /// user_type's type_identifiers joined with `.` (`Outer.Inner`, type
+    /// arguments left out), at the first one (interfaces ride extends too;
+    /// `by`-delegation emits NOTHING).
     fn extract_inheritance(&mut self, node: Node<'t>, class_row: u32) {
         let extends_kind = edge_kind_index("extends").unwrap();
         for i in 0..node.named_child_count() {
@@ -1394,156 +1390,123 @@ impl<'t> Walker<'t> {
                 .find(|c| c.kind() == "constructor_invocation");
             let target = user_type.or(ctor_inv);
             let Some(target) = target else { continue };
-            let type_id: Node = if target.kind() == "user_type" {
+            let type_node: Option<Node> = if target.kind() == "user_type" {
+                Some(target)
+            } else {
                 (0..target.named_child_count())
                     .filter_map(|j| target.named_child(j))
-                    .find(|c| c.kind() == "type_identifier")
-                    .unwrap_or(target)
-            } else {
-                // constructor_invocation → its user_type → first type_identifier
-                let ut = (0..target.named_child_count())
-                    .filter_map(|j| target.named_child(j))
-                    .find(|c| c.kind() == "user_type");
-                match ut {
-                    Some(ut) => (0..ut.named_child_count())
-                        .filter_map(|j| ut.named_child(j))
-                        .find(|c| c.kind() == "type_identifier")
-                        .unwrap_or(ut),
-                    None => target,
-                }
+                    .find(|c| c.kind() == "user_type")
             };
-            let name = self.text(type_id).to_string();
+            let ids: Vec<Node> = match type_node {
+                Some(t) => (0..t.named_child_count())
+                    .filter_map(|j| t.named_child(j))
+                    .filter(|c| c.kind() == "type_identifier")
+                    .collect(),
+                None => Vec::new(),
+            };
+            let type_id: Node = ids.first().copied().or(type_node).unwrap_or(target);
+            let name = if ids.is_empty() {
+                self.text(type_id).to_string()
+            } else {
+                ids.iter().map(|c| self.text(*c)).collect::<Vec<_>>().join(".")
+            };
             self.push_ref_at(class_row, &name, extends_kind, type_id);
         }
     }
 
-    /// extractKotlinObjectLiteral (tree-sitter.ts:5330) — `object : IFoo.Stub() { ... }`,
-    /// the dominant AIDL Stub implementation idiom. NOT the same AST shape as
-    /// Java/C#'s object_creation_expression (repeatable delegation_specifier
-    /// supertypes, no single constructor/type field) — its own extraction.
-    fn extract_kotlin_object_literal(&mut self, node: Node<'t>) {
+    /// extractKotlinObjectLiteral — `object : Api.Listener { … }`: an anonymous
+    /// class. Headers (each delegation_specifier) walked first by the CURRENT
+    /// walker in the enclosing scope; an `instantiates` ref from the stack top
+    /// to the first supertype's last segment; a class `<Short$anon@line>`;
+    /// `extends` refs (dotted path) from it, at each path's first
+    /// type_identifier; its class_body children through visit_node. False
+    /// (nothing done) without a class_body.
+    fn extract_object_literal(&mut self, node: Node<'t>, body_walker: bool) -> bool {
         stack_guard!();
         let Some(body) = (0..node.named_child_count())
             .filter_map(|i| node.named_child(i))
             .find(|c| c.kind() == "class_body")
         else {
-            return;
+            return false;
         };
-
-        let delegation_specifiers: Vec<Node<'t>> = (0..node.named_child_count())
+        let specs: Vec<Node<'t>> = (0..node.named_child_count())
             .filter_map(|i| node.named_child(i))
             .filter(|c| c.kind() == "delegation_specifier")
             .collect();
-
-        // A specifier contains a constructor invocation, an explicit `by`
-        // delegation, or a bare interface type. Only the first constructs a
-        // supertype; a call in a delegate expression does not. Preserve all
-        // dotted name segments for qualified lookup (excludes type_arguments).
-        struct SuperType<'t> {
-            full_name: String,
-            user_type: Node<'t>,
-            has_call: bool,
-        }
-        let mut super_types: Vec<SuperType<'t>> = Vec::new();
-        for &spec in &delegation_specifiers {
-            let mut user_type: Option<Node<'t>> = None;
-            let mut has_call = false;
-            for i in 0..spec.named_child_count() {
-                let Some(child) = spec.named_child(i) else { continue };
-                if matches!(child.kind(), "constructor_invocation" | "explicit_delegation") {
-                    has_call = child.kind() == "constructor_invocation";
-                    for j in 0..child.named_child_count() {
-                        if let Some(grandchild) = child.named_child(j) {
-                            if grandchild.kind() == "user_type" {
-                                user_type = Some(grandchild);
-                                break;
-                            }
-                        }
-                    }
-                    break;
-                }
-                if child.kind() == "user_type" {
-                    user_type = Some(child);
-                    break;
-                }
-            }
-            let Some(user_type) = user_type else { continue };
-            // Read only direct name segments: Outer<T>.Inner<U> is Outer.Inner,
-            // and types nested in type_arguments are never supertypes themselves.
-            let full_name = (0..user_type.named_child_count())
-                .filter_map(|i| user_type.named_child(i))
-                .filter(|c| c.kind() == "type_identifier")
-                .map(|c| self.text(c).trim().to_string())
-                .collect::<Vec<_>>()
-                .join(".");
-            if !full_name.is_empty() {
-                super_types.push(SuperType { full_name, user_type, has_call });
+        // (name, first type_identifier, built by a constructor_invocation)
+        let mut supertypes: Vec<(String, Node<'t>, bool, bool)> = Vec::new();
+        for spec in &specs {
+            let holder = (0..spec.named_child_count())
+                .filter_map(|j| spec.named_child(j))
+                .find(|c| c.kind() == "constructor_invocation" || c.kind() == "explicit_delegation");
+            let from = holder.unwrap_or(*spec);
+            let user_type = (0..from.named_child_count())
+                .filter_map(|j| from.named_child(j))
+                .find(|c| c.kind() == "user_type");
+            let ids: Vec<Node<'t>> = match user_type {
+                Some(t) => (0..t.named_child_count())
+                    .filter_map(|j| t.named_child(j))
+                    .filter(|c| c.kind() == "type_identifier")
+                    .collect(),
+                None => Vec::new(),
+            };
+            if let Some(first) = ids.first() {
+                let name = ids.iter().map(|c| self.text(*c)).collect::<Vec<_>>().join(".");
+                let built = holder.map(|h| h.kind() == "constructor_invocation").unwrap_or(false);
+                supertypes.push((name, *first, built, holder.map(|h| h.kind() == "explicit_delegation").unwrap_or(false)));
             }
         }
-        // Header expressions execute in the enclosing scope, not as members of
-        // the new class. Visit each spec once so constructor arguments,
-        // delegates, and objects nested in either retain their calls/structure.
-        for &spec in &delegation_specifiers {
-            self.visit_node(spec);
-        }
-
-        let enclosing_row = if self.stack.is_empty() { None } else { Some(self.top_row()) };
-        if let Some(enclosing_row) = enclosing_row {
-            if let Some(primary_ctor) = super_types.iter().find(|s| s.has_call) {
-                self.push_ref(
-                    enclosing_row,
-                    &primary_ctor.full_name,
-                    edge_kind_index("instantiates").unwrap(),
-                    node.start_position().row as u32 + 1,
-                    self.col_of(node),
-                );
+        for spec in &specs {
+            if body_walker {
+                self.visit_for_calls_and_structure(*spec);
+            } else {
+                self.visit_node(*spec);
             }
         }
-
-        // The anon class's own (cosmetic) name uses the first supertype's bare
-        // last segment, matching extractAnonymousClass's convention.
-        let mut type_name = super_types.first().map(|s| s.full_name.clone()).unwrap_or_else(|| "Object".to_string());
-        if let Some(last_dot) = type_name.rfind('.') {
-            type_name = type_name[(last_dot + 1)..].to_string();
-        }
-        type_name = type_name.trim().to_string();
-        if type_name.is_empty() {
-            type_name = "Object".to_string();
-        }
-
-        // createNode IDs use name + line; include the column to distinguish
-        // same-type literals nested or adjacent on the same source line.
-        let anon_name = format!(
-            "<{type_name}$anon@{}:{}>",
-            node.start_position().row + 1,
-            node.start_position().column
-        );
-        let Some(row) = self.create_node("class", &anon_name, node, Extra::default()) else {
-            return;
+        // The class it builds, else its first supertype: the object's name and,
+        // as written, what the code around instantiates.
+        let primary = supertypes.iter().find(|s| s.2).or(supertypes.first());
+        let short_name = match primary {
+            Some((name, _, _, _)) => match name.rfind('.') {
+                Some(dot) => name[dot + 1..].to_string(),
+                None => name.clone(),
+            },
+            None => "Object".to_string(),
         };
-
-        // Bug-for-bug: the TS code uses `startPosition.row` (0-based) as the
-        // LINE here (no +1), unlike push_ref_at's usual line_of.
-        let extends_kind = edge_kind_index("extends").unwrap();
-        for s in &super_types {
-            self.push_ref(
-                row,
-                &s.full_name,
-                extends_kind,
-                s.user_type.start_position().row as u32,
-                self.col_of(s.user_type),
-            );
+        if let Some((written, at, _, delegated)) = primary {
+            if !*delegated && !self.stack.is_empty() {
+                let owner = self.top_row();
+                let at = *at;
+                let written = written.clone();
+                self.push_ref_at(owner, &written, edge_kind_index("instantiates").unwrap(), at);
+            }
         }
-
+        let anon_name = format!("<{short_name}$anon@{}:{}>", node.start_position().row + 1, node.start_position().column);
+        let Some(row) = self.create_node("class", &anon_name, node, Extra::default()) else {
+            for i in 0..body.named_child_count() {
+                if let Some(c) = body.named_child(i) {
+                    if body_walker {
+                        self.visit_for_calls_and_structure(c);
+                    } else {
+                        self.visit_node(c);
+                    }
+                }
+            }
+            return true;
+        };
+        let extends_kind = edge_kind_index("extends").unwrap();
+        for (name, at, _, _) in &supertypes {
+            let at = *at;
+            self.push_ref_at(row, name, extends_kind, at);
+        }
         self.stack.push(Scope { row, kind: "class", name: anon_name });
-        self.kotlin_object_scope_depth += 1;
         for i in 0..body.named_child_count() {
             if let Some(c) = body.named_child(i) {
                 self.visit_node(c);
             }
         }
-        self.kotlin_object_scope_depth -= 1;
         self.stack.pop();
+        true
     }
 
     /// extractDecoratorsFor — kotlin annotations inside `modifiers`:

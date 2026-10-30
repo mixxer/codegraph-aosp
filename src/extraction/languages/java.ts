@@ -331,6 +331,7 @@ export const javaExtractor: LanguageExtractor = {
   importTypes: ['import_declaration'],
   callTypes: ['method_invocation'],
   variableTypes: ['local_variable_declaration'],
+  // An interface's constants (`Helper HELPER = new Helper();`) are fields too.
   fieldTypes: ['field_declaration', 'constant_declaration'],
   nameField: 'name',
   bodyField: 'body',
@@ -358,6 +359,7 @@ export const javaExtractor: LanguageExtractor = {
     return undefined;
   },
   isStatic: (node) => {
+    // An interface constant is implicitly `public static final`.
     if (node.type === 'constant_declaration') return true;
     for (let i = 0; i < node.childCount; i++) {
       const child = node.child(i);

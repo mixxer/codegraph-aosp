@@ -42,7 +42,7 @@ jobs:
       - name: Test portable engine and viewer
         env:
           CODEGRAPH_KERNEL: '0'
-        run: npm test -- --maxWorkers=2 --minWorkers=1
+        run: npm test -- --maxWorkers=2
 
   kernel:
     needs: test
@@ -117,7 +117,7 @@ jobs:
           __tests__/security.test.ts
           __tests__/mcp-nested-repo-projectpath.test.ts
           __tests__/mcp-project-cache.test.ts
-          --maxWorkers=2 --minWorkers=1
+          --maxWorkers=2
 
   checks:
     name: CI checks
