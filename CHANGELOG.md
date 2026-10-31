@@ -43,6 +43,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Android interface results use consistent project-relative paths on Windows, so matching HIDL implementations keep their package evidence.
 - Java calls through static fields keep the field's own nested type and package imports, so same-named types in other files no longer take those calls.
 - Kotlin extensions declared with an imported type alias keep their callers, while an alias for a different external type is excluded.
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)

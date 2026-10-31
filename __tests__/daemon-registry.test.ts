@@ -109,9 +109,13 @@ describe('daemon-registry', () => {
   it('clears, without signalling it, the lock of a live process that is not a CodeGraph server (#2770)', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-foreign-holder-'));
     fs.mkdirSync(path.join(root, '.codegraph'));
-    const holder = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    const holder = spawn(process.execPath, ['-e', 'process.stdout.write("ready\\n"); setInterval(() => {}, 1000)'], { stdio: ['ignore', 'pipe', 'ignore'] });
     const pid = holder.pid!;
     try {
+      await new Promise<void>((resolve, reject) => {
+        holder.once('error', reject);
+        holder.stdout!.once('data', () => resolve());
+      });
       fs.writeFileSync(
         getDaemonPidPath(root),
         encodeLockInfo({ pid, version: 'test', socketPath: path.join(root, '.codegraph', 'missing.sock'), startedAt: Date.now() }),

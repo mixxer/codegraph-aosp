@@ -21,6 +21,13 @@ import { DatabaseConnection } from '../src/db';
 describe('Resolution Module', () => {
   let tempDir: string;
   let cg: CodeGraph;
+  const inspectionConnections: DatabaseConnection[] = [];
+
+  function openInspectionConnection(): DatabaseConnection {
+    const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+    inspectionConnections.push(db);
+    return db;
+  }
 
   beforeEach(() => {
     // Create temp directory
@@ -28,6 +35,7 @@ describe('Resolution Module', () => {
   });
 
   afterEach(() => {
+    for (const connection of inspectionConnections.splice(0)) connection.close();
     // destroy() is an alias for close(): it releases the database but leaves
     // the project directory on disk, so removing tempDir cannot be the
     // alternative to it. Both must run, on every test. maxRetries covers
@@ -6517,7 +6525,7 @@ class Host {
       );
 
       cg = await CodeGraph.init(tempDir, { index: true });
-      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+      const db = openInspectionConnection();
       const innerId = db
         .getDb()
         .prepare("select id from nodes where kind = 'class' and name = 'Inner'")
@@ -6822,7 +6830,7 @@ class Other {
       );
 
       cg = await CodeGraph.init(tempDir, { index: true });
-      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+      const db = openInspectionConnection();
       const rows = db
         .getDb()
         .prepare(
@@ -6860,7 +6868,7 @@ class UiModeManagerService {
       );
 
       cg = await CodeGraph.init(tempDir, { index: true });
-      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+      const db = openInspectionConnection();
       const rows = db
         .getDb()
         .prepare(
@@ -6890,7 +6898,7 @@ class UiModeManagerService {
         'package androidx; class LinearLayoutManager extends RecyclerView.LayoutManager {}');
 
       cg = await CodeGraph.init(tempDir, { index: true });
-      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+      const db = openInspectionConnection();
       const rows = db.getDb().prepare(
         `select dst.file_path as targetPath from edges e
          join nodes src on src.id = e.source
@@ -6907,7 +6915,7 @@ class UiModeManagerService {
         'package unrelated; class OnClickListener {}');
 
       cg = await CodeGraph.init(tempDir, { index: true });
-      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+      const db = openInspectionConnection();
       const rows = db.getDb().prepare(
         `select dst.qualified_name as target from edges e
          join nodes src on src.id = e.source

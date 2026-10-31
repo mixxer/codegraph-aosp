@@ -124,7 +124,7 @@ function parseHalDeclarationsWithWalk(repoRoot: string, halName: string, extensi
       }
       const packageMatch = HAL_PACKAGE_RE.exec(text);
       declarations.push({
-        filePath: path.relative(repoRoot, file),
+        filePath: path.relative(repoRoot, file).split(path.sep).join('/'),
         line: text.slice(0, match.index).split('\n').length,
         methods,
         packageName: packageMatch?.[1] ?? null,

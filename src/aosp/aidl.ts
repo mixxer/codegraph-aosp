@@ -203,7 +203,7 @@ function parseAidlDeclarationsWithWalk(repoRoot: string, interfaceName: string, 
 
       const packageMatch = AIDL_PACKAGE_RE.exec(text);
       declarations.push({
-        filePath: path.relative(repoRoot, aidlFile),
+        filePath: path.relative(repoRoot, aidlFile).split(path.sep).join('/'),
         line: text.slice(0, match.index).split('\n').length,
         methods,
         packageName: packageMatch?.[1] ?? null,
