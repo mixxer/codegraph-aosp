@@ -1146,9 +1146,14 @@ program
         }).finally(() => progress.stop());
 
         const totalChanges = result.filesAdded + result.filesModified + result.filesRemoved;
+        // Sync re-reads changed files only, so a file left alone keeps what an
+        // older engine extracted from it, and the index isn't up to date however
+        // little changed. It warns and carries on: the git hooks discard this
+        // output, so a refusal would quietly stop them after every upgrade.
+        const staleIndex = cg.isIndexStale();
 
         if (totalChanges === 0 && !result.pendingRefsProcessed) {
-          clack.log.info('Already up to date');
+          clack.log.info(staleIndex ? 'No files changed' : 'Already up to date');
         } else if (totalChanges > 0) {
           clack.log.success(`Synced ${formatNumber(totalChanges)} changed files`);
           const details: string[] = [];
@@ -1162,6 +1167,10 @@ program
           const unresolved = result.pendingRefsUnresolved
             ? ` (${formatNumber(result.pendingRefsUnresolved)} unresolved)` : '';
           clack.log.info(`Resolved ${formatNumber(result.pendingRefsResolved ?? 0)} pending references${unresolved}`);
+        }
+
+        if (staleIndex) {
+          clack.log.warn('This index was built by an older CodeGraph engine, and sync only re-reads changed files. Run "codegraph index" for a full rebuild.');
         }
 
         clack.outro('Done');
@@ -1477,7 +1486,7 @@ program
       if (reindexRecommended) {
         const builtWith = buildInfo.version ? `v${buildInfo.version.replace(/^v/, '')}` : 'an earlier version';
         warn(`Index was built by ${builtWith}; re-index to pick up this engine's improvements.`);
-        info('Run "codegraph index" (full rebuild) or "codegraph sync"');
+        info('Run "codegraph index" for a full rebuild');
         console.log();
       }
       if (frameworkChanges) {
@@ -1943,6 +1952,8 @@ program
   .option('-p, --path <path>', 'Project path')
   .option('--filter <dir>', 'Filter to files under this directory')
   .option('--pattern <glob>', 'Filter files matching this glob pattern')
+  .option('--tests', 'Show only test files')
+  .option('--no-tests', 'Exclude test files')
   .option('--format <format>', 'Output format (tree, flat, grouped, package)', 'tree')
   .option('--max-depth <number>', 'Maximum directory depth for tree format')
   .option('--no-metadata', 'Hide file metadata (language, symbol count)')
@@ -1951,6 +1962,7 @@ program
     path?: string;
     filter?: string;
     pattern?: string;
+    tests?: boolean;
     format?: string;
     maxDepth?: string;
     metadata?: boolean;
@@ -1985,6 +1997,10 @@ program
         files = files.filter(f => regex.test(f.path));
       }
 
+      if (options.tests !== undefined) {
+        files = files.filter(f => isTestPath(f.path) === options.tests);
+      }
+
       if (files.length === 0) {
         info('No files found matching the criteria.');
         cg.destroy();
@@ -1995,6 +2011,7 @@ program
       if (options.json) {
         const output = files.map(f => ({
           path: f.path,
+          isTest: isTestPath(f.path),
           language: f.language,
           nodeCount: f.nodeCount,
           size: f.size,
@@ -2718,24 +2735,28 @@ program
         const collected = groups.map((group) => {
           const nodes = new Map<string, Node>();
           const edges = new Map<string, Edge>();
+          let truncated = false;
           for (const target of group) {
             const impact = cg.getImpactRadius(target.id, depth);
+            truncated ||= impact.truncated === true;
             for (const [id, node] of impact.nodes) nodes.set(id, node);
             for (const edge of impact.edges) edges.set(`${edge.source}->${edge.target}:${edge.kind}`, edge);
           }
-          return { group, nodes, edges };
+          return { group, nodes, edges, truncated };
         });
+        const truncated = collected.some((c) => c.truncated);
 
         if (options.json) {
           const unionNodes = new Map<string, Node>();
           const unionEdges = new Map<string, Edge>();
-          const definitions = collected.map(({ group, nodes, edges }) => {
+          const definitions = collected.map(({ group, nodes, edges, truncated }) => {
             for (const [id, node] of nodes) unionNodes.set(id, node);
             for (const [key, edge] of edges) unionEdges.set(key, edge);
             return {
               ...cliDefinition(group),
               nodeCount: nodes.size,
               edgeCount: edges.size,
+              ...(truncated ? { truncated } : {}),
               affected: [...nodes.values()].map((node) => ({ id: node.id, ...cliNode(node) })),
               edges: [...edges.values()],
             };
@@ -2752,6 +2773,7 @@ program
             definitions,
             nodeCount: unionNodes.size,
             edgeCount: unionEdges.size,
+            ...(truncated ? { truncated } : {}),
             affected: [...unionNodes.values()].map(cliNode),
           }, null, 2));
         } else {
@@ -2781,6 +2803,7 @@ program
               console.log();
             }
           }
+          if (truncated) warn('Result truncated at the safety limit. Narrow it with --file or a smaller --depth.');
         }
       } finally {
         cg.destroy();
