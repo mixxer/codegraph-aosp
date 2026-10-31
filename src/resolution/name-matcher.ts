@@ -20246,9 +20246,20 @@ function javaTypeRef(written: string, filePath: string, context: ResolutionConte
   if (!pkg && chain.length === 1 && /^[A-Z][A-Z0-9]{0,2}$/.test(outer)) return { name: outer };
   const decls = jvmTypeDecls(outer, context);
   if (decls.length === 0) return null;
-  const pins = pkg
+  let pins = pkg
     ? [`${pkg}.${outer}`]
     : context.getImportMappings(filePath, 'java').filter((i) => i.localName === outer).map((i) => i.source);
+  if (pins.length === 0) {
+    // Read a field's type where it is declared. Its own nested type and
+    // package precede on-demand imports; a library wildcard is not a
+    // similarly named project type from an unrelated package.
+    const own = decls.filter((d) => d.filePath === filePath);
+    const scope = javaFileScope(filePath, context);
+    const samePackage = decls.filter((d) => declaresJvmFqn(d, [scope.pkg ? `${scope.pkg}.${outer}` : outer]));
+    if (own.length === 1) pins = [own[0]!.qualifiedName.replace(/::/g, '.')];
+    else if (samePackage.length === 1) pins = [samePackage[0]!.qualifiedName.replace(/::/g, '.')];
+    else pins = [...scope.demand].map((prefix) => `${prefix}.${outer}`);
+  }
   if (pins.length === 0) {
     if (!decls.some((d) => isJavaTypeNameable(d, filePath, context))) return null;
     if (chain.length === 1) return { name: outer };
@@ -20258,7 +20269,9 @@ function javaTypeRef(written: string, filePath: string, context: ResolutionConte
     );
     return nested ? { name } : null;
   }
-  let decl = decls.find((d) => declaresJvmFqn(d, pins));
+  const pinned = decls.filter((d) => declaresJvmFqn(d, pins));
+  if (pinned.length !== 1) return null;
+  let decl: Node | undefined = pinned[0];
   for (const segment of chain.slice(1)) {
     if (!decl) break;
     const owner: Node = decl;

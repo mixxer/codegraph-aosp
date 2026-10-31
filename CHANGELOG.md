@@ -41,6 +41,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Java calls through static fields keep the field's own nested type and package imports, so same-named types in other files no longer take those calls.
 - Kotlin extensions declared with an imported type alias keep their callers, while an alias for a different external type is excluded.
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)
 - In JavaScript and TypeScript, a call or `new` in a parameter's default value, like `function renderWithNote(note = buildNote())`, a destructured `{ size = defaultSize() }` or `constructor(private svc = new Service())`, now counts as the function's own call. Before, it was dropped, so `buildNote` was missing that caller and impact on it came back incomplete. Re-index JavaScript and TypeScript projects after upgrading. Thanks @inth3shadows for the report and the pull request. (#2588)

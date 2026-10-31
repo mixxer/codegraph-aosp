@@ -3922,7 +3922,7 @@ function useTmpDirs(label: string): { home: () => string; cwd: () => string } {
 
   beforeEach(() => {
     tmpHome = mkTmpDir(`${label}-home`);
-    tmpCwd = mkTmpDir(`${label}-cwd`);
+    tmpCwd = fs.realpathSync(mkTmpDir(`${label}-cwd`));
     origCwd = process.cwd();
     process.chdir(tmpCwd);
     homeRestore = setHome(tmpHome);

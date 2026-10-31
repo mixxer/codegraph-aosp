@@ -100,7 +100,9 @@ describe('Resolution Module', () => {
         'pkg::ComposeInitializer', 'ComposeInitializer.kt'), language: 'kotlin' as const };
       const objectMethod = { ...makeNode('object-method', 'method', 'onDetachedFromWindow',
         'pkg::ComposeInitializer::onDetachedFromWindow', 'ComposeInitializer.kt'), language: 'kotlin' as const };
-      const nodes = [field, anon, correct, wrong, entry, enumMethod, object, objectMethod];
+      const owner = makeNode('owner', 'class', 'SelectGesture', 'pkg::SelectGesture', 'SelectGesture.java');
+      const enumOwner = makeNode('enum-owner', 'enum', 'ScrimState', 'pkg::ScrimState', 'ScrimState.java');
+      const nodes = [owner, field, anon, correct, wrong, enumOwner, entry, enumMethod, object, objectMethod];
       const context = {
         getNodesByName: (name: string) => nodes.filter(n => n.name === name),
         getNodesByLowerName: (name: string) => nodes.filter(n => n.name.toLowerCase() === name),
