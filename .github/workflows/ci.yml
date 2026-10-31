@@ -1,5 +1,5 @@
 {
-  "name": "Windows final 446d full portable compatibility",
+  "name": "Windows final full portable compatibility",
   "on": {
     "workflow_dispatch": {}
   },
@@ -20,23 +20,13 @@
         "matrix": {
           "include": [
             {
-              "target": "upstream",
-              "sha": "446d08c272f18e8ce9e61ea537228240893fc131",
-              "node": 22
-            },
-            {
-              "target": "upstream",
-              "sha": "446d08c272f18e8ce9e61ea537228240893fc131",
-              "node": 24
-            },
-            {
               "target": "main",
-              "sha": "d29ac428e8f5e1736e49e63cfd2e31f34415df6c",
+              "sha": "44b78550a10335831e7335c312c03ea48ca16ca4",
               "node": 22
             },
             {
               "target": "main",
-              "sha": "d29ac428e8f5e1736e49e63cfd2e31f34415df6c",
+              "sha": "44b78550a10335831e7335c312c03ea48ca16ca4",
               "node": 24
             }
           ]
