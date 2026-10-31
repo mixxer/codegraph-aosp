@@ -23,7 +23,7 @@ import { cppClassWritten, type CppNameSite } from './cpp-supertypes';
 import { cppIncludedFile, cppIncludedHeadersBeside, cppIncluders } from './cpp-includers';
 import { isCFeatureVariant, isOffByDefault } from './c-feature-variants';
 import { isTestFile, isTestPath } from '../search/query-utils';
-import { inBlock, isDeclarationFile, isMergedAmbientDeclaration, scanGlobalScope, type GlobalScopeScan } from './ambient-modules';
+import { ambientModuleDeclarations, declaringFileAnswers, inBlock, isDeclarationFile, isMergedAmbientDeclaration, scanGlobalScope, type GlobalScopeScan } from './ambient-modules';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap, parsePackageName, parseTargetPaths } from './frameworks/cargo-workspace';
 import { blankRustCode, readRustScopes, rustBindingAt, rustInnerBlockAt, rustBoundsOf, rustFnAt, rustImplAt, splitRustTopLevel, type RustBinding, type RustPatternSite, type RustScopes } from './rust-scopes';
@@ -644,7 +644,7 @@ function pythonLineBindings(lines: string[], index: number, statements: boolean[
   if (statements[index]) for (let j = index + 1; j < lines.length && !statements[j]; j++) line += '\n' + lines[j];
   const out: PythonBinding[] = [];
   // An import statement can name `name` on a continuation line: `from x import (\n    name,\n)`.
-  const imported = statements[index] ? line.match(/^\s*(?:from\s+([\w.]+)\s+)?import\s+([\s\S]*)$/) : null;
+  const imported = statements[index] && line.includes('import') ? line.match(/^\s*(?:from\s+([\w.]+)\s+)?import\s+([\s\S]*)$/) : null;
   if (imported) {
     const names = imported[2]!;
     // `from x import *` can bind any name.
@@ -3739,6 +3739,46 @@ function javaAncestorNames(qn: string, context: ResolutionContext, depth = 0): S
   return names;
 }
 
+/** What isJavaTypeVisible reads of a reference, whichever candidate is being asked about. */
+interface JavaNameRead {
+  /** An inner class's `outer.new Inner()`. */
+  innerNew: boolean;
+  /** What the line writes before the name: `RequestFactory`, `java.util`. */
+  qualifiers: string[];
+  /** The types around the reference, read when a nested candidate needs them. */
+  enclosing?: Node[];
+}
+
+/** The last reference javaNameRead read: one is asked about every candidate of its name. */
+let lastJavaNameRead: { ref: UnresolvedRef; context: ResolutionContext; read: JavaNameRead } | null = null;
+
+/** `outer.new Inner()` on `name\0line`, `\1` being the name, compiled once (see CPP_DECLARATOR_OF). */
+const JAVA_INNER_NEW_OF = /^([^\0]*)\0[\s\S]*?\.\s*new\s+\1\b/;
+/** What's written before the name: group 2. (A type annotation may sit between: jsoup's `Range.@Nullable Spans`.) */
+const JAVA_QUALIFIER_OF = /^([^\0]*)\0[\s\S]*?([A-Za-z_$][\w$.]*)\s*\.\s*(?:@[\w.]+(?:\([^)]*\))?\s+)*\1\b/;
+
+function javaQualifiersOf(line: string, name: string): string[] {
+  const found: string[] = [];
+  let rest = line;
+  for (let m = JAVA_QUALIFIER_OF.exec(`${name}\0${rest}`); m; m = JAVA_QUALIFIER_OF.exec(`${name}\0${rest}`)) {
+    found.push(m[2]!);
+    rest = rest.slice(m[0].length - name.length - 1);
+  }
+  return found;
+}
+
+function javaNameRead(ref: UnresolvedRef, context: ResolutionContext): JavaNameRead {
+  if (lastJavaNameRead?.ref === ref && lastJavaNameRead.context === context) return lastJavaNameRead.read;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
+  const name = ref.referenceName;
+  const read: JavaNameRead = {
+    innerNew: JAVA_INNER_NEW_OF.test(`${name}\0${line}`),
+    qualifiers: javaQualifiersOf(line, name),
+  };
+  lastJavaNameRead = { ref, context, read };
+  return read;
+}
+
 /**
  * Whether a bare Java type name at `ref` can mean `candidate`. A top-level type
  * is in reach from its own package and through a single-type or on-demand
@@ -3755,8 +3795,9 @@ function isJavaTypeVisible(candidate: Node, ref: UnresolvedRef, context: Resolut
   if (candidate.kind === 'method') {
     const segs = candidate.qualifiedName.split('::');
     if (segs.length < 2 || segs[segs.length - 2] !== candidate.name || ref.referenceKind === 'calls') return true;
+    const ownerQn = segs.slice(0, -1).join('::');
     const owner = context.getNodesInFile(candidate.filePath).find((n) =>
-      n.qualifiedName === segs.slice(0, -1).join('::') && JAVA_TYPE_KINDS_VISIBLE.has(n.kind));
+      n.qualifiedName === ownerQn && JAVA_TYPE_KINDS_VISIBLE.has(n.kind));
     return !owner || isJavaTypeVisible(owner, ref, context);
   }
   // An enum constant by its bare name: inside its enum, a `case` label, a
@@ -3783,10 +3824,8 @@ function isJavaTypeVisible(candidate: Node, ref: UnresolvedRef, context: Resolut
   // Written with a qualifier — `RequestFactory.Builder`, `java.util.Map`, an
   // inner class's `outer.new Inner()` — the qualifier says which: the owner
   // (or the package) of this candidate.
-  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
-  if (new RegExp(`\\.\\s*new\\s+${escapeRegExp(ref.referenceName)}\\b`).test(line)) return true;
-  // (A type annotation may sit between them: jsoup's `Range.@Nullable Spans`.)
-  const qualifiers = [...line.matchAll(new RegExp(`([A-Za-z_$][\\w$.]*)\\s*\\.\\s*(?:@[\\w.]+(?:\\([^)]*\\))?\\s+)*${escapeRegExp(ref.referenceName)}\\b`, 'g'))].map((m) => m[1]!);
+  const { innerNew, qualifiers } = javaNameRead(ref, context);
+  if (innerNew) return true;
   // Nested only inside a type the file declares; a class local to a method is
   // the lexical rule's to judge.
   const ownerQn = segs.slice(0, -1).join('::');
@@ -3802,8 +3841,9 @@ function isJavaTypeVisible(candidate: Node, ref: UnresolvedRef, context: Resolut
     return here.single.has(fqn) || here.demand.has(candidateScope.pkg);
   }
   // Nested: inside its owner, a subtype of it, or imported.
-  const enclosing = context.getNodesInFile(ref.filePath)
-    .filter((p) => JAVA_TYPE_KINDS_VISIBLE.has(p.kind) && p.startLine <= ref.line && p.endLine >= ref.line);
+  const read = javaNameRead(ref, context);
+  const enclosing = (read.enclosing ??= context.getNodesInFile(ref.filePath)
+    .filter((p) => JAVA_TYPE_KINDS_VISIBLE.has(p.kind) && p.startLine <= ref.line && p.endLine >= ref.line));
   if (enclosing.some((p) => p.qualifiedName === ownerQn || p.qualifiedName.startsWith(`${ownerQn}::`))) return true;
   // An anonymous class (`new NodeFilter() { … }`, named `<NodeFilter$anon@N>`) derives from what it instantiates.
   const supertypesAround = (p: Node): string[] => {
@@ -10145,32 +10185,10 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
   if (RUST_SCOPED_REFS.get(context)?.has(ref)) return true;
   if (!isRustItemVisibleFrom(candidate, ref, context)) return false;
   const name = ref.referenceName;
-  // Bare in the SOURCE: the index keeps `crate::error::Result` by its last
-  // segment, and a path is not a prelude lookup.
-  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
-  // A trait's associated type bound in its arguments — `Iterator<Item = &str>`,
-  // `Readable<Storage = S>` — is that trait's, which no node stands for: never
-  // a module item or an impl's. axum's `Iterator<Item = &str>` went to a
-  // same-file `enum Item`, dioxus's `Storage = UnsyncStorage` to a `Storage` trait.
-  if (ref.referenceKind === 'references' && line !== undefined && isRustAssocBinding(line, ref.column, name)) return false;
-  // A variant path — `Mode::A`, `mode::Mode::B`, a `Mode::C(x)` pattern, or
-  // `Self::A` in an impl, where the reference names the impl's type (#2328) —
-  // reads the enum that declares that variant, and nothing else: ripgrep's
-  // `Match::None` is `ignore`'s enum, not the matcher's `struct Match`. An
-  // associated const or function read the same way (`Limits::MAX`, `Mode::ALL`)
-  // is not a variant, so it references no type.
-  const at = line === undefined ? '' : line.slice(ref.column);
-  const typeRead = ref.referenceKind === 'references' && /^\w+$/.test(name);
-  const viaSelf = typeRead && name !== 'Self' && /^Self\s*::/.test(at);
-  const variant = typeRead && (viaSelf || (at.startsWith(name) && !/^\w/.test(at.slice(name.length))))
-    ? /^\w+\s*::\s*([A-Z]\w*)/.exec(at)?.[1] : undefined;
-  if (variant !== undefined && !declaresRustVariant(candidate, variant, context)) return false;
-  // Written through a path on its line (`jsont::SubMatch { … }`, `io::Result<…>`),
-  // wherever the reference's column points. `Self::A` names the impl's type, not
-  // whatever path the line writes elsewhere.
-  const pathed = line === undefined || viaSelf ? null
-    : (line.startsWith(name, ref.column) && /::\s*$/.test(line.slice(0, ref.column)) ? /((?:[A-Za-z_]\w*\s*::\s*)*)([A-Za-z_]\w*)?\s*::\s*$/.exec(line.slice(0, ref.column))
-      : !new RegExp(`(?<![\\w$:])${escapeRegExp(name)}\\b`).test(line) ? new RegExp(`((?:[A-Za-z_]\\w*\\s*::\\s*)*)([A-Za-z_]\\w*)\\s*::\\s*${escapeRegExp(name)}\\b`).exec(line) : null);
+  const read = rustNameRead(ref, context);
+  const { line, pathed } = read;
+  if (read.assocBinding) return false;
+  if (read.variant !== undefined && !declaresRustVariant(candidate, read.variant, context)) return false;
   if (pathed) {
     // Through a path: `crate::` / `self::` / `super::` look it up relatively;
     // `io::Result` is the `io` module's — tokio's `runtime/task` alias is not —
@@ -10259,8 +10277,8 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
   // `runtime::context::Context`. (A method call `.env(…)` is no imported name.)
   if (uses.external.has(name) && !uses.bound.has(name) && line !== undefined) {
     // Not on its line at all: a later link of a chain written across lines (`Arg::new(…)\n.env(…)`).
-    const at = new RegExp(`(?<![\\w$])${escapeRegExp(name)}\\b`).exec(line.slice(Math.max(0, ref.column)));
-    if (at && !/\.\s*$/.test(line.slice(0, Math.max(0, ref.column) + at.index))) return false;
+    read.writtenBare ??= rustWrittenBare(line, name, ref);
+    if (read.writtenBare) return false;
   }
   if (!RUST_PRELUDE.has(name)) {
     // Another file's item — a type, a function — is in scope only through a
@@ -10272,6 +10290,62 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
     return uses.bound.has(name) || rustGlobScope(name, candidate, uses, ref, context);
   }
   return uses.names.has(name) || rustGlobScope(name, candidate, uses, ref, context);
+}
+
+/** What a reference's own line says of its name, whichever candidate is being asked about. */
+interface RustNameRead {
+  line: string | undefined;
+  assocBinding: boolean;
+  variant: string | undefined;
+  pathed: RegExpExecArray | null;
+  /** From rustWrittenBare, read when a candidate needs it. */
+  writtenBare?: boolean;
+}
+
+/**
+ * The last reference rustNameRead read. One reference is asked about every
+ * candidate of its name, and a common name (`new`, `from`, `len`) has thousands:
+ * reading its line again for each was most of a Rust index's name matching.
+ */
+let lastRustNameRead: { ref: UnresolvedRef; context: ResolutionContext; read: RustNameRead } | null = null;
+
+function rustNameRead(ref: UnresolvedRef, context: ResolutionContext): RustNameRead {
+  if (lastRustNameRead?.ref === ref && lastRustNameRead.context === context) return lastRustNameRead.read;
+  const name = ref.referenceName;
+  // Bare in the SOURCE: the index keeps `crate::error::Result` by its last
+  // segment, and a path is not a prelude lookup.
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  // A trait's associated type bound in its arguments — `Iterator<Item = &str>`,
+  // `Readable<Storage = S>` — is that trait's, which no node stands for: never
+  // a module item or an impl's. axum's `Iterator<Item = &str>` went to a
+  // same-file `enum Item`, dioxus's `Storage = UnsyncStorage` to a `Storage` trait.
+  const assocBinding = ref.referenceKind === 'references' && line !== undefined && isRustAssocBinding(line, ref.column, name);
+  // A variant path — `Mode::A`, `mode::Mode::B`, a `Mode::C(x)` pattern, or
+  // `Self::A` in an impl, where the reference names the impl's type (#2328) —
+  // reads the enum that declares that variant, and nothing else: ripgrep's
+  // `Match::None` is `ignore`'s enum, not the matcher's `struct Match`. An
+  // associated const or function read the same way (`Limits::MAX`, `Mode::ALL`)
+  // is not a variant, so it references no type.
+  const at = line === undefined ? '' : line.slice(ref.column);
+  const typeRead = ref.referenceKind === 'references' && /^\w+$/.test(name);
+  const viaSelf = typeRead && name !== 'Self' && /^Self\s*::/.test(at);
+  const variant = typeRead && (viaSelf || (at.startsWith(name) && !/^\w/.test(at.slice(name.length))))
+    ? /^\w+\s*::\s*([A-Z]\w*)/.exec(at)?.[1] : undefined;
+  // Written through a path on its line (`jsont::SubMatch { … }`, `io::Result<…>`),
+  // wherever the reference's column points. `Self::A` names the impl's type, not
+  // whatever path the line writes elsewhere.
+  const pathed = line === undefined || viaSelf ? null
+    : (line.startsWith(name, ref.column) && /::\s*$/.test(line.slice(0, ref.column)) ? /((?:[A-Za-z_]\w*\s*::\s*)*)([A-Za-z_]\w*)?\s*::\s*$/.exec(line.slice(0, ref.column))
+      : !new RegExp(`(?<![\\w$:])${escapeRegExp(name)}\\b`).test(line) ? new RegExp(`((?:[A-Za-z_]\\w*\\s*::\\s*)*)([A-Za-z_]\\w*)\\s*::\\s*${escapeRegExp(name)}\\b`).exec(line) : null);
+  const read: RustNameRead = { line, assocBinding, variant, pathed };
+  lastRustNameRead = { ref, context, read };
+  return read;
+}
+
+/** Whether a line writes the reference's name at or after its column, other than as a method. */
+function rustWrittenBare(line: string, name: string, ref: UnresolvedRef): boolean {
+  const at = new RegExp(`(?<![\\w$])${escapeRegExp(name)}\\b`).exec(line.slice(Math.max(0, ref.column)));
+  return at !== null && !/\.\s*$/.test(line.slice(0, Math.max(0, ref.column) + at.index));
 }
 
 /** What a bare Rust name a `use` renames may be, by the reference's kind. */
@@ -12818,6 +12892,7 @@ const TYPE_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'f
 /** Per-context memo: `file\0name` → "the file binds this name locally". */
 /** Whether `n` lies outside the function that binds the reference's name itself (see jsFunctionLocalScope). */
 function isOutsideJsLocal(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!JS_FAMILY.has(ref.language)) return false;
   // `const indexName = this.dataSource.namingStrategy.indexName(…)`: a member, whatever the local's name.
   if (ref.referenceKind === 'calls' && bareCallReceiver(ref, context) !== null) return false;
   const scope = jsFunctionLocalScope(ref.referenceName, ref, context);
@@ -12875,11 +12950,46 @@ export function jsCodeBindsName(name: string, fn: Node, filePath: string, line: 
     // A plain declaration. Destructuring re-binds what a call returns under
     // the same name — `const { t } = useI18n()`, `const { getLabel } =
     // useProps(props)` — which is the same-named function more often than not.
-    const declared = new RegExp(`\\b(?:const|let|var)\\s+${n}(?![\\w$])(?!\\s*[,\\]}])`).test(text);
-    binds = declared || jsParameterListPattern(name, '').test(text);
+    const sites = jsNameSites(text, name);
+    const declared = sites.declaration && new RegExp(`\\b(?:const|let|var)\\s+${n}(?![\\w$])(?!\\s*[,\\]}])`).test(text);
+    binds = declared || (sites.parameter && jsParameterListPattern(name, '').test(text));
     memo.set(key, binds);
   }
   return binds;
+}
+
+/** ASCII `s`. Past ASCII, `s` is left to the patterns. */
+const isJsBlank = (code: number): boolean => code === 32 || (code >= 9 && code <= 13);
+
+/** Whether the mention of `name` at `[at, end)` is followed as a parameter's name is: `?`, `:`, `=`, `,` or `)`. */
+function jsParameterMayFollow(text: string, end: number): boolean {
+  let after = end;
+  while (after < text.length && isJsBlank(text.charCodeAt(after))) after++;
+  const next = text.charCodeAt(after);
+  return next >= 128 || next === 63 || next === 58 || next === 61 || next === 44 || next === 41;
+}
+
+/**
+ * Whether any mention of `name` in `text` could be what jsCodeBindsName's two
+ * patterns look for: a declaration's name, a word and blanks before it, or a
+ * parameter's, with `(`, `,`, a blank or a `.` before it. Nearly all of a
+ * function's mentions of a name it doesn't bind are calls and member reads, and
+ * compiling those patterns for each name was most of what asking cost.
+ */
+function jsNameSites(text: string, name: string): { declaration: boolean; parameter: boolean } {
+  if (!JS_BINDING_NAME.test(name)) return { declaration: true, parameter: true };
+  let declaration = false;
+  let parameter = false;
+  for (let at = text.indexOf(name); at >= 0; at = text.indexOf(name, at + 1)) {
+    const end = at + name.length;
+    const before = at === 0 ? 0 : text.charCodeAt(at - 1);
+    if (isJsBlank(before) || before >= 128) declaration = true;
+    if (at === 0 || before >= 128 || before === 40 || before === 44 || before === 46 || isJsBlank(before)) {
+      if (jsParameterMayFollow(text, end)) parameter = true;
+    }
+    if (declaration && parameter) break;
+  }
+  return { declaration, parameter };
 }
 
 /**
@@ -13260,6 +13370,7 @@ function bindsAtSites(source: string, name: string, sites: LocalBindingSites): b
   }
   let tried = -1;
   for (let at = source.indexOf(name); at !== -1; at = source.indexOf(name, at + 1)) {
+    if (!jsParameterMayFollow(source, at + name.length)) continue;
     const open = enclosingOpenParen(source, at);
     if (open < 0 || open === tried) continue;
     tried = open;
@@ -13639,6 +13750,7 @@ export function matchByExactName(
   // Every candidate uses the same binding key. Keep this check lazy.
   let locallyBoundJsName: boolean | undefined;
   const tsBareTypeName = (): boolean => (bareTypeName ??= isTsBareTypeName(ref, context));
+  const ambientDeclarations = ambientModuleDeclarations(context);
   const sameName = outOfRepoCall
     ? innerScopeShadows(context.getNodesByName(ref.referenceName), ref, context)
     : context.getNodesByName(ref.referenceName);
@@ -13748,6 +13860,10 @@ export function matchByExactName(
     // its own or a global, never another module's — ahead of the ranking, so
     // a global `interface Window` in a `declare global` still wins.
     !(n.filePath !== ref.filePath && tsBareTypeName() && !isTsTypeInScope(n, ref, context)) &&
+    // Nor is a `declare module` block a file can't see any candidate, ahead of
+    // the ranking, where the gate on the winner would drop the reference: a
+    // sibling's test stub's `createRef` is no rival to `packages/react`'s own.
+    !(ambientDeclarations.has(n.id) && !declaringFileAnswers(n.filePath, ref.filePath, context)) &&
     // Likewise for `imports`: a member that only exists inside a type is not
     // importable, so it is not a candidate. Without this a `path`/`id`/`url`
     // import resolved to some interface's same-named property.
@@ -15255,9 +15371,9 @@ function cppTypeBeganAbove(typeName: string): boolean {
  * arguments pair their brackets. (`this->blob_reqs` and `in >> blob_reqs`
  * declare nothing.)
  */
-function cppEndsDeclarationBegunAbove(line: string, escapedReceiver: string): boolean {
-  const end = new RegExp(String.raw`(?:^|[^\w:])([A-Za-z_][\w:]*\s*<[^;=(){}]+>)(?:\s*(?:const\b|volatile\b|[*&]+))*\s*${escapedReceiver}\b`).exec(line);
-  return end !== null && cppTypeBeganAbove(end[1]!);
+function cppEndsDeclarationBegunAbove(line: string, receiverName: string): boolean {
+  const end = line.includes('>') ? CPP_ENDS_DECLARATION_OF.exec(`${receiverName}\0${line}`) : null;
+  return end !== null && cppTypeBeganAbove(end[2]!);
 }
 
 /**
@@ -15278,17 +15394,16 @@ function cppDeclarationBegunAbove(
   lines: readonly string[],
   index: number,
   line: string,
-  receiverPattern: RegExp,
-  declaratorRegex: RegExp,
+  receiverName: string,
   rawLines: ReturnType<typeof cppNonCodeLines>,
 ): string | null {
-  const at = line.search(receiverPattern);
+  const at = cppNameAt(line, receiverName);
   if (at < 0 || index === 0) return null;
   const codeAt = (j: number): string => cppCodeOf(cppLiteralsBlanked(lines[j]!, j + 1, rawLines)) ?? '';
   const head = line.slice(0, at);
   if (/^\s*[*&]*\s*$/.test(head)) {
     const above = codeAt(index - 1);
-    return CPP_TYPE_LINE.test(above) ? matchCppDeclarator(`${above} ${line}`, declaratorRegex)?.[1] ?? null : null;
+    return CPP_TYPE_LINE.test(above) ? matchCppDeclarator(`${above} ${line}`, receiverName)?.[1] ?? null : null;
   }
   // (Only such a line can need the lines above: every other line naming the
   // receiver is spared joining them.)
@@ -15299,7 +15414,7 @@ function cppDeclarationBegunAbove(
     const above = codeAt(j);
     text = `${above} ${text}`;
     before = `${above} ${before}`;
-    if (!cppTypeBeganAbove(before)) return matchCppDeclarator(text, declaratorRegex)?.[1] ?? null;
+    if (!cppTypeBeganAbove(before)) return matchCppDeclarator(text, receiverName)?.[1] ?? null;
   }
   return null;
 }
@@ -15384,16 +15499,82 @@ function buildDeclaratorRegex(escapedReceiver: string): RegExp {
   );
 }
 
-/** buildDeclaratorRegex's `regex` run on the code `line`, with its type as cppDeclaratorType gives it. */
-function matchCppDeclarator(line: string, regex: RegExp): RegExpExecArray | null {
-  const m = regex.exec(line);
-  if (m?.[1] !== undefined) m[1] = cppDeclaratorType(m[1]);
-  return m;
+/*
+ * The patterns below read one name on a line, given `name\0line`: `\1` is the
+ * name, `[\s\S]*?` tries each start in turn as an unanchored search does, and
+ * each thread compiles a pattern once. Building them per name, with the name
+ * written in, meant compiling one for every receiver in every file, which was
+ * the largest part of resolving C++ calls.
+ */
+/** buildDeclaratorRegex's match: its start is group 2's length, its text group 3, its type group 4. */
+const CPP_DECLARATOR_OF = new RegExp(String.raw`^([^\0]*)\0([\s\S]*?)((${CPP_DECLARATOR_TYPE})\s*\b\1\b(?:\s*${CPP_TRAILING_ANNOTATION})*\s*)(?=[;=,)\[{(]|$)`);
+/** A range-`for` variable: `for (const Foo& x : xs)`. */
+const CPP_RANGE_FOR_OF = new RegExp(String.raw`^([^\0]*)\0[\s\S]*?\bfor\s*\(.*\b\1\s*:(?!:)`);
+/** A structured binding: `auto [x, y] = …`. */
+const CPP_BINDING_OF = new RegExp(String.raw`^([^\0]*)\0[\s\S]*?\bauto\s*&{0,2}\s*\[[^\]]*\b\1\b[^\]]*\]`);
+/** The end of a declaration begun on an earlier line (cppEndsDeclarationBegunAbove): the type is group 2. */
+const CPP_ENDS_DECLARATION_OF = new RegExp(String.raw`^([^\0]*)\0[\s\S]*?(?:(?<=\0)|[^\w:])([A-Za-z_][\w:]*\s*<[^;=(){}]+>)(?:\s*(?:const\b|volatile\b|[*&]+))*\s*\1\b`);
+
+const isAsciiSpace = (code: number): boolean => code === 32 || (code >= 9 && code <= 13);
+const isWordCode = (code: number): boolean =>
+  (code >= 97 && code <= 122) || (code >= 65 && code <= 90) || (code >= 48 && code <= 57) || code === 95;
+
+/** Where `\bname\b` first matches in `text`, or -1. */
+function cppNameAt(text: string, name: string): number {
+  if (!isWordCode(name.charCodeAt(0)) || !isWordCode(name.charCodeAt(name.length - 1))) {
+    return text.search(new RegExp(`\\b${escapeRegExp(name)}\\b`));
+  }
+  for (let at = text.indexOf(name); at >= 0; at = text.indexOf(name, at + 1)) {
+    if (!isWordCode(text.charCodeAt(at - 1)) && !isWordCode(text.charCodeAt(at + name.length))) return at;
+  }
+  return -1;
+}
+
+/** May a declarator of the name at [start, end) of `line` end there, by the characters around it? */
+function cppDeclaratorMayEndAt(line: string, start: number, end: number): boolean {
+  let before = start - 1;
+  while (before >= 0 && isAsciiSpace(line.charCodeAt(before))) before--;
+  // A type comes first: a word, or the `:`, `>`, `*` or `&` it can end with.
+  if (before < 0) return false;
+  const last = line.charCodeAt(before);
+  if (isWordCode(last) ? before === start - 1 : last < 128 && last !== 58 && last !== 62 && last !== 42 && last !== 38) return false;
+  if (isWordCode(line.charCodeAt(end))) return false;
+  let after = end;
+  while (after < line.length && isAsciiSpace(line.charCodeAt(after))) after++;
+  if (after >= line.length) return true;
+  // Then `;`, `=`, `,`, `)`, `[`, `{`, `(`, or an annotation macro's capital. (`\s` is more than
+  // ASCII: past it, leave the answer to the pattern.)
+  const next = line.charCodeAt(after);
+  return next >= 128 || (next >= 65 && next <= 90) || next === 59 || next === 61 || next === 44 || next === 41 || next === 91 || next === 123 || next === 40;
+}
+
+/**
+ * Whether the declarator pattern can't match `name` on `line`. Most lines that
+ * name a receiver only use it (`iter->Next()`, `Seek(key)`), and the pattern,
+ * the slowest step of reading a line, has a type to try at each position.
+ */
+function cppDeclaresNoName(line: string, name: string): boolean {
+  if (!isWordCode(name.charCodeAt(0)) || !isWordCode(name.charCodeAt(name.length - 1))) return false;
+  for (let at = line.indexOf(name); at >= 0; at = line.indexOf(name, at + 1)) {
+    if (cppDeclaratorMayEndAt(line, at, at + name.length)) return false;
+  }
+  return true;
+}
+
+/** The declarator of `name` on the code `line`, its type as written. */
+function cppDeclaratorExec(line: string, name: string): RegExpExecArray | null {
+  return cppDeclaresNoName(line, name) ? null : CPP_DECLARATOR_OF.exec(`${name}\0${line}`);
+}
+
+/** What buildDeclaratorRegex's pattern finds on the code `line`, with its type as cppDeclaratorType gives it. */
+function matchCppDeclarator(line: string, name: string): RegExpExecArray | null {
+  const m = cppDeclaratorExec(line, name);
+  return m && Object.assign([m[3]!, cppDeclaratorType(m[4]!)], { index: m[2]!.length, input: line }) as unknown as RegExpExecArray;
 }
 
 /** matchCppDeclarator's first match in `line` from `from` on. */
-function matchCppDeclaratorFrom(line: string, regex: RegExp, from: number): RegExpExecArray | null {
-  const global = new RegExp(regex.source, 'g');
+function matchCppDeclaratorFrom(line: string, name: string, from: number): RegExpExecArray | null {
+  const global = new RegExp(buildDeclaratorRegex(escapeRegExp(name)).source, 'g');
   global.lastIndex = from;
   const m = global.exec(line);
   if (m?.[1] !== undefined) m[1] = cppDeclaratorType(m[1]);
@@ -15445,9 +15626,7 @@ function cppDeclaratorType(text: string): string {
 // `ByteBuffer symbols_found, strings_found;`, `Foo *a, *const b;`. The
 // declarator regex wants the type right before the name, and a list writes
 // it once, before the first name; matchCppListedDeclarator reads the others.
-function buildListedDeclaratorRegex(escapedReceiver: string): RegExp {
-  return new RegExp(String.raw`,(?:\s|[*&]|${CPP_DECLARATOR_CV}|${CPP_DECLARATOR_ANNOTATION})*\b${escapedReceiver}\b`);
-}
+const CPP_LISTED_DECLARATOR_OF = new RegExp(String.raw`^([^\0]*)\0[\s\S]*?,(?:\s|[*&]|${CPP_DECLARATOR_CV}|${CPP_DECLARATOR_ANNOTATION})*\b\1\b`);
 
 // Words a C++ declaration may open with before its type.
 const CPP_DECL_SPECIFIERS: ReadonlySet<string> = new Set([
@@ -15664,8 +15843,8 @@ function cppDeclaratorsAfterFirst(code: string, start: number, inHeader: boolean
  * lists no name. A declaration opens the line, follows a statement or a
  * brace, or opens a `for`, `if` or `switch` header.
  */
-function matchCppListedDeclarator(line: string, receiverName: string, listedRegex: RegExp): RegExpExecArray | null {
-  return listedRegex.test(line) ? cppListedDeclaratorOn(line, receiverName) : null;
+function matchCppListedDeclarator(line: string, receiverName: string): RegExpExecArray | null {
+  return line.includes(',') && CPP_LISTED_DECLARATOR_OF.test(`${receiverName}\0${line}`) ? cppListedDeclaratorOn(line, receiverName) : null;
 }
 
 /** matchCppListedDeclarator without its prefilter, for a line already known to name the receiver after a comma. */
@@ -16054,19 +16233,15 @@ function cppDataMemberIn(decl: Node, name: string, context: ResolutionContext): 
   let member: CppWrittenType | null = null;
   const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/);
   if (lines) {
-    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const word = new RegExp(`\\b${escaped}\\b`);
-    const declarator = buildDeclaratorRegex(escaped);
-    const listed = buildListedDeclaratorRegex(escaped);
     // `Table *index_, *data_;` declares both members.
     const declared = (text: string): RegExpExecArray | null =>
-      matchCppDeclarator(text, declarator) ?? matchCppListedDeclarator(text, name, listed);
+      matchCppDeclarator(text, name) ?? matchCppListedDeclarator(text, name);
     const end = Math.min(decl.endLine ?? decl.startLine, lines.length);
     const nested = cppNestedSpans(decl, end, context);
     const rawLines = cppNonCodeLines(decl.filePath, context);
     const depths = cppClassParenDepths(decl, lines, end, rawLines, context);
     for (let l = decl.startLine; l <= end; l++) {
-      if (!word.test(lines[l - 1]!) || nested.some(([start, stop]) => l >= start && l <= stop)) continue;
+      if (cppNameAt(lines[l - 1]!, name) < 0 || nested.some(([start, stop]) => l >= start && l <= stop)) continue;
       let code = cppCodeOf(cppLiteralsBlanked(lines[l - 1]!, l, rawLines));
       // The line the declaration's code starts on: the one above, for a type
       // written there and nothing else (rocksdb's
@@ -18428,24 +18603,20 @@ function isCppLocalName(name: string, caller: Node, ref: UnresolvedRef, context:
   if (caller.filePath !== ref.filePath || CPP_CLASS_KINDS.has(caller.kind)) return false;
   const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
   if (!lines) return false;
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const word = new RegExp(`\\b${escaped}\\b`);
-  const declarator = buildDeclaratorRegex(escaped);
-  const listed = buildListedDeclaratorRegex(escaped);
   const nonCode = cppNonCodeLines(caller.filePath, context);
   for (let i = Math.max(0, caller.startLine - 1); i < Math.min(lines.length, ref.line); i++) {
-    if (!word.test(lines[i]!)) continue;
+    if (cppNameAt(lines[i]!, name) < 0) continue;
     const code = cppCodeOf(cppLiteralsBlanked(lines[i]!, i + 1, nonCode));
-    if (!code || !word.test(code)) continue;
-    if (cppRebindsReceiver(code, escaped)) return true;
+    if (!code || cppNameAt(code, name) < 0) continue;
+    if (cppRebindsReceiver(code, name)) return true;
     // `std::function<void()> done;` reads as a declaration once its template arguments are gone.
     for (const variant of [code, stripCppTemplateArguments(code)]) {
-      const type = declarator.exec(variant)?.[1];
+      const type = cppDeclaratorExec(variant, name)?.[4];
       // `Owner::name(` is a definition's own declarator; `return name(` no declaration.
       if (type !== undefined && !/::\s*$/.test(type) && normalizeCppTypeName(type) !== null) return true;
     }
     // `std::function<void()> done, failed;` declares `failed` too.
-    const listedType = matchCppListedDeclarator(code, name, listed)?.[1];
+    const listedType = matchCppListedDeclarator(code, name)?.[1];
     if (listedType !== undefined && normalizeCppTypeName(listedType) !== null) return true;
   }
   return false;
@@ -18698,6 +18869,7 @@ function isCppLocalCallableCall(ref: UnresolvedRef, context: ResolutionContext):
  * is not.
  */
 function cppCodeOf(line: string): string | null {
+  if (!line.includes('/')) return line;
   if (/^\s*\/\//.test(line)) return null;
   let code = line.replace(/\/\*.*?\*\//g, (c) => ' '.repeat(c.length));
   // A block comment opening here runs past the line.
@@ -18712,9 +18884,9 @@ function cppCodeOf(line: string): string | null {
  * read: a range-`for` variable (`for (const Foo& x : xs)`) or a structured
  * binding (`auto [x, y] = …`)?
  */
-function cppRebindsReceiver(line: string, escapedReceiver: string): boolean {
-  return new RegExp(String.raw`\bfor\s*\(.*\b${escapedReceiver}\s*:(?!:)`).test(line) ||
-    new RegExp(String.raw`\bauto\s*&{0,2}\s*\[[^\]]*\b${escapedReceiver}\b[^\]]*\]`).test(line);
+function cppRebindsReceiver(line: string, receiverName: string): boolean {
+  return (line.includes('for') && CPP_RANGE_FOR_OF.test(`${receiverName}\0${line}`)) ||
+    (line.includes('auto') && CPP_BINDING_OF.test(`${receiverName}\0${line}`));
 }
 
 /** Record the C++ declaration receiver inference settles on, with the array dimensions its declarator gives it. */
@@ -18874,10 +19046,6 @@ function inferCppReceiverType(
   if (!lines || lines.length === 0) return null;
 
   const callLineIndex = Math.max(0, Math.min(lines.length - 1, ref.line - 1));
-  const escapedReceiver = receiverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const receiverPattern = new RegExp(`\\b${escapedReceiver}\\b`);
-  const declaratorRegex = buildDeclaratorRegex(escapedReceiver);
-  const listedRegex = buildListedDeclaratorRegex(escapedReceiver);
   // A declaration in a string literal is text: protobuf's upb generator
   // writes `upb_MiniTableField field = $field_init$;` in the raw string it
   // emits, above calls on its own `upb::FieldDefPtr field` parameter.
@@ -18895,16 +19063,16 @@ function inferCppReceiverType(
       if (member !== undefined) return member;
     }
     const text = lines[i];
-    if (!text || !receiverPattern.test(text)) continue;
+    if (!text || cppNameAt(text, receiverName) < 0) continue;
     const line = cppCodeOf(cppLiteralsBlanked(text, i + 1, rawLines));
-    if (!line || !receiverPattern.test(line)) continue;
+    if (!line || cppNameAt(line, receiverName) < 0) continue;
 
-    let declaratorMatch = matchCppDeclarator(line, declaratorRegex) ?? matchCppListedDeclarator(line, receiverName, listedRegex);
+    let declaratorMatch = matchCppDeclarator(line, receiverName) ?? matchCppListedDeclarator(line, receiverName);
     // A parameter named like the function it belongs to is declared after
     // the function's own name on its head: protobuf's `std::string
     // u64(uint64_t u64) {` gives `u64` a `uint64_t`, not a `std::string`.
     if (declaratorMatch && memberCaller?.name === receiverName && line[declaratorMatch.index + declaratorMatch[0].length] === '(') {
-      declaratorMatch = matchCppDeclaratorFrom(line, declaratorRegex, declaratorMatch.index + declaratorMatch[0].length) ?? declaratorMatch;
+      declaratorMatch = matchCppDeclaratorFrom(line, receiverName, declaratorMatch.index + declaratorMatch[0].length) ?? declaratorMatch;
     }
     if (declaratorMatch) {
       const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
@@ -18963,7 +19131,7 @@ function inferCppReceiverType(
         }
       }
       // A declaration begun on an earlier line, read with the lines it began on.
-      const begun = cppDeclarationBegunAbove(lines, i, line, receiverPattern, declaratorRegex, rawLines);
+      const begun = cppDeclarationBegunAbove(lines, i, line, receiverName, rawLines);
       const begunType = begun && normalizeCppTypeName(begun);
       if (begun && begunType && begunType !== 'auto') {
         const inCallerScope = isCppCallersDeclaration(ref.filePath, i + 1, ref, context);
@@ -18972,7 +19140,7 @@ function inferCppReceiverType(
       }
       // One those lines don't make readable is still maybe the receiver's:
       // one found further up may be another variable.
-      if (cppEndsDeclarationBegunAbove(line, escapedReceiver)) found.shadowed = true;
+      if (cppEndsDeclarationBegunAbove(line, receiverName)) found.shadowed = true;
       // `for (auto& [cfh, iter] : cfh_iter_pairs_)`, `auto [status, iter] = Open();`.
       const bound = !found.shadowed ? cppStructuredBindingType(line, lines, i, receiverName, callLineIndex, ref, context, rawLines) : null;
       const boundType = bound && normalizeCppTypeName(bound.text);
@@ -18981,7 +19149,7 @@ function inferCppReceiverType(
         found.declared = bound;
         return cppDeclaredType(bound.text, boundType, true, ref, context, found);
       }
-      if (cppRebindsReceiver(line, escapedReceiver)) found.shadowed = true;
+      if (cppRebindsReceiver(line, receiverName)) found.shadowed = true;
     }
   }
   // (A function that starts on the file's first line.)
@@ -19006,10 +19174,10 @@ function inferCppReceiverType(
 
     for (let i = 0; i < headerLines.length; i++) {
       const text = headerLines[i]!;
-      if (!receiverPattern.test(text)) continue;
+      if (cppNameAt(text, receiverName) < 0) continue;
       const line = cppCodeOf(cppLiteralsBlanked(text, i + 1, headerRawLines));
       if (!line) continue;
-      const declaratorMatch = matchCppDeclarator(line, declaratorRegex) ?? matchCppListedDeclarator(line, receiverName, listedRegex);
+      const declaratorMatch = matchCppDeclarator(line, receiverName) ?? matchCppListedDeclarator(line, receiverName);
       if (!declaratorMatch) continue;
       const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
       if (normalized && normalized !== 'auto') {
@@ -21129,6 +21297,8 @@ function getInferScanStates(context: ResolutionContext): Map<string, InferScanSt
 
 /** Drop the per-context scan states (see ReferenceResolver.clearCaches). */
 export function clearNameMatcherMemos(context: ResolutionContext): void {
+  lastRustNameRead = null;
+  lastJavaNameRead = null;
   INFER_SCAN_STATES.delete(context);
   PYTHON_MEMBER_LINES.delete(context);
   PYTHON_STATEMENT_STARTS.delete(context);
@@ -21219,6 +21389,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   DECLARED_SUPERS.delete(context);
   JAVA_FILE_ANCESTORS.delete(context);
   INHERITED_METHODS.delete(context);
+  FILE_METHODS.delete(context);
   MEMBER_SHADOWS.delete(context);
   MEMBER_WALKS.delete(context);
   MEMBER_LINES.delete(context);
@@ -21328,6 +21499,17 @@ const TS_ANNOTATED_TYPE = '([A-Z][\\w.$]*(?:(?:\\s*<[^;=(){}<>]*(?:<[^;=(){}<>]*
 
 export function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
   return memoPatterns(`${language}|${r}`, () => buildLocalReceiverTypePatterns(language, r));
+}
+
+/**
+ * Patterns for any receiver, as built with `build`: each reads `name\0line`,
+ * `\1` standing for the name, and the type is group 2 (see CPP_DECLARATOR_OF).
+ * inferLocalReceiverType runs for every `receiver.method()` reference, and
+ * compiling three or four patterns per name, per thread, was most of its cost.
+ */
+function anyReceiverPatterns(key: string, build: (r: string) => RegExp[]): RegExp[] {
+  return memoPatterns(`any|${key}`, () => build('\\1').map((p) =>
+    new RegExp(`^([^\\0]*)\\0[\\s\\S]*?${p.source.split('(?:^|').join('(?:(?<=\\0)|')}`, p.flags)));
 }
 
 function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[] {
@@ -21780,6 +21962,25 @@ function inheritedClassMethod(classes: Node[], name: string, context: Resolution
   return found;
 }
 
+const FILE_METHODS = new WeakMap<ResolutionContext, Map<string, Map<string, Node[]>>>();
+
+/** A file's methods named `name`. The walk up a class's supertypes asks this of each one, for each method name. */
+function fileMethodsNamed(file: string, name: string, context: ResolutionContext): Node[] {
+  let files = FILE_METHODS.get(context);
+  if (!files) FILE_METHODS.set(context, (files = new Map()));
+  let methods = files.get(file);
+  if (!methods) {
+    files.set(file, (methods = new Map()));
+    for (const n of context.getNodesInFile(file)) {
+      if (n.kind !== 'method') continue;
+      const named = methods.get(n.name);
+      if (named) named.push(n);
+      else methods.set(n.name, [n]);
+    }
+  }
+  return methods.get(name) ?? [];
+}
+
 function findInheritedClassMethod(classes: Node[], name: string, context: ResolutionContext, kind?: RubyMethodKind): Node | null {
   const seen = new Set<string>(classes.map((c) => c.id));
   let frontier = classes;
@@ -21791,7 +21992,7 @@ function findInheritedClassMethod(classes: Node[], name: string, context: Resolu
           if (decl.language !== cls.language || !isMethodOwnerKind(decl) || seen.has(decl.id)) continue;
           if (cls.language === 'python' && isPythonBaseFromOutside(cls, sup, decl, context)) continue;
           seen.add(decl.id);
-          const method = rubyMethodsOfKindFirst(context.getNodesInFile(decl.filePath).filter((n) => n.kind === 'method' && n.name === name &&
+          const method = rubyMethodsOfKindFirst(fileMethodsNamed(decl.filePath, name, context).filter((n) =>
             n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop() === decl.name), kind)[0];
           if (method) return method;
           next.push(decl);
@@ -22137,8 +22338,8 @@ export function inferLocalReceiverType(
 
   const escapedReceiver = scanReceiver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const patterns = phpProperty
-    ? phpPropertyTypePatterns(escapedReceiver)
-    : localReceiverTypePatterns(ref.language, escapedReceiver);
+    ? anyReceiverPatterns('php-prop', buildPhpPropertyTypePatterns)
+    : anyReceiverPatterns(ref.language, (r) => buildLocalReceiverTypePatterns(ref.language, r));
   if (patterns.length === 0) return null;
 
   // Split through the context's per-file lines cache when available: this runs
@@ -22161,28 +22362,35 @@ export function inferLocalReceiverType(
     ? Math.max(startIdx, pascalRoutineHeaderIndex(ref.filePath, lines, callIdx, context))
     : -1;
   const withListed = ownFrom >= 0
-    ? memoPatterns(`pascal-listed|${escapedReceiver}`, () =>
-      [...patterns, new RegExp(`\\b${escapedReceiver}\\b(?:\\s*,\\s*[A-Za-z_]\\w*)+\\s*:\\s*([A-Z][\\w]*)`)])
+    ? anyReceiverPatterns('pascal-listed', (r) => [...buildLocalReceiverTypePatterns('pascal', r), new RegExp(`\\b${r}\\b(?:\\s*,\\s*[A-Za-z_]\\w*)+\\s*:\\s*([A-Z][\\w]*)`)])
     : patterns;
 
+  // Each pattern writes the receiver out, so a line that doesn't holds no match
+  // (a case-insensitive pattern, CFML's, may spell it otherwise). As a whole
+  // word, for a short name that's in most lines: only PHP's `$?lg = new …`
+  // leaves the start of the name open.
+  const needsReceiver = patterns.every((p) => !p.ignoreCase);
+  const wholeWord = !phpProperty && ref.language !== 'php' && isWordCode(scanReceiver.charCodeAt(0)) && isWordCode(scanReceiver.charCodeAt(scanReceiver.length - 1));
   // The raw capture behind matchLine's latest non-null answer (see `decl`).
   let lastRaw: string | undefined;
   const matchLine = (i: number): string | null => {
     const line = lines[i];
     if (!line || nestedElsewhere?.(i)) return null;
+    if (needsReceiver && (wholeWord ? cppNameAt(line, scanReceiver) < 0 : !line.includes(scanReceiver))) return null;
     // A generated/minified line (one multi-KB statement) is not something a
     // human-written local declaration lives on, and regexing it per ref is
     // pure waste — skip it rather than scan it.
     if (line.length > 10_000) return null;
+    const input = `${scanReceiver}\0${line}`;
     for (const re of i >= ownFrom ? withListed : patterns) {
-      const m = line.match(re);
-      if (m && m[1]) {
-        let type = ref.language === 'java' ? javaTypeName(m[1]) : normalizeInferredTypeName(m[1]);
+      const m = re.exec(input);
+      if (m && m[2]) {
+        let type = ref.language === 'java' ? javaTypeName(m[2]) : normalizeInferredTypeName(m[2]);
         // Delphi dereferences a pointer for a member (`P.Method` is
         // `P^.Method`), and a class reference reaches its class's methods.
         if (type && ref.language === 'pascal') type = pascalPointee(type, context) ?? type;
         if (type) {
-          lastRaw = m[1];
+          lastRaw = m[2];
           return type;
         }
       }
@@ -22831,9 +23039,6 @@ function jsReceiverBindingReading(receiver: string, ref: UnresolvedRef, context:
  * silent beats wrong. The classic untyped-property-assigned-in-constructor
  * shape is handled by inferPhpAssignedPropertyType instead.
  */
-function phpPropertyTypePatterns(r: string): RegExp[] {
-  return memoPatterns(`php-prop|${r}`, () => buildPhpPropertyTypePatterns(r));
-}
 
 function buildPhpPropertyTypePatterns(r: string): RegExp[] {
   return [

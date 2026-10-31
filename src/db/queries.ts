@@ -1591,6 +1591,20 @@ export class QueryBuilder {
   }
 
   /**
+   * The `signature` of each top-level node of these kinds and languages whose
+   * text holds one of `names`. A sync asks this about the definitions it changed,
+   * so no node is built and nothing is sorted; `names` is the caller's to keep short.
+   */
+  getTopLevelSignaturesMentioning(kinds: readonly NodeKind[], languages: readonly string[], names: readonly string[]): string[] {
+    const marks = (n: number): string => new Array(n).fill('?').join(', ');
+    const rows = this.db.prepare(
+      `SELECT signature FROM nodes WHERE kind IN (${marks(kinds.length)}) AND language IN (${marks(languages.length)})
+       AND qualified_name = name AND (${names.map(() => 'instr(signature, ?) > 0').join(' OR ')})`
+    ).all(...kinds, ...languages, ...names) as Array<{ signature: string }>;
+    return rows.map((row) => row.signature);
+  }
+
+  /**
    * Get all nodes in the database
    */
   getAllNodes(): Node[] {
@@ -3817,6 +3831,31 @@ export class QueryBuilder {
       .all(`${dir}/`, `${dir}0`) as Array<
         EdgeRow & { target_file_path: string; source_file_path: string; source_language: Language }
       >;
+    return rows.map((row) => ({
+      ...rowToEdge(row),
+      edgeId: row.id,
+      targetFilePath: row.target_file_path,
+      sourceFilePath: row.source_file_path,
+      sourceLanguage: row.source_language,
+    }));
+  }
+
+  /**
+   * The module edges (`imports` edges into a file node) into declaration
+   * files, with the source file and language a resurrection needs: where an
+   * import of a package lands while a `declare module` of it is all there is.
+   */
+  getModuleImportsIntoDeclarationFiles(): Array<Edge & { edgeId: number; targetFilePath: string; sourceFilePath: string; sourceLanguage: Language }> {
+    const rows = this.db
+      .prepare(
+        `SELECT e.*, tgt.file_path AS target_file_path, src.file_path AS source_file_path, src.language AS source_language
+           FROM nodes tgt
+           JOIN edges e ON e.target = tgt.id AND e.kind = 'imports'
+           JOIN nodes src ON src.id = e.source
+          WHERE tgt.kind = 'file'
+            AND (tgt.file_path LIKE '%.d.ts' OR tgt.file_path LIKE '%.d.mts' OR tgt.file_path LIKE '%.d.cts')`
+      )
+      .all() as Array<EdgeRow & { target_file_path: string; source_file_path: string; source_language: Language }>;
     return rows.map((row) => ({
       ...rowToEdge(row),
       edgeId: row.id,
