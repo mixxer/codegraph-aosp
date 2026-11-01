@@ -2803,13 +2803,13 @@ export class ToolHandler {
    * Evicts over the LRU bound, on close, and once idle past the timeout
    * (#2087). The cache is in last-use order, so idle entries lead it.
    */
-  private trimProjects(): void {
+  private trimProjects(maxOpen = MAX_CACHED_PROJECTS): void {
     if (this.activeCalls > 0 && (this.closing || this.activeProjectRoots.size === 0)) return;
     const idleMs = resolveProjectIdleTimeoutMs();
     const now = Date.now();
     for (const [root, cg] of this.projectCache) {
       const idle = idleMs > 0 && now - (this.projectUsedAt.get(root) ?? now) >= idleMs;
-      if (!this.closing && this.projectCache.size <= MAX_CACHED_PROJECTS && !idle) break;
+      if (!this.closing && this.projectCache.size <= maxOpen && !idle) break;
       if (this.projectGates.has(cg) || [...this.activeProjectRoots.keys()].some(active => isSameIndexRoot(root, active))) continue;
       this.projectCache.delete(root);
       this.projectUsedAt.delete(root);
@@ -2874,6 +2874,22 @@ export class ToolHandler {
       // the (still stale) handle keeps serving and the next call retries.
     }
     return cg;
+  }
+
+  /**
+   * A query worker kept through a quiet spell gives back what it can without
+   * going cold: every project but the last one used closes, and what stays
+   * open lets go of the memory it holds only to read faster. The heap needs
+   * nothing from here: V8 shrinks an idle thread's by itself, well before the
+   * pool's idle delay is up.
+   */
+  releaseIdleMemory(): void {
+    this.trimProjects(1);
+    for (const cg of [this.cg, ...this.projectCache.values()]) {
+      try {
+        cg?.releaseMemory();
+      } catch { /* one that can't let go still answers, and the others still can */ }
+    }
   }
 
   /**
@@ -5465,7 +5481,7 @@ export class ToolHandler {
     // names, says who holds what, not where the code goes: rocksdb's classes
     // reach everything through them, and they would pull a flow's rank and its
     // file budget away from the code on the flow.
-    const isCFamily = (node: Node | undefined): boolean => node?.language === 'c' || node?.language === 'cpp';
+    const isCFamily = (node: Node | undefined): boolean => node?.language === 'c' || node?.language === 'cpp' || node?.language === 'objc';
     const isCMemberTypeEdge = (edge: Edge): boolean =>
       edge.kind === 'references' && isTypeDeclaration(edge.source) && isCFamily(subgraph.nodes.get(edge.source));
     const connectedToEntry = new Set<string>();

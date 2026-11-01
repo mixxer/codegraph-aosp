@@ -731,7 +731,7 @@ const CPP_COMMENT_OR_LITERAL_RE =
  * still lines up with the source.
  */
 function maskCppCommentsAndLiterals(source: string): string {
-  return source.replace(CPP_COMMENT_OR_LITERAL_RE, (m) => m.replace(/[^\r\n]/g, ' '));
+  return source.replace(CPP_COMMENT_OR_LITERAL_RE, (m) => (m.includes('\n') || m.includes('\r') ? m.replace(/[^\r\n]/g, ' ') : ' '.repeat(m.length)));
 }
 
 /**
@@ -774,14 +774,18 @@ function pushCppRunTokens(spans: Array<[number, number]>, run: string, start: nu
  */
 function blankCppSpans(source: string, spans: ReadonlyArray<readonly [number, number]>, code?: string): string {
   if (spans.length === 0) return source;
+  const ordered = [...spans].sort((a, b) => a[0] - b[0]);
   const blank = (text: string): string => {
-    const chars = text.split('');
-    for (const [start, end] of spans) {
-      for (let k = start; k < end; k++) {
-        if (chars[k] !== '\n' && chars[k] !== '\r') chars[k] = ' ';
-      }
+    let out = '';
+    let at = 0;
+    for (const [start, end] of ordered) {
+      const from = Math.max(start, at);
+      if (from >= end) continue;
+      const span = text.slice(from, end);
+      out += text.slice(at, from) + (span.includes('\n') || span.includes('\r') ? span.replace(/[^\r\n]/g, ' ') : ' '.repeat(span.length));
+      at = end;
     }
-    return chars.join('');
+    return out + text.slice(at);
   };
   const out = blank(source);
   if (code !== undefined) cppMaskMemo = { source: out, code: blank(code) };
@@ -1308,7 +1312,7 @@ export function blankCppAnnotationMacroCalls(source: string, options: { keepCRet
   if (!/^[ \t]*[A-Z][A-Z0-9_]{2,}\s*\(/m.test(source)) return source;
   const rawStrings = maskCppRawStrings(source);
   source = rawStrings.source;
-  const chars = source.split('');
+  let chars: string[] | null = null;
   const re = /^([ \t]*)([A-Z][A-Z0-9_]{2,})(\s*)\(/gm;
   let m: RegExpExecArray | null;
   while ((m = re.exec(source)) !== null) {
@@ -1342,12 +1346,13 @@ export function blankCppAnnotationMacroCalls(source: string, options: { keepCRet
     // (`;`), init-list item (`,`/`{`), or expression fragment (operator) is not.
     if (!after || !/[A-Za-z_~#]/.test(after)) continue;
     if (options.keepCReturnTypes && macroStart === m.index && isCReturnTypeMacro(source, m.index, open, end, j)) continue;
+    chars ??= source.split('');
     for (let k = macroStart; k < end; k++) {
       if (chars[k] !== '\n' && chars[k] !== '\r') chars[k] = ' ';
     }
     re.lastIndex = end;
   }
-  return rawStrings.restore(chars.join(''));
+  return rawStrings.restore(chars ? chars.join('') : source);
 }
 
 /** A macro argument that reads as a C type: `char *`, `const cJSON *`, `unsigned long`, `git_repository *`. */
@@ -1574,7 +1579,7 @@ export function blankCppInlineAnnotationMacros(source: string): string {
   if (!/\b(?:UMETA|UPARAM|UE_DEPRECATED)/.test(source)) return source;
   const rawStrings = maskCppRawStrings(source);
   source = rawStrings.source;
-  const chars = source.split('');
+  let chars: string[] | null = null;
   const re = new RegExp(CPP_INLINE_ANNOTATION_RE.source, 'g');
   let m: RegExpExecArray | null;
   while ((m = re.exec(source)) !== null) {
@@ -1599,12 +1604,13 @@ export function blankCppInlineAnnotationMacros(source: string): string {
       }
     }
     if (end < 0) continue;
+    chars ??= source.split('');
     for (let k = m.index; k < end; k++) {
       if (chars[k] !== '\n' && chars[k] !== '\r') chars[k] = ' ';
     }
     re.lastIndex = end;
   }
-  return rawStrings.restore(chars.join(''));
+  return rawStrings.restore(chars ? chars.join('') : source);
 }
 
 /**
@@ -2035,6 +2041,12 @@ export function blankCCplusplusGuardBodies(source: string): string {
  * statement — valid C — so the body's calls/locals extract normally on both
  * arms instead of riding error recovery.
  *
+ * A statement of a function body keeps the macro's name, as `name;`: the
+ * function still uses the macro (`TEST_CONTEXT("…") {` in redis, `XXH_ASSERT(c)`
+ * in xxhash, which writes no `;`), and that is how a change to the macro reaches
+ * it. Anywhere else (an initializer, a struct body, another macro's arguments)
+ * a `;` would be the very error this avoids, so the whole call goes.
+ *
  * C-ONLY, and matched tightly:
  *  - the call must be INDENTED (statement position; file-scope definitions
  *    start at column 0, and an unbraced file-scope `name(args) { }` is a
@@ -2053,11 +2065,75 @@ export function blankCCplusplusGuardBodies(source: string): string {
 const C_STMT_MACRO_KEYWORDS = new Set([
   'if', 'while', 'for', 'switch', 'return', 'do', 'else', 'sizeof',
 ]);
+
+/** What an open brace holds, for cStatementLines: a `(` or `[` is held as its offset. */
+const C_BLOCK = -1;
+const C_OTHER_BRACES = -2;
+
+/** Can a statement follow this code character, inside a block? (After `)`, a macro without its `;`.) */
+const cStatementFollows = (ch: string | undefined): boolean =>
+  ch === ';' || ch === '{' || ch === '}' || ch === ':' || ch === ')';
+
+/**
+ * Which lines of a C file start a statement of a function body, given the
+ * file's code (maskCppCode: directives and comments are spaces). A brace opens
+ * a block after a function or control head, or where a statement could start
+ * inside another block; `= {`, `struct s {` and `enum {` hold no statements,
+ * and neither do parentheses. A line that is the body of an `if`, a `for`, an
+ * `else` or the like is left out: a `;` there would end the body, and leave the
+ * `else` or `while` after the block with nothing to belong to. A branch of an
+ * `#if` that leaves a bracket open costs at most the rest of its block, which
+ * then reads as no statement.
+ */
+function cStatementLines(code: string): boolean[] {
+  const statements: boolean[] = [];
+  const open: number[] = [];
+  let line = 0;
+  let atLineStart = true;
+  let prev = -1;
+  // Whether the `)` at `prev` closes a control head, whose body comes next.
+  let afterControlHead = false;
+  for (let i = 0; i < code.length; i++) {
+    const ch = code[i];
+    if (ch === '\n') {
+      line++;
+      atLineStart = true;
+      continue;
+    }
+    if (ch === ' ' || ch === '\t' || ch === '\r') continue;
+    const top = open[open.length - 1];
+    if (atLineStart) {
+      atLineStart = false;
+      statements[line] = top === C_BLOCK && !afterControlHead && cStatementFollows(code[prev]);
+    }
+    afterControlHead = false;
+    if (ch === '(' || ch === '[') {
+      open.push(i);
+    } else if (ch === ')' || ch === ']') {
+      if (top !== undefined && top >= 0) {
+        open.pop();
+        afterControlHead = /\b(?:if|for|while|switch)\s*$/.test(code.slice(Math.max(0, top - 10), top));
+      }
+    } else if (ch === '{') {
+      const opensBlock =
+        code[prev] === '(' || // `({ … })`, a GNU statement expression
+        (code[prev] === ')' && top === undefined) ||
+        (top === C_BLOCK && (cStatementFollows(code[prev]) || /(?:^|\W)(?:else|do)$/.test(code.slice(Math.max(0, prev - 4), prev + 1))));
+      open.push(opensBlock ? C_BLOCK : C_OTHER_BRACES);
+    } else if (ch === '}') {
+      while (open.length > 0 && (open.pop() as number) >= 0);
+    }
+    prev = i;
+  }
+  return statements;
+}
+
 export function blankCStatementMacroCalls(source: string): string {
   const rawStrings = maskCppRawStrings(source);
   source = rawStrings.source;
   const lines = source.split('\n');
   let changed = false;
+  let statementLines: boolean[] | null = null;
   const content = (l: string): string => l.replace(/\r$/, '').trim();
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] as string;
@@ -2146,13 +2222,15 @@ export function blankCStatementMacroCalls(source: string): string {
       continue;
     }
     const identStart = line.indexOf(m[1] as string);
+    statementLines ??= cStatementLines(maskCppCode(source));
+    const kept = statementLines[i] ? `${m[1] as string};` : '';
     if (endLine === i) {
       lines[i] =
         line.slice(0, identStart) +
-        ' '.repeat(close + 1 - identStart) +
+        kept.padEnd(close + 1 - identStart) +
         line.slice(close + 1);
     } else {
-      lines[i] = line.slice(0, identStart) + line.slice(identStart).replace(/[^\r]/g, ' ');
+      lines[i] = line.slice(0, identStart) + kept + line.slice(identStart + kept.length).replace(/[^\r]/g, ' ');
       for (let j = i + 1; j < endLine; j++) {
         lines[j] = (lines[j] as string).replace(/[^\r]/g, ' ');
       }
@@ -2663,7 +2741,7 @@ export function blankCDesignatedMacroArgs(source: string): string {
   if (source.indexOf('=') === -1) return source;
   const rawStrings = maskCppRawStrings(source);
   source = rawStrings.source;
-  const out = source.split('');
+  let out: string[] | null = null;
   const re = /^[ \t]*([A-Z_][A-Z0-9_]*)\s*\(/gm;
   let m: RegExpExecArray | null;
   while ((m = re.exec(source))) {
@@ -2681,10 +2759,11 @@ export function blankCDesignatedMacroArgs(source: string): string {
     // A designator at argument depth: `.name =` or `[index] =`.
     if (!/(^|[,{(\s])(\.[A-Za-z_]\w*|\[[^\]]+\])\s*=[^=]/.test(args)) continue;
     if (!/^\s*;/.test(source.slice(close + 1))) continue;
+    out ??= source.split('');
     for (let k = open + 1; k < close; k++) if (out[k] !== '\n') out[k] = ' ';
     re.lastIndex = close;
   }
-  return rawStrings.restore(out.join(''));
+  return rawStrings.restore(out ? out.join('') : source);
 }
 
 /**

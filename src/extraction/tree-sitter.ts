@@ -39,10 +39,7 @@ import { MyBatisExtractor } from './mybatis-extractor';
 import { CfmlExtractor } from './cfml-extractor';
 import { tryKernelExtract, takeDeferredPreParse } from './kernel';
 import { commonJsRequireRefs } from './commonjs-requires';
-import {
-  getAllFrameworkResolvers,
-  getApplicableFrameworks,
-} from '../resolution/frameworks';
+import { frameworks } from './lazy-frameworks';
 
 // Re-export for backward compatibility
 export { generateNodeId } from './tree-sitter-helpers';
@@ -1495,7 +1492,7 @@ export class TreeSitterExtractor {
           // Skip self and same-name targets: a symbol referencing a file-scope
           // sibling of its own name (the two halves of a conditional `try: X=…;
           // except: X=…`) is never a meaningful value read.
-          if (targetId && targetId !== scope.id && refName !== scope.name && !seen.has(targetId)) {
+          if (targetId && targetId !== scope.id && refName !== scope.name && !seen.has(targetId) && !this.isForeignJavaField(n, targetId)) {
             seen.add(targetId);
             this.edges.push({
               source: scope.id,
@@ -1511,6 +1508,23 @@ export class TreeSitterExtractor {
         }
       }
     }
+  }
+
+  /**
+   * Whether a Java field read is another type's: `InferenceString.PARSER` reads
+   * that class's constant, not the `PARSER` of the file reading it. This file's
+   * own is read bare, through `this`, or through the class that declares it.
+   */
+  private isForeignJavaField(n: SyntaxNode, targetId: string): boolean {
+    if (this.language !== 'java' || n.parent?.type !== 'field_access') return false;
+    const access = n.parent;
+    const object = getChildByField(access, 'object');
+    if (!object || getChildByField(access, 'field')?.startIndex !== n.startIndex) return false;
+    const written = getNodeText(object, this.source);
+    const qualifier = written.slice(written.lastIndexOf('.') + 1).trim();
+    if (qualifier === 'this') return false;
+    const segments = this.nodes.find((d) => d.id === targetId)?.qualifiedName.split('::') ?? [];
+    return segments[segments.length - 2] !== qualifier;
   }
 
   /**
@@ -3012,7 +3026,7 @@ export class TreeSitterExtractor {
    * #2327). Mirrored in the kernel (ccpp/mod.rs).
    */
   private extractCMemberTypeRefs(specifier: SyntaxNode, owner: Node): void {
-    if ((this.language !== 'c' && this.language !== 'cpp') || isUnnamedMemberType(specifier)) return;
+    if ((this.language !== 'c' && this.language !== 'cpp' && this.language !== 'objc') || isUnnamedMemberType(specifier)) return;
     this.pushCTypeRefs(cMemberTypeNames(specifier, owner.name, this.source), owner);
   }
 
@@ -4580,7 +4594,7 @@ export class TreeSitterExtractor {
 
     // A C or C++ alias references what it names, so a change to a struct
     // reaches the members declared through `typedef struct redisObject robj;`.
-    if (typeAliasNode && (this.language === 'c' || this.language === 'cpp')) {
+    if (typeAliasNode && (this.language === 'c' || this.language === 'cpp' || this.language === 'objc')) {
       this.pushCTypeRefs(cAliasTypeNames(node, name, this.source), typeAliasNode);
     }
 
@@ -10058,6 +10072,7 @@ export function extractFromSource(
 
   // Framework-specific extraction (routes, middleware, etc.)
   if (frameworkNames && frameworkNames.length > 0) {
+    const { getAllFrameworkResolvers, getApplicableFrameworks } = frameworks();
     const allResolvers = getAllFrameworkResolvers();
     const applicable = getApplicableFrameworks(
       allResolvers.filter((r) => frameworkNames.includes(r.name)),
