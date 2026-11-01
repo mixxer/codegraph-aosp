@@ -53,6 +53,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Java calls now select the overload their arguments fit before checking its visibility. A public overload remains reachable when a private overload of the same name was found first, including calls whose arguments are other calls.
 - Android interface results use consistent project-relative paths on Windows, so matching HIDL implementations keep their package evidence.
 - Java calls through static fields keep the field's own nested type and package imports, so same-named types in other files no longer take those calls.
 - Kotlin extensions declared with an imported type alias keep their callers, while an alias for a different external type is excluded.

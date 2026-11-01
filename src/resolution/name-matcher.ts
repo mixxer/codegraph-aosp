@@ -32406,7 +32406,11 @@ export function matchReference(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
-  const result = gateLanguageMatch(matchReferenceInner(ref, context), ref, context);
+  const match = matchReferenceInner(ref, context);
+  // A private Java overload can be the initial pick before its public sibling
+  // is selected by the arguments. Apply visibility to that final overload.
+  const ranked = match && ref.language === 'java' ? retargetSelfOverload(match, ref, context) : match;
+  const result = gateLanguageMatch(ranked, ref, context);
   // `this.container.classList.toggle()` inside `toggle()`, `window.$events
   // .listen()` inside `listen()`, Scala's `requestToArmeria(request).execute()`
   // inside `execute()`: a member of what the receiver is, which is the calling
@@ -32452,7 +32456,7 @@ export function matchReference(
   // basicRequest.get(…).response(asStringAlways)` is a request's `response`.
   if (result && result.targetNodeId === ref.fromNodeId && ref.referenceKind === 'calls' &&
       VALUE_KINDS.has(context.getNodeById?.(ref.fromNodeId)?.kind ?? '')) return null;
-  return result ? retargetSelfOverload(result, ref, context) : result;
+  return result && ref.language !== 'java' ? retargetSelfOverload(result, ref, context) : result;
 }
 
 /**
