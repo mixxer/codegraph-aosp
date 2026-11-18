@@ -1146,6 +1146,7 @@ export class CodeGraph {
       reopenReferencesThroughBarrels,
       reopenReferencesThroughChangedDefaults,
       reopenReferencesThroughDeclaredPackages,
+      reopenReferencesThroughObjectMembers,
       reopenReferencesThroughRetargetedModules,
       trustedManifestList,
     } = engine();
@@ -1612,6 +1613,24 @@ export class CodeGraph {
             const throughRetargeted = retargeted.length === 0 ? 0
               : reopenReferencesThroughRetargetedModules(this.queries, importReader, retargeted);
             if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-retargeted-modules: ${Date.now() - tRetargeted}ms (${throughRetargeted} refs re-opened)`);
+
+            // A call through an object literal another module exports,
+            // `api.bar()` with `export const api = { foo, bar }`, binds to the
+            // member the literal names, or to the object when it names none.
+            // An edit that adds, drops or rebinds a member declares no name
+            // (`{ foo }` to `{ foo, bar }`), so nothing above re-opens the
+            // caller's unchanged file (#3015): read each edited literal and
+            // send back what its importers' references now disagree with.
+            const tMembers = Date.now();
+            const throughMembers = editedModules.length === 0 || process.env.CODEGRAPH_NO_REBIND === '1' ? 0
+              : reopenReferencesThroughObjectMembers(this.queries, importReader, editedModules, (filePath) => {
+                try {
+                  return fs.readFileSync(path.join(this.projectRoot, filePath), 'utf-8').split('\n');
+                } catch {
+                  return null;
+                }
+              });
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-object-members: ${Date.now() - tMembers}ms (${throughMembers} refs re-opened)`);
           } else {
             // No git info — use batched resolution to avoid OOM
             const unresolvedCount = this.queries.getUnresolvedReferencesCount();
@@ -3239,10 +3258,13 @@ export class CodeGraph {
    * Get dependents of a file
    *
    * @param filePath - Path to the file
+   * @param opts - `skipTiers`: leave out links across a process boundary (a
+   *   client's HTTP call onto a route, a queue job onto its consumer, an event
+   *   onto its handler), as `codegraph affected` does by default (#3320)
    * @returns Array of file paths that depend on this file
    */
-  getFileDependents(filePath: string): string[] {
-    return this.graphManager.getFileDependents(filePath);
+  getFileDependents(filePath: string, opts: { skipTiers?: boolean } = {}): string[] {
+    return this.graphManager.getFileDependents(filePath, opts);
   }
 
   /**

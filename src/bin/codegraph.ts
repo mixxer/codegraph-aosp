@@ -438,6 +438,25 @@ async function openIndexToRead(projectPath: string): Promise<import('../index').
   return cg;
 }
 
+/**
+ * Say which files of an answer changed on disk after they were last indexed
+ * (#3260). A CLI answer comes straight from the index with no watcher behind
+ * it, so the line numbers of an edited file can point at other code; `node`
+ * and `explore` already flag such a file, and `callers`, `callees` and
+ * `impact` say it too. Under `--json` the warning goes to stderr, as the
+ * rebuild notice does, so stdout stays parseable; the answer lists the files
+ * as `changedOnDisk`.
+ */
+function warnChangedOnDisk(changed: string[], json: boolean | undefined): void {
+  if (changed.length === 0) return;
+  const named = changed.slice(0, 5).join(', ') + (changed.length > 5 ? ` and ${changed.length - 5} more` : '');
+  const message = changed.length === 1
+    ? `${named} changed on disk after it was last indexed, so line numbers from it may be off. Run "codegraph sync" to update the index.`
+    : `${changed.length} files changed on disk after they were last indexed (${named}), so line numbers from them may be off. Run "codegraph sync" to update the index.`;
+  if (json) console.error(`${chalk.yellow(getGlyphs().warn)} ${message}`);
+  else warn(message);
+}
+
 /** "not found" (+ optional did-you-mean) when no exact symbol matches. */
 function formatSymbolNotFound(symbol: string, fuzzyNames: string[]): string {
   const suggestions = [...new Set(fuzzyNames.filter((n) => n !== symbol))].slice(0, 3);
@@ -781,6 +800,47 @@ function applyLocalOnlyGitignore(
 }
 
 /**
+ * What `status` and `init` say about an index whose last run didn't end well:
+ * null for a complete index, and for one another process is rebuilding right
+ * now, whose `indexing` is that run's own, not an interrupted one's.
+ */
+function unfinishedIndexWarning(indexState: string | null, rebuildInProgress: boolean): string | null {
+  if (rebuildInProgress) return null;
+  switch (indexState) {
+    case 'indexing':
+      return 'The last index run never finished (killed mid-index?) — the index is truncated. Re-run "codegraph index".';
+    case 'partial':
+      return 'The last index run silently dropped files — the index is partial. Re-run "codegraph index".';
+    case 'failed':
+      return 'The last index run failed — results may be incomplete. Re-run "codegraph index".';
+    default:
+      return null;
+  }
+}
+
+/**
+ * How the last index run of an initialized project ended, read the way
+ * `status` reads it: read-only, and with a rebuild running in another process
+ * told apart from a run that died. An index that can't be opened reads as
+ * finished, so `init` says what it always said.
+ */
+async function readLastIndexRun(projectPath: string): Promise<{ unfinished: string | null; rebuildInProgress: boolean }> {
+  const { isRebuildInProgress } = await import('../mcp/writer-lock');
+  const rebuildInProgress = isRebuildInProgress(projectPath);
+  let indexState: string | null = null;
+  try {
+    const { default: CodeGraph } = await loadCodeGraph();
+    const cg = await CodeGraph.open(projectPath, { readOnly: true });
+    try {
+      indexState = cg.getIndexState();
+    } finally {
+      cg.destroy();
+    }
+  } catch { /* unreadable index: nothing to add */ }
+  return { unfinished: unfinishedIndexWarning(indexState, rebuildInProgress), rebuildInProgress };
+}
+
+/**
  * The `init` flow — shared by `codegraph init` and `codegraph install --init`
  * (#1578): refuse an unsafe root, create `.codegraph/`, build the initial
  * index under supervision, then the post-index offers. `yes` makes every
@@ -810,8 +870,20 @@ async function runInit(
     }
 
     if (isInitialized(projectPath)) {
-      clack.log.warn(`Already initialized in ${projectPath}`);
-      clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
+      // `.codegraph/` alone isn't a working index: a first run that was killed
+      // or failed partway leaves it behind, and "Already initialized" then reads
+      // like a setup that only needs a sync (#3228). Say how the last run ended,
+      // as `status` does.
+      const { unfinished, rebuildInProgress } = await readLastIndexRun(projectPath);
+      if (unfinished) {
+        clack.log.warn(`Initialized in ${projectPath}, but its index is incomplete.`);
+        clack.log.warn(unfinished);
+      } else {
+        clack.log.warn(`Already initialized in ${projectPath}`);
+        clack.log.info(rebuildInProgress
+          ? 'An index rebuild ("codegraph index") is running in another process.'
+          : 'Use "codegraph index" to re-index or "codegraph sync" to update');
+      }
       if (options.localOnly) applyLocalOnlyGitignore(clack, projectPath);
       try {
         const { offerWatchFallback } = await import('../installer');
@@ -1365,14 +1437,11 @@ program
       if (worktreeMismatch) {
         warn(worktreeMismatchWarning(worktreeMismatch));
       }
+      const unfinished = unfinishedIndexWarning(indexState, rebuildInProgress);
       if (rebuildInProgress) {
         warn('An index rebuild ("codegraph index") is running in another process — the statistics below are a snapshot of it.');
-      } else if (indexState === 'indexing') {
-        warn('The last index run never finished (killed mid-index?) — the index is truncated. Re-run "codegraph index".');
-      } else if (indexState === 'partial') {
-        warn('The last index run silently dropped files — the index is partial. Re-run "codegraph index".');
-      } else if (indexState === 'failed') {
-        warn('The last index run failed — results may be incomplete. Re-run "codegraph index".');
+      } else if (unfinished) {
+        warn(unfinished);
       }
       // A running rebuild's references are its own work in progress, not an
       // interrupted run's.
@@ -1786,11 +1855,21 @@ program
           // keyword is signal enough.
           const tokenVerified = !keyworded && codeTokens.some((t) => cg.getNodesByName(t).length > 0);
           if (keyworded || tokenVerified) {
-            const { ToolHandler } = await import('../mcp/tools');
-            const handler = new ToolHandler(cg);
-            const result = await handler.execute('codegraph_explore', { query: prompt });
-            const text = result.content[0]?.text ?? '';
-            if (!result.isError && text.trim()) {
+            const exploreHere = async (): Promise<string> => {
+              const { ToolHandler } = await import('../mcp/tools');
+              const result = await new ToolHandler(cg).execute('codegraph_explore', { query: prompt });
+              return result.isError ? '' : result.content[0]?.text ?? '';
+            };
+            // A daemon already running for this project answers from memory
+            // what an explore here reads from disk again on every prompt
+            // (#3284). One that is exploring but has not answered by the
+            // deadline gets no second explore here, and nothing is injected.
+            const { exploreViaDaemon, promptHookDaemonTimeoutMs } = await import('../mcp/hook-client');
+            const viaDaemon = await exploreViaDaemon(plan.exploreRoot, prompt, promptHookDaemonTimeoutMs());
+            const text = viaDaemon.status === 'answered' ? viaDaemon.text
+              : viaDaemon.status === 'unavailable' ? await exploreHere()
+              : '';
+            if (text.trim()) {
               // Cap the injection so a large-repo explore can't flood the prompt.
               // Claude Code shows hook stdout inline only up to 10,000 characters;
               // above that it persists the output to a file and the model sees a
@@ -2620,6 +2699,14 @@ for (const direction of ['callers', 'callees'] as const) {
             lines: callSiteLines(ownEdges(node, edges)),
             recursive,
           });
+          // The files whose lines this answer prints: each definition's and each
+          // neighbour's shown.
+          const { filesChangedSinceIndexed } = await import('../graph/file-drift');
+          const changedOnDisk = filesChangedSinceIndexed(cg, [
+            ...groups.flat().map((node) => node.filePath),
+            ...collected.flatMap(({ nodes }) => nodes.slice(0, limit).map((node) => node.filePath)),
+          ]);
+          warnChangedOnDisk(changedOnDisk, options.json);
           if (options.json) {
             const definitions = collected.map(({ group, nodes, edges, recursive }) => {
               const limited = nodes.slice(0, limit);
@@ -2647,6 +2734,7 @@ for (const direction of ['callers', 'callees'] as const) {
               file: options.file,
               filteredOut,
               note,
+              ...(changedOnDisk.length > 0 ? { changedOnDisk } : {}),
               definitions,
               [direction]: [...union.values()].slice(0, limit).map((node) =>
                 row(node, allEdges, collected.some((entry) => entry.recursive.has(node.id)))),
@@ -2741,6 +2829,12 @@ program
           return { group, nodes, edges, truncated };
         });
         const truncated = collected.some((c) => c.truncated);
+        const { filesChangedSinceIndexed } = await import('../graph/file-drift');
+        const changedOnDisk = filesChangedSinceIndexed(cg, [
+          ...groups.flat().map((node) => node.filePath),
+          ...collected.flatMap(({ nodes }) => [...nodes.values()].map((node) => node.filePath)),
+        ]);
+        warnChangedOnDisk(changedOnDisk, options.json);
 
         if (options.json) {
           const unionNodes = new Map<string, Node>();
@@ -2766,6 +2860,7 @@ program
             file: options.file,
             filteredOut,
             note,
+            ...(changedOnDisk.length > 0 ? { changedOnDisk } : {}),
             definitions,
             nodeCount: unionNodes.size,
             edgeCount: unionEdges.size,
@@ -2905,7 +3000,7 @@ program
             relation: e.relation,
             depth: e.depth,
             via: e.depth > 1 ? nameOf.get(e.parentId) : undefined,
-            test: isTestCode(e.node, e.node.language === 'rust' ? sourceOf(e.node.filePath) : undefined),
+            test: isTestCode(e.node, sourceOf),
             synthesized: e.synthesized,
           }));
           return { group, implementations, directSubtypes: hierarchy?.directSubtypes ?? 0, bounded: hierarchy?.bounded ?? false };
@@ -3407,7 +3502,8 @@ program
   .option('-f, --filter <glob>', 'Glob for the files that count as tests, matched against the whole name: "*_test.go" matches the file name at any depth, "e2e/*.spec.ts" that folder at any depth, "/tests/**/*.py" from the project root only')
   .option('-j, --json', 'Output as JSON')
   .option('-q, --quiet', 'Only output file paths, no decoration')
-  .action(async (fileArgs: string[], options: { path?: string; stdin?: boolean; depth?: string; filter?: string; json?: boolean; quiet?: boolean }) => {
+  .option('--cross-tier', "Also follow links across a process boundary: a client's HTTP call to its server's route, a queue job to its consumer, an event to its handler")
+  .action(async (fileArgs: string[], options: { path?: string; stdin?: boolean; depth?: string; filter?: string; json?: boolean; quiet?: boolean; crossTier?: boolean }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -3483,7 +3579,9 @@ program
           const current = queue.shift()!;
           if (current.depth >= maxDepth) continue;
 
-          const dependents = cg.getFileDependents(current.file);
+          // A test on the other side of an HTTP call, queue or event mocks
+          // that boundary, so it isn't affected by default (#3320).
+          const dependents = cg.getFileDependents(current.file, { skipTiers: !options.crossTier });
           for (const dep of dependents) {
             if (visited.has(dep)) continue;
             visited.add(dep);

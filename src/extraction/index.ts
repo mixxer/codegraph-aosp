@@ -787,6 +787,22 @@ function permitsVendorInclude(rel: string, vendor: VendorInclude | null): boolea
 }
 
 /**
+ * A folder's real path, for the include walk's cycle guard. The OS's realpath
+ * is one call a folder, where the JS one stats every part of the path, which
+ * made the walk the bulk of a `status` on a project that includes a large
+ * ignored tree (#3086). Some volumes refuse the OS call where the JS one works
+ * (a RAM disk, some `subst` and network drives answer EISDIR or the like), so
+ * the JS one answers there; throws only when both do.
+ */
+function walkRealpath(dir: string): string {
+  try {
+    return fs.realpathSync.native(dir);
+  } catch {
+    return fs.realpathSync(dir);
+  }
+}
+
+/**
  * Actively discover the source files an `include` whitelist forces in. `git
  * ls-files` never lists gitignored files, so a filtered filesystem walk of just
  * the opted-in subtrees (`includeStaticRoots`) is the only way to find them.
@@ -831,7 +847,7 @@ function collectIncludedFiles(
   function walk(absDir: string): void {
     let realDir: string;
     try {
-      realDir = fs.realpathSync(absDir);
+      realDir = walkRealpath(absDir);
     } catch {
       return;
     }
@@ -4287,6 +4303,44 @@ export class ExtractionOrchestrator {
   }
 
   /**
+   * The files `codegraph.json` `include` brings in that may have changed since
+   * they were indexed. They are gitignored, and `git status` never reports an
+   * ignored file, so the git fast path below saw no edit, addition or deletion
+   * among them (#3086). The test is sync's own: an included file on disk is a
+   * candidate when the index doesn't hold it or holds another size or mtime,
+   * and an indexed file `include` covers is one when it's gone or out of scope. So status
+   * calls pending exactly what a sync would pick up, and the caller's hash
+   * check decides as for any other candidate.
+   */
+  private includedFileChanges(): string[] {
+    const include = loadIncludeMatcher(this.rootDir);
+    if (!include) return [];
+    const out: string[] = [];
+    const onDisk = collectIncludedFilesForRoot(this.rootDir);
+    for (const filePath of onDisk) {
+      const tracked = this.queries.getFileByPath(filePath);
+      if (!tracked) {
+        out.push(filePath);
+        continue;
+      }
+      try {
+        const stats = fs.statSync(path.join(this.rootDir, filePath));
+        if (stats.size !== tracked.size || Math.floor(stats.mtimeMs) !== Math.floor(tracked.modifiedAt)) out.push(filePath);
+      } catch {
+        out.push(filePath);
+      }
+    }
+    const scope = this.scopedSyncMatcher();
+    const overrides = loadExtensionOverrides(this.rootDir);
+    for (const filePath of this.queries.getAllFilePaths()) {
+      if (!include.ignores(filePath)) continue;
+      // An indexed include can leave scope while its file still exists.
+      if (!isSourceFile(filePath, overrides, this.rootDir) || scope.ignores(filePath) || !fs.existsSync(path.join(this.rootDir, filePath))) out.push(filePath);
+    }
+    return out;
+  }
+
+  /**
    * The files a change of the sparse checkout brought in or took away since the
    * last full index or sync: where the scan and the index disagree. Nothing git
    * reports can supply them, so this runs on a clean tree too. It costs a scan
@@ -4327,14 +4381,7 @@ export class ExtractionOrchestrator {
       // have been recreated locally; a previously indexed dirty path may have
       // vanished from git status after restore. Classify current disk vs DB once.
       const gitCandidates = new Set([...gitChanges.deleted, ...gitChanges.modified, ...gitChanges.added, ...dirtyPaths!, ...this.sparseCheckoutChanges()]);
-      const candidates = new Set(gitCandidates);
-      const include = loadIncludeMatcher(this.rootDir);
-      if (include) {
-        for (const file of collectIncludedFilesForRoot(this.rootDir)) candidates.add(file);
-        for (const file of this.queries.getAllFiles()) {
-          if (include.ignores(file.path)) candidates.add(file.path);
-        }
-      }
+      const candidates = new Set([...gitCandidates, ...this.includedFileChanges()]);
       const scope = this.scopedSyncMatcher();
       const overrides = loadExtensionOverrides(this.rootDir);
       for (const filePath of candidates) {

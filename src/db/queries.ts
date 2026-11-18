@@ -3667,15 +3667,22 @@ export class QueryBuilder {
    * decorates — exactly what {@link GraphTraverser.getImpactRadius} traverses.
    * `contains` is excluded: a parent containing a symbol does not *depend* on
    * it. One indexed query (idx_nodes_file_path + idx_edges_target_kind).
+   *
+   * `skipTiers` leaves out the edges the tier pass links across a process
+   * boundary (their metadata carries `tier`): a client's HTTP call onto its
+   * server's route, a queue job onto its consumer, an event onto its handler.
+   * Test selection wants that: a frontend's tests mock the backend they call,
+   * so a backend change doesn't affect them (#3320).
    */
-  getDependentFilePaths(filePath: string): string[] {
+  getDependentFilePaths(filePath: string, opts: { skipTiers?: boolean } = {}): string[] {
     const sql = `SELECT DISTINCT src.file_path AS fp
       FROM edges e
       JOIN nodes tgt ON tgt.id = e.target
       JOIN nodes src ON src.id = e.source
       WHERE tgt.file_path = ?
         AND e.kind != 'contains'
-        AND src.file_path != ?`;
+        AND src.file_path != ?${opts.skipTiers ? `
+        AND (e.metadata IS NULL OR json_extract(e.metadata, '$.tier') IS NULL)` : ''}`;
     const rows = this.db.prepare(sql).all(filePath, filePath) as Array<{ fp: string }>;
     return rows.map((r) => r.fp);
   }
@@ -5854,10 +5861,18 @@ export class QueryBuilder {
       const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
       const placeholders = chunk.map(() => '?').join(',');
       const rows = this.db
-        .prepare(`SELECT DISTINCT file_path, name FROM nodes WHERE file_path IN (${placeholders})`)
-        .all(...chunk) as Array<{ file_path: string; name: string }>;
+        .prepare(`SELECT file_path, name, SUM(language = 'python' AND kind IN ('function', 'method')) AS python_defs
+                    FROM nodes WHERE file_path IN (${placeholders}) GROUP BY file_path, name`)
+        .all(...chunk) as Array<{ file_path: string; name: string; python_defs: number }>;
       // NUL-joined: a path or a symbol name can contain a space, never a NUL.
-      for (const row of rows) pairs.add(`${row.file_path}\0${row.name}`);
+      // A Python name a file defines more than once (typing.overload stubs and
+      // the def below them) also counts its defs, behind a \u0001 in the file's
+      // half: adding or removing the implementation moves every call to the
+      // name (#2963) while the set of names stays the same.
+      for (const row of rows) {
+        const file = row.python_defs > 1 ? `${row.file_path}\u0001${row.python_defs}` : row.file_path;
+        pairs.add(`${file}\0${row.name}`);
+      }
     }
     return pairs;
   }

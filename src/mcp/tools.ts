@@ -60,11 +60,11 @@ import {
   realpathSync,
   statSync,
 } from 'fs';
-import { createHash } from 'crypto';
 import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
 import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranchGuardGrammars } from '../graph/branch-guards';
 import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
 import { countImplementers } from '../graph/type-hierarchy';
+import { isTestCode, type SourceReader } from '../graph/test-code';
 import { describeSynthesizedHop } from '../graph/synthesized-hop';
 import { callSiteLines, formatCallSiteLines } from '../graph/call-sites';
 import { DEFAULT_IMPACT_MAX_EDGES, DEFAULT_IMPACT_MAX_NODES, type CallSiteRow } from '../graph/traversal';
@@ -159,7 +159,7 @@ function wslSharedIndexGuidance(err: WslSharedIndexError): string {
  */
 export { PathRefusalError } from '../errors';
 import { PathRefusalError } from '../errors';
-import { indexedHashInput } from '../file-limits';
+import { fileDrift } from '../graph/file-drift';
 import { resolve as resolvePath, relative as relativePath, dirname } from 'path';
 
 /** Maximum output length to prevent context bloat (characters) */
@@ -1666,6 +1666,26 @@ export interface ToolResult {
   _cgAnswerFiles?: AnswerFile[];
 }
 
+/** Options for {@link ToolHandler.execute}. */
+export interface ExecuteOptions {
+  /**
+   * Start the call now or not at all: when the handler is closing, the
+   * project's post-open catch-up is still running, or every warm pool worker
+   * is busy, `execute` returns {@link NOT_STARTED} at once instead of waiting
+   * or queueing. For a caller with its own way to answer, the prompt hook
+   * (#3284), which should not hold a prompt behind other work.
+   */
+  startNow?: boolean;
+}
+
+/**
+ * What `execute` returns, by identity, for a `startNow` call it did not start.
+ * Never sent to a client as is: the caller checks for it.
+ */
+export const NOT_STARTED: ToolResult = Object.freeze({
+  content: Object.freeze([]) as unknown as ToolResult['content'],
+}) as ToolResult;
+
 /**
  * Common projectPath property for cross-project queries
  */
@@ -3098,28 +3118,9 @@ export class ToolHandler {
     const now = Date.now();
     const hit = this.driftCache.get(key);
     if (hit && now - hit.at < ToolHandler.DRIFT_TTL_MS) return hit.stale;
-    let stale = false;
-    try {
-      const rec = cg.getFile(relPath);
-      const absPath = rec ? validatePathWithinRoot(root, relPath) : null;
-      if (rec && absPath && existsSync(absPath)) {
-        const st = statSync(absPath);
-        // Same freshness test as the sync fast path (extraction/index.ts):
-        // equal size + equal floored mtime ⇒ unchanged, no read needed.
-        if (st.size !== rec.size || Math.floor(st.mtimeMs) !== Math.floor(rec.modifiedAt)) {
-          // A file over the index's size limit is stored as its size stamp
-          // (#1910), so it is compared as one, without reading it.
-          const data = indexedHashInput(st.size, () => content ?? readFileSync(absPath, 'utf-8'));
-          // Must stay byte-identical to extraction's `hashContent` (sha256 over
-          // the utf-8 string) — the identical-rewrite test in
-          // mcp-stale-slice.test.ts pins the parity. Inlined (not imported)
-          // to keep the extraction module off the MCP startup path.
-          stale = createHash('sha256').update(data).digest('hex') !== rec.contentHash;
-        }
-      }
-    } catch {
-      stale = false;
-    }
+    // The check itself is shared with the CLI's read commands (#3260). A file
+    // gone from disk isn't flagged here: the not-found paths answer for it.
+    const stale = fileDrift(cg, relPath, content) === 'changed';
     this.driftCache.set(key, { at: now, stale });
     return stale;
   }
@@ -3274,8 +3275,11 @@ export class ToolHandler {
     args: Record<string, unknown>,
     sessionState?: ExploreSessionState,
     indexVersionWarnings?: IndexVersionWarningState,
+    opts: ExecuteOptions = {},
   ): Promise<ToolResult> {
-    if (this.closing) return this.textResult('This MCP session is closing; retry with a connected session.');
+    if (this.closing) {
+      return opts.startNow ? NOT_STARTED : this.textResult('This MCP session is closing; retry with a connected session.');
+    }
     this.activeCalls++;
     let pinnedRoot: string | null = null;
     try {
@@ -3288,6 +3292,7 @@ export class ToolHandler {
       // Catch-up failures are logged by the engine; we proceed regardless so a
       // transient sync error never breaks tools.
       if (this.catchUpGate) {
+        if (opts.startNow) return NOT_STARTED;
         const gate = this.catchUpGate;
         await this.awaitCatchUpGate(gate);
       }
@@ -3382,9 +3387,16 @@ export class ToolHandler {
       const pooled = !!(this.queryPool && this.queryPool.healthy && this.queryPool.ready);
       const projectPath = pooled ? args.projectPath ?? this.cg?.getProjectRoot() : undefined;
       const wasDegraded = project.isWatcherDegraded?.();
-      const raw = (pooled && projectPath)
-        ? await this.queryPool!.run(toolName, { ...dispatchArgs, projectPath })
-        : await this.executeReadTool(toolName, dispatchArgs);
+      let raw: ToolResult;
+      if (pooled && projectPath) {
+        const call = { ...dispatchArgs, projectPath };
+        // `startNow`: an idle worker or none, never a place in the queue.
+        const started = opts.startNow ? this.queryPool!.tryRun(toolName, call) : this.queryPool!.run(toolName, call);
+        if (!started) return NOT_STARTED;
+        raw = await started;
+      } else {
+        raw = await this.executeReadTool(toolName, dispatchArgs);
+      }
       const answeredFrom = raw._cgAnswerFiles;
       delete raw._cgAnswerFiles;
       if (!raw.isError && answeredFrom && (wasDegraded || project.isWatcherDegraded?.())) {
@@ -4700,6 +4712,33 @@ export class ToolHandler {
   }
 
   /**
+   * Whether a caller is test code, for one blast-radius section. A Rust unit
+   * test is told by its file's source (an inline `#[cfg(test)]` module, or the
+   * parent's `#[cfg(test)] mod tests;`), so each file is read once.
+   */
+  private testCodeReading(cg: CodeGraph): (node: Node) => boolean {
+    const root = cg.getProjectRoot();
+    const sources = new Map<string, string | undefined>();
+    const readSource: SourceReader = (filePath) => {
+      if (!sources.has(filePath)) {
+        let text: string | undefined;
+        try {
+          const abs = validatePathWithinRoot(root, filePath);
+          text = abs === null ? undefined : readFileSync(abs, 'utf-8');
+        } catch { /* unreadable → not known to be test code */ }
+        sources.set(filePath, text);
+      }
+      return sources.get(filePath);
+    };
+    const verdicts = new Map<string, boolean>();
+    return (node) => {
+      let v = verdicts.get(node.id);
+      if (v === undefined) verdicts.set(node.id, (v = isTestCode(node, readSource)));
+      return v;
+    };
+  }
+
+  /**
    * Compact "blast radius" for the entry symbols of an explore result: who
    * depends on each (callers) and which test files cover it — LOCATIONS ONLY,
    * no source, so the agent knows what to update / re-verify before editing
@@ -4726,6 +4765,7 @@ export class ToolHandler {
       'enum', 'type_alias', 'component', 'constant', 'variable', 'property', 'field',
     ]);
     const rel = (p: string) => p.replace(/\\/g, '/');
+    const isTest = this.testCodeReading(cg);
 
     const roots = [...new Set([...leadingIds, ...subgraph.roots])]
       .map((id) => subgraph.nodes.get(id))
@@ -4745,9 +4785,10 @@ export class ToolHandler {
       }
       if (uniq.length === 0) continue; // no blast radius → nothing to flag
 
-      const callerFiles = [...new Set(uniq.map((n) => rel(n.filePath)))];
-      const testFiles = callerFiles.filter((f) => isTestFile(f));
-      const nonTest = callerFiles.filter((f) => !isTestFile(f));
+      // By caller, not by file: a Rust file holds its `#[cfg(test)] mod tests`
+      // next to the production code it tests.
+      const testFiles = [...new Set(uniq.filter(isTest).map((n) => rel(n.filePath)))];
+      const nonTest = [...new Set(uniq.filter((n) => !isTest(n)).map((n) => rel(n.filePath)))];
 
       // A view depends on a helper across a layer, and is easily outnumbered by
       // same-language callers: one flat cap showed none of a helper's 22 views
@@ -4762,7 +4803,7 @@ export class ToolHandler {
       const where = (codeFiles.length > 0 ? ` in ${shown}${more}` : '') + views;
       const tests = testFiles.length > 0
         ? `; tests: ${testFiles.slice(0, FILE_CAP).map((f) => `\`${f}\``).join(', ')}${testFiles.length > FILE_CAP ? ` +${testFiles.length - FILE_CAP}` : ''}`
-        : this.indirectTestNote(cg, uniq, rel);
+        : this.indirectTestNote(cg, uniq, rel, isTest);
 
       entries.push(
         `- \`${root.name}\` (${rel(root.filePath)}:${root.startLine}) — ${uniq.length} caller${uniq.length === 1 ? '' : 's'}${where}${tests}`,
@@ -4825,7 +4866,7 @@ export class ToolHandler {
    * symbols had a test within 2-3 hops), so walk up to 2 more hops before
    * claiming anything — and even then claim only what was measured.
    */
-  private indirectTestNote(cg: CodeGraph, directCallers: Node[], rel: (p: string) => string): string {
+  private indirectTestNote(cg: CodeGraph, directCallers: Node[], rel: (p: string) => string, isTest: (n: Node) => boolean): string {
     const MAX_HOPS = 3; // direct callers are hop 1
     const BUDGET = 64;  // getCallers lookups per entry — bounds god-fan-in symbols
     const FILE_CAP = 2;
@@ -4843,8 +4884,7 @@ export class ToolHandler {
           const n = c?.node;
           if (!n || visited.has(n.id)) continue;
           visited.add(n.id);
-          const f = rel(n.filePath);
-          if (isTestFile(f)) found.add(f);
+          if (isTest(n)) found.add(rel(n.filePath));
           else next.push(n);
         }
       }

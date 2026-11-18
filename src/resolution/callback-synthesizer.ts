@@ -10,16 +10,16 @@
  *      scene.onUpdate(this.triggerRender)                  // registration
  *      → synthesize triggerUpdate → triggerRender
  *
- *  (2) String-keyed EventEmitter (Phase 2):
+ *  (2) String-keyed EventEmitter (Phase 2, ./event-emitter-synthesizer):
  *      this.on('mount', function onmount(){...})           // registration
  *      fn.emit('mount', this)                              // dispatch
  *      → synthesize (method containing emit('mount')) → onmount
  *
  * Whole-graph pass after base resolution. High-precision/low-recall by design:
  * named callbacks only; field channels paired by file+field; EventEmitter
- * channels capped by event fan-out (generic names like 'error' skipped — they
- * need receiver-type matching, deferred to Phase 3). All synthesized edges are
- * tagged `provenance:'heuristic'`. See docs/design/callback-edge-synthesis.md.
+ * channels paired by event and receiver, and capped by event fan-out (generic
+ * names like 'error' skipped). All synthesized edges are tagged
+ * `provenance:'heuristic'`. See docs/design/callback-edge-synthesis.md.
  */
 import type { Edge, Language, Node, NodeKind } from '../types';
 import type { QueryBuilder } from '../db/queries';
@@ -45,6 +45,7 @@ import { createYielder, type MaybeYield } from './cooperative-yield';
 import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequestEdges } from './tier-synthesizer';
 import { hasTauriPattern, tauriEdges } from './tauri-synthesizer';
 import { enclosingFn, makeLineAt } from './synth-utils';
+import { eventEmitterEdges } from './event-emitter-synthesizer';
 import { resolveImportPath } from './import-resolver';
 import { cppSpecializationArguments, crossesCodeBoundary, goRefQualification, isManualMockHiddenFrom, isManualMockPath, jsCodeBindsName } from './name-matcher';
 import { goStdlibMethods } from './go-stdlib-methods';
@@ -58,8 +59,6 @@ const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
 const MAX_CALLBACKS_PER_CHANNEL = 40;
 const EVENT_FANOUT_CAP = 6; // skip events with more handlers/dispatchers than this (too generic without type info)
 
-const ON_RE = /\.(?:on|once|addListener)\(\s*['"]([^'"]+)['"]\s*,\s*(?:function\s+(\w+)|(?:this\.)?(\w+))/g;
-const EMIT_RE = /\.(?:emit|fire|dispatchEvent)\(\s*['"]([^'"]+)['"]/g;
 const SETSTATE_RE = /this\.setState\s*\(/;
 const FLUTTER_SETSTATE_RE = /\bsetState\s*\(/; // Flutter: setState((){…}) / this.setState
 const JS_FAMILY = ['typescript', 'javascript', 'tsx', 'jsx'];
@@ -347,69 +346,6 @@ async function closureCollectionEdges(queries: QueryBuilder, ctx: ResolutionCont
         provenance: 'heuristic',
         metadata: { synthesizedBy: 'closure-collection', field, registeredAt: `${reg.node.filePath}:${reg.line}` },
       });
-    }
-  }
-  return edges;
-}
-
-/** Phase 2: string-keyed EventEmitter channels (on('e', fn) ↔ emit('e')). */
-async function eventEmitterEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
-  let scannedFiles = 0;
-  const emitsByEvent = new Map<string, Set<string>>();          // event → dispatcher node ids
-  const handlersByEvent = new Map<string, Map<string, string>>(); // event → handler id → registration site (file:line)
-
-  let scanned = 0;
-  for (const file of ctx.getAllFiles()) {
-    if ((++scannedFiles & 15) === 0) await onYield();
-    if ((++scanned & 255) === 0) await onYield(); // #1091: yield mid-scan on huge graphs
-    const content = ctx.readFile(file);
-    if (!content) continue;
-    const hasEmit = content.includes('.emit(') || content.includes('.fire(') || content.includes('.dispatchEvent(');
-    const hasOn = content.includes('.on(') || content.includes('.once(') || content.includes('.addListener(');
-    if (!hasEmit && !hasOn) continue;
-    const nodesInFile = ctx.getNodesInFile(file);
-    const lineOf = makeLineAt(content, 1);
-
-    if (hasEmit) {
-      EMIT_RE.lastIndex = 0;
-      let m: RegExpExecArray | null;
-      while ((m = EMIT_RE.exec(content))) {
-        const disp = enclosingFn(nodesInFile, lineOf(m.index));
-        if (!disp) continue;
-        const set = emitsByEvent.get(m[1]!) ?? new Set<string>();
-        set.add(disp.id); emitsByEvent.set(m[1]!, set);
-      }
-    }
-    if (hasOn) {
-      ON_RE.lastIndex = 0;
-      let m: RegExpExecArray | null;
-      while ((m = ON_RE.exec(content))) {
-        const handlerName = m[2] || m[3];
-        if (!handlerName) continue;
-        // A manual mock's function is a handler only test code registers (#2455).
-        const handler = ctx.getNodesByName(handlerName).find((n) =>
-          (n.kind === 'function' || n.kind === 'method') && !isManualMockHiddenFrom(n.filePath, file));
-        if (!handler) continue;
-        const map = handlersByEvent.get(m[1]!) ?? new Map<string, string>();
-        map.set(handler.id, `${file}:${lineOf(m.index)}`); handlersByEvent.set(m[1]!, map);
-      }
-    }
-  }
-
-  const edges: Edge[] = [];
-  const seen = new Set<string>();
-  for (const [event, dispatchers] of emitsByEvent) {
-    const handlers = handlersByEvent.get(event);
-    if (!handlers) continue;
-    // Precision guard: a generic event name with many handlers/dispatchers can't
-    // be matched without receiver-type info (Phase 3) — skip rather than over-link.
-    if (dispatchers.size > EVENT_FANOUT_CAP || handlers.size > EVENT_FANOUT_CAP) continue;
-    for (const d of dispatchers) for (const [h, registeredAt] of handlers) {
-      if (d === h) continue;
-      const key = `${d}>${h}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      edges.push({ source: d, target: h, kind: 'calls', provenance: 'heuristic', metadata: { synthesizedBy: 'event-emitter', event, registeredAt } });
     }
   }
   return edges;
@@ -2081,7 +2017,8 @@ function importedFrom(ctx: ResolutionContext, file: string, language: Language):
 /**
  * Does `file` import `name` from a package outside the repository (`import {
  * Button } from 'antd'`)? A package means one the file's package.json, or an
- * enclosing one, declares, under a specifier no project file answers. That is
+ * enclosing one, declares, or one installed in a `node_modules` folder the
+ * import would search, under a specifier no project file answers. That is
  * the test the name matcher applies to calls and values. What such a name
  * renders is the package's, never a project symbol that shares the name.
  */
@@ -4152,9 +4089,19 @@ async function piniaStoreEdges(ctx: ResolutionContext, onYield: MaybeYield): Pro
 // (the store-file gate excludes a same-named `api/` helper — `getInfo`/`login`
 // commonly collide), disambiguated by the namespace appearing in the path (or, for
 // a root key, the same file — Vuex's local-module `commit('M')` inside an action).
-const VUEX_DISPATCH_RE = /\b(?:dispatch|commit)\s*\(\s*['"]([A-Za-z][\w/]*)['"]/g;
+// `dispatch` runs an action and `commit` a mutation, so a function known to be in
+// another collection — `const mutations = { … }`'s, a getter — is never the
+// target: an action and the mutation it commits often share a name.
+const VUEX_DISPATCH_RE = /\b(dispatch|commit)\s*\(\s*['"]([A-Za-z][\w/]*)['"]/g;
 const VUEX_STORE_SIGNAL = /\bdefineStore\b|\bcreateStore\b|\bVuex\b|\bmutations\b|\bactions\b|\bgetters\b|\bnamespaced\b/g;
 const VUEX_FANOUT_CAP = 120;
+// A store split into files (#3393) names its collections only in the store file
+// that assembles it — `import actions from './actions'` — while `actions.js`
+// itself, `export default { FETCH_LIST_DATA() {…} }`, says nothing of Vuex. A
+// file a store file default-imports as its actions, mutations or getters is a
+// store file too, holding that collection.
+const VUEX_COLLECTION_IMPORT = /\bimport\s+(?:actions|mutations|getters)\s+from\b/;
+const VUEX_COLLECTION_NAMES: ReadonlySet<string> = new Set(['actions', 'mutations', 'getters']);
 
 /** A path segment (dir or filename stem) equals `seg` — `…/modules/user.js` has
  *  the segment `user` for namespace `user`. */
@@ -4165,7 +4112,7 @@ function pathHasSegment(filePath: string, seg: string): boolean {
 async function vuexDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   let scannedFiles = 0;
   const storeFileCache = new Map<string, boolean>();
-  const isStoreFile = (file: string): boolean => {
+  const hasStoreSignals = (file: string): boolean => {
     let v = storeFileCache.get(file);
     if (v === undefined) {
       const c = ctx.readFile(file);
@@ -4180,11 +4127,44 @@ async function vuexDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield): P
     }
     return v;
   };
+  // The files store files default-import as collections, and which collection
+  // each is, found once: the first time a candidate's file is asked about.
+  let collectionFiles: Map<string, string> | null = null;
+  const collectionOf = (file: string): string | undefined => {
+    if (collectionFiles === null) {
+      collectionFiles = new Map();
+      for (const store of ctx.getAllFiles()) {
+        if (!PINIA_CONSUMER_EXT.test(store)) continue;
+        const c = ctx.readFile(store);
+        if (!c || !VUEX_COLLECTION_IMPORT.test(c) || !hasStoreSignals(store)) continue;
+        const language = languageForJsxFile(store);
+        for (const im of ctx.getImportMappings(store, language)) {
+          if (!im.isDefault || !VUEX_COLLECTION_NAMES.has(im.localName)) continue;
+          const target = im.resolvedPath ?? resolveImportPath(im.source, store, language, ctx);
+          if (target && !collectionFiles.has(target)) collectionFiles.set(target, im.localName);
+        }
+      }
+    }
+    return collectionFiles.get(file);
+  };
+  const isStoreFile = (file: string): boolean => hasStoreSignals(file) || collectionOf(file) !== undefined;
+  // The collection a function is known to be in: its owner's name (`const
+  // mutations = { … }` holds `mutations::SET_TOKEN`), else its file's.
+  const collectionHolding = (n: Node): string | undefined => {
+    const cut = n.qualifiedName.lastIndexOf('::');
+    const owner = cut < 0 ? '' : n.qualifiedName.slice(0, cut);
+    return VUEX_COLLECTION_NAMES.has(owner) ? owner : collectionOf(n.filePath);
+  };
 
-  const resolve = (key: string, dispatchFile: string): Node | null => {
+  const resolve = (verb: string, key: string, dispatchFile: string): Node | null => {
     const segs = key.split('/');
     const action = segs[segs.length - 1]!;
-    const cands = ctx.getNodesByName(action).filter((n) => n.kind === 'function' && isStoreFile(n.filePath));
+    const runs = verb === 'commit' ? 'mutations' : 'actions';
+    const cands = ctx.getNodesByName(action).filter((n) => {
+      if (n.kind !== 'function' || !isStoreFile(n.filePath)) return false;
+      const holder = collectionHolding(n);
+      return holder === undefined || holder === runs;
+    });
     if (!cands.length) return null;
     if (segs.length > 1) {
       const mod = segs[segs.length - 2]!; // immediate namespace ≈ the module file
@@ -4209,11 +4189,11 @@ async function vuexDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield): P
     let m: RegExpExecArray | null;
     let added = 0;
     while ((m = VUEX_DISPATCH_RE.exec(safe)) && added < VUEX_FANOUT_CAP) {
-      const key = m[1]!;
+      const key = m[2]!;
       const line = lineOf(safe, m.index);
       const disp = enclosingFn(nodesInFile, line) ?? fallback;
       if (!disp) continue;
-      const target = resolve(key, file);
+      const target = resolve(m[1]!, key, file);
       if (!target || target.id === disp.id) continue;
       const edgeKey = `${disp.id}>${target.id}`;
       if (seen.has(edgeKey)) continue;
@@ -5364,7 +5344,7 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   // `$this->postJson('api/x')`) onto the route it reaches, so the handler
   // counts as tested.
   { name: 'testRequestEdges', gate: (has) => has('java', 'kotlin', 'php'), run: (_q, c, y) => testRequestEdges(c, y) },
-  { name: 'emitterEdges', gate: ALWAYS, run: (_q, c, y) => eventEmitterEdges(c, y) },
+  { name: 'emitterEdges', gate: ALWAYS, run: (q, c, y) => eventEmitterEdges(q, c, y) },
   { name: 'renderEdges', gate: ALWAYS, run: (q, c, y) => reactRenderEdges(q, c, y) },
   { name: 'jsxEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => reactJsxChildEdges(c, y) },
   { name: 'vueEdges', gate: (has) => has('vue'), run: (_q, c, y) => vueTemplateEdges(c, y) },
