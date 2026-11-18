@@ -1,5 +1,5 @@
 {
-  "name": "Windows exact-source full portable f72c",
+  "name": "Windows exact-source full portable 96ab",
   "on": {
     "workflow_dispatch": {}
   },
@@ -20,13 +20,13 @@
         "matrix": {
           "include": [
             {
-              "target": "candidate-652c30b9",
-              "sha": "652c30b900f29995cb3eed1722e9d0be4ac2c417",
+              "target": "candidate-9f7d7d5d",
+              "sha": "9f7d7d5dc916e089b0a72891d0060864c08263ad",
               "node": 22
             },
             {
-              "target": "candidate-652c30b9",
-              "sha": "652c30b900f29995cb3eed1722e9d0be4ac2c417",
+              "target": "candidate-9f7d7d5d",
+              "sha": "9f7d7d5dc916e089b0a72891d0060864c08263ad",
               "node": 24
             }
           ]
