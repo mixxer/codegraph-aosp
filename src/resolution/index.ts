@@ -58,6 +58,9 @@ import { readCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
 import { detectFrameworks, getAllFrameworkResolvers, getResolvingFrameworks } from './frameworks';
 import { clearDeclaredDependencies } from './frameworks/package-deps';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
+import { loadWebRoot, PROJECT_CONFIG_FILENAME } from '../project-config';
+import { folderOf, inferPhpWebRoots, phpWebRootSnapshot, phpWebRootsMoved } from './php-web-root';
+import { PHP_DOCUMENT_ROOT } from '../extraction/languages/php';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { FlowChange, planParameterFlows } from './parameter-flow';
 import { MAX_SOURCE_FILE_SIZE_BYTES, readSourceText } from '../file-limits';
@@ -293,8 +296,11 @@ const CPP_BUILT_INS = new Set([
   'move', 'forward', 'swap',
 ]);
 
-/** The module-config files at the project root a resolver reads, present or not (#2977). */
-const MODULE_CONFIG_ROOT_FILES = ['tsconfig.json', 'jsconfig.json', 'tsconfig.base.json', 'go.mod', 'Cargo.toml', ...CPP_COMPILE_DB_FILES] as const;
+/**
+ * The module-config files at the project root a resolver reads, present or not
+ * (#2977): `codegraph.json` for its PHP `webRoot` (#3298).
+ */
+const MODULE_CONFIG_ROOT_FILES = ['tsconfig.json', 'jsconfig.json', 'tsconfig.base.json', 'go.mod', 'Cargo.toml', ...CPP_COMPILE_DB_FILES, PROJECT_CONFIG_FILENAME] as const;
 
 /**
  * Project-relative config path → `<digest>@<stamp>`: a digest of what
@@ -355,6 +361,14 @@ function moduleConfigEntry(abs: string, previous: string | undefined, projectRoo
  */
 function moduleConfigDigest(abs: string, projectRoot: string): string {
   const file = path.basename(abs);
+  // A codegraph.json counts for its `webRoot` alone, which places a PHP
+  // include of `$_SERVER['DOCUMENT_ROOT'] . '/x.php'` (#3298). One that sets
+  // none reads as no file, so writing one to `exclude` a folder, or a snapshot
+  // from before it counted, re-opens nothing.
+  if (file === PROJECT_CONFIG_FILENAME) {
+    const webRoot = loadWebRoot(path.dirname(abs));
+    return webRoot === null ? 'absent' : createHash('sha256').update(`webRoot=${webRoot}`).digest('hex').slice(0, 16);
+  }
   const read = file === 'go.mod' ? loadGoModule(path.dirname(abs))?.modulePath ?? ''
     : file === 'Cargo.toml' ? cargoManifestDigestText(abs)
     : file === 'compile_commands.json' ? (readCompileDbIncludeDirs(abs, projectRoot) ?? []).join('\n')
@@ -418,6 +432,7 @@ export function moduleConfigLanguages(changed: readonly string[]): Set<Language>
   const languages = new Set<Language>();
   for (const rel of changed) {
     if (/(?:^|\/)go\.mod$/.test(rel)) languages.add('go');
+    else if (rel === PROJECT_CONFIG_FILENAME) languages.add('php');
     else if (/(?:^|\/)Cargo\.toml$/.test(rel)) languages.add('rust');
     else if (/(?:^|\/)compile_commands\.json$/.test(rel)) for (const language of ['c', 'cpp'] as const) languages.add(language);
     else for (const language of ESM_IMPORT_LANGUAGES) languages.add(language);
@@ -524,6 +539,10 @@ export class ReferenceResolver {
   private projectAliases: AliasMap | null | undefined = undefined;
   // Per directory: the aliases of the nearest non-root tsconfig declaring `paths` or `baseUrl`.
   private dirAliases = new Map<string, AliasMap | null>();
+  // Per folder holding a `$_SERVER['DOCUMENT_ROOT']` include: the PHP web root
+  // the project's includes agree on, or null (#3298, php-web-root.ts). Read
+  // from the graph, so it lives for one pass: clearCaches drops it.
+  private phpWebRoots: Map<string, string | null> | null = null;
   // The Cargo workspace's crates and the include directories a compile
   // database names (null: the project has none). Same lazy convention: read
   // once, whatever the size of the workspace or the database, and dropped by
@@ -825,6 +844,7 @@ export class ReferenceResolver {
     this.searchedModules.clear();
     this.realModulesDirs.clear();
     this.ownPackageNames = null;
+    this.phpWebRoots = null;
     this.installedNames.clear();
     this.knownNames = null;
     this.knownLowerNames = null;
@@ -1305,6 +1325,8 @@ export class ReferenceResolver {
         for (const d of walked) this.dirAliases.set(d, found);
         return found;
       },
+
+      getPhpWebRoot: (fromFile: string) => this.phpWebRootOf(fromFile),
 
       getGoPackageDir: (importPath: string, fromFile?: string) => {
         const own = fromFile === undefined ? null : this.nearestGoModule(goDirOf(fromFile));
@@ -3503,6 +3525,44 @@ export class ReferenceResolver {
   /** The fingerprint of the workspace map this resolver resolves by (see `workspaceFingerprint`). */
   getWorkspaceFingerprint(): string {
     return workspaceFingerprint(this.context.getWorkspacePackages?.() ?? null);
+  }
+
+  /**
+   * The folder `$_SERVER['DOCUMENT_ROOT']` names for a PHP include in
+   * `fromFile` (#3298): the project's `codegraph.json` `webRoot`, else the one
+   * the project's own includes agree on for the file's folder (see
+   * php-web-root.ts), else null.
+   */
+  phpWebRootOf(fromFile: string): string | null {
+    const configured = loadWebRoot(this.projectRoot);
+    if (configured !== null) return configured;
+    return this.inferredPhpWebRoots().get(folderOf(fromFile)) ?? null;
+  }
+
+  /** Every folder holding a `$_SERVER['DOCUMENT_ROOT']` include → the web root inferred for it, read once a pass. */
+  private inferredPhpWebRoots(): Map<string, string | null> {
+    if (this.phpWebRoots === null) {
+      const prefix = `${PHP_DOCUMENT_ROOT}/`;
+      const includes = this.queries.getPhpDocumentRootIncludes(prefix)
+        .map((row) => ({ filePath: row.filePath, written: row.name.slice(prefix.length) }));
+      this.phpWebRoots = includes.length === 0
+        ? new Map()
+        : inferPhpWebRoots(includes, (relPath) => this.context.fileExists(relPath));
+    }
+    return this.phpWebRoots;
+  }
+
+  /**
+   * The web roots PHP's `$_SERVER['DOCUMENT_ROOT']` includes go under now,
+   * for a sync to compare with the index's (#3298; see phpWebRootSnapshot).
+   */
+  getPhpWebRootSnapshot(): string {
+    return phpWebRootSnapshot(loadWebRoot(this.projectRoot), this.inferredPhpWebRoots());
+  }
+
+  /** Whether files a sync never touched must take another web root (see phpWebRootsMoved). */
+  phpWebRootsMoved(before: string, now: string): boolean {
+    return phpWebRootsMoved(before, now);
   }
 
   /** The folder of the workspace package or path dependency `file` is in (see `workspacePackageDirOf`), or null. */

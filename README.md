@@ -775,6 +775,28 @@ language or a malformed file is warned about and skipped — it never breaks
 indexing — and a project with no `codegraph.json` behaves exactly as before.
 Re-index (`codegraph index`) after adding or changing mappings.
 
+### PHP includes from the web root
+
+PHP code often loads files from the folder the web server serves, as in
+`require $_SERVER['DOCUMENT_ROOT'] . '/inc/header.php'`. That folder is set in
+the server's configuration, not in your code, so CodeGraph works it out from
+your includes: it's the folder under which their paths name files your project
+has. When they don't settle it (fewer than three different paths, or two
+folders that fit them about as well), name it in `codegraph.json`:
+
+```json
+{
+  "webRoot": "public"
+}
+```
+
+The folder is relative to the project root, like `"public"`, `"web"` or
+`"htdocs"`, or `"."` for the root itself, and a `webRoot` you set always wins.
+Without either, these includes link to nothing rather than to a guess, which
+could be a different file of the same name. The next sync applies a change.
+Includes built from the including file's own folder, like
+`__DIR__ . '/inc/a.php'`, need neither.
+
 ## Telemetry
 
 CodeGraph collects **anonymous usage statistics** — which tools and commands get

@@ -51,6 +51,25 @@ beforeEach(async () => {
 afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 
 describe('explicit CLI sync with stale extraction', () => {
+  it('keeps extraction-29 fork indexes stale until a full grammar-upgrade rebuild', () => {
+    // The fork published 29 before upstream reused 29 for its newer grammars.
+    setStamp(29);
+    expect(run('status').stdout).toContain(WARNING);
+    expect(indexState()).toEqual({ stale: true, files: 1 });
+    expect(run('sync').stdout).toContain(WARNING);
+    const before = CodeGraph.openSync(root);
+    try { expect(before.getIndexBuildInfo().extractionVersion).toBe(29); }
+    finally { before.close(); }
+    expect(indexState().stale).toBe(true);
+
+    expect(run('index').status).toBe(0);
+    const after = CodeGraph.openSync(root);
+    try { expect(after.getIndexBuildInfo().extractionVersion).toBe(EXTRACTION_VERSION); }
+    finally { after.close(); }
+    expect(indexState()).toEqual({ stale: false, files: 1 });
+    expect(run('status').stdout).not.toContain(WARNING);
+  }, 60_000);
+
   for (const stamp of [EXTRACTION_VERSION - 1, null]) {
     it(`warns for stamp ${stamp} and still syncs`, () => {
       setStamp(stamp);
