@@ -19,9 +19,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### New Features
 
 - The Claude Code prompt hook now gets its context from the CodeGraph server already running for your project instead of loading the index again on every prompt, so structural prompts are answered sooner, most of all in large projects; with no server running, one that is busy, or one that can't prove it runs as you, the hook works it out itself as before. Thanks @aidenpan0x for the report, the measurements and the pull request. (#3284)
+- Elysia (Bun) backends now have their HTTP routes in the graph, named by the full path a request takes, with the prefixes of `new Elysia({ prefix })`, `.group()` and a `.use()` in another file included, and linked to their handlers, so `codegraph_explore` can follow a request from its route into your code. Thanks @ChampPABA for the report. (#3255)
 
 ### Fixes
 
+- Express routes remain indexed when the same file also defines Elysia routes, without adding duplicate routes under the wrong prefix.
 - `codegraph affected` no longer selects tests on the other side of an HTTP call, a queue or an event, like an Angular app's specs for a change to the Spring controller it calls, since those tests mock that boundary; pass `--cross-tier` to include them. Thanks @jotder for the report. (#3320)
 - In Python, `import time` no longer links the importing file to a project function that happens to be named `time`, so such a function stops listing every file that imports the standard library module among its callers and in its impact. The same goes for `json`, `copy`, `random`, `logging` and any other module, and for a fallback variable like `brotli = None` beside a guarded `import brotli`. Thanks @inth3shadows for the report. (#3239)
 - In Python, a call to a function or method declared with `typing.overload`, like click's `command` and `prompt`, now links to the `def` that runs instead of the first `@overload` stub, so the implementation shows its callers and a call path goes on through it. A stub with no implementation below it, as in a `Protocol`, stays the target, and another library's `overload` whose bodies all run is left alone. Thanks @inth3shadows for the report and @nilotpal-n7. (#2963)

@@ -9,6 +9,10 @@ import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from
 import { REGEX_START_BEFORE, stripCommentsForRegex } from '../strip-comments';
 import { resolveImportPath } from '../import-resolver';
 import { dependsOn } from './package-deps';
+import { elysiaCalls } from './elysia';
+
+/** The languages a route file is read in here and by the Elysia resolver, which shares these readers. */
+export type ScriptLanguage = 'typescript' | 'javascript' | 'tsx' | 'jsx';
 
 function extractTailIdent(expr: string): string | null {
   const cleaned = expr.replace(/\s+/g, '').replace(/\(\)$/, '');
@@ -61,7 +65,7 @@ const JS_KEYWORDS = new Set([
  * `ClientResponse.text` 423 times. A member of an expression (`a.b().c(`)
  * names nothing this can follow.
  */
-function handlerCallNames(body: string): string[] {
+export function handlerCallNames(body: string): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   const callRe = /((?:[A-Za-z_$][\w$]*\s*\??\.\s*)*)([A-Za-z_$][\w$]*)\s*\(/g;
@@ -90,7 +94,7 @@ function handlerCallNames(body: string): string[] {
  * not the business flow); for the endpoint's contract they are the point.
  */
 const REPLY_CALL = /\b(res|response|reply|rep|ctx)\s*\.\s*(?:[A-Za-z_$][\w$]*\s*\([^()]*\)\s*\.\s*)*([A-Za-z_$][\w$]*)\s*\(/g;
-function replyRefs(safe: string, bodyStart: number, bodyEnd: number, fromNodeId: string, filePath: string, language: 'typescript' | 'javascript'): UnresolvedRef[] {
+function replyRefs(safe: string, bodyStart: number, bodyEnd: number, fromNodeId: string, filePath: string, language: ScriptLanguage): UnresolvedRef[] {
   const out: UnresolvedRef[] = [];
   const body = safe.slice(bodyStart, bodyEnd);
   REPLY_CALL.lastIndex = 0;
@@ -197,6 +201,7 @@ export const expressResolver: FrameworkResolver = {
     const now = Date.now();
     const lang = detectLanguage(filePath);
     const safe = stripCommentsForRegex(content, lang);
+    const ownedByElysia = elysiaCalls(safe);
     // Brackets and commas are counted on `structure`, where string and regex
     // contents are blanked: `/[^]]/`, `/}/` or `'a, b)'` must not end an
     // argument or a body early. Same offsets as `safe`, which the route path
@@ -207,6 +212,8 @@ export const expressResolver: FrameworkResolver = {
     const head = /\b(app|router)\s*\.\s*(get|post|put|patch|delete|all|use)\s*\(\s*['"]([^'"]+)['"]\s*,/g;
     let match: RegExpExecArray | null;
     while ((match = head.exec(safe)) !== null) {
+      const openParen = safe.indexOf('(', match.index);
+      if (ownedByElysia.has(openParen)) continue;
       const method = match[2]!;
       const routePath = match[3]!;
       if (method === 'use' && !routePath.startsWith('/')) continue;
@@ -227,7 +234,6 @@ export const expressResolver: FrameworkResolver = {
       nodes.push(routeNode);
 
       // The full argument list = balanced parens from the route call's open paren.
-      const openParen = safe.indexOf('(', match.index);
       const call = openParen >= 0 ? scanCall(safe, openParen) : null;
       const args = call ? call.structure.slice(1, -1) : '';
       references.push(...handlerRefs(safe, openParen + 1, args, routeNode.id, line, filePath, lang));
@@ -237,6 +243,7 @@ export const expressResolver: FrameworkResolver = {
     // per method, at the line of its `.method(`, bound like the plain form.
     const chainHead = /\b(?:app|router)\s*\.\s*route\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
     while ((match = chainHead.exec(safe)) !== null) {
+      if (ownedByElysia.has(safe.indexOf('(', match.index))) continue;
       const routePath = match[1]!;
       let at = match.index + match[0].length;
       for (;;) {
@@ -299,10 +306,12 @@ export const expressResolver: FrameworkResolver = {
       if (!content || !content.includes('.use(')) continue;
       const lang = detectLanguage(file);
       const safe = stripCommentsForRegex(content, lang);
+      const ownedByElysia = elysiaCalls(safe);
       const mount = /\b[A-Za-z_$][\w$]*\.use\s*\(\s*(['"`])(\/[^'"`]*)\1\s*,/g;
       let m: RegExpExecArray | null;
       while ((m = mount.exec(safe)) !== null) {
         const open = safe.indexOf('(', m.index);
+        if (ownedByElysia.has(open)) continue;
         const call = open >= 0 ? scanCall(safe, open) : null;
         if (!call) continue;
         // Split where the blanked structure says, but read the target from
@@ -374,9 +383,12 @@ const REGEX_END_AFTER = /^[dgimsuyv]*[ \t]*(?:\.\s*(?:test|exec|source|flags|glo
  * blanked (offsets kept) so `/[^]]/`, `/}/`, `'a, b)'` or a backtick in a regex
  * can't end an argument or a body early. Scanned per call, from the call's own
  * paren — never from the top of the file — so nothing earlier in the file can
- * throw it off.
+ * throw it off. A `{` or `[` at `open` is scanned to its own match the same
+ * way (a function body, for the Elysia resolver).
  */
-function scanCall(safe: string, open: number): { close: number; structure: string } | null {
+export function scanCall(safe: string, open: number): { close: number; structure: string } | null {
+  const oc = safe[open];
+  const cc = oc === '{' ? '}' : oc === '[' ? ']' : ')';
   const out: string[] = [];
   let depth = 0;
   for (let i = open; i < safe.length; i++) {
@@ -409,8 +421,8 @@ function scanCall(safe: string, open: number): { close: number; structure: strin
       }
     }
     out.push(c);
-    if (c === '(') depth++;
-    else if (c === ')') {
+    if (c === oc) depth++;
+    else if (c === cc) {
       depth--;
       if (depth === 0) return { close: i, structure: out.join('') };
     }
@@ -419,7 +431,7 @@ function scanCall(safe: string, open: number): { close: number; structure: strin
 }
 
 /** Whether the quote at `i` has an unescaped closing quote on the same line. */
-function closesOnLine(s: string, i: number): boolean {
+export function closesOnLine(s: string, i: number): boolean {
   const q = s[i];
   for (let k = i + 1; k < s.length && s[k] !== '\n'; k++) {
     if (s[k] === '\\') k++;
@@ -467,7 +479,7 @@ function functionBodyEnd(text: string, fnAt: number): number {
 }
 
 /** `args` split at its top-level commas, each piece with its offset into `args`. */
-function topLevelArgs(args: string): Array<{ text: string; start: number }> {
+export function topLevelArgs(args: string): Array<{ text: string; start: number }> {
   const out: Array<{ text: string; start: number }> = [];
   let depth = 0;
   let start = 0;
@@ -515,14 +527,14 @@ function topLevelArgs(args: string): Array<{ text: string; start: number }> {
  *
  * `argsStart` is where `args` begins in `safe`, for the reply-call offsets.
  */
-function handlerRefs(
+export function handlerRefs(
   safe: string,
   argsStart: number,
   args: string,
   fromNodeId: string,
   line: number,
   filePath: string,
-  language: 'typescript' | 'javascript'
+  language: ScriptLanguage
 ): UnresolvedRef[] {
   // A trailing options object (`…, handler, { cache: true }`) is not the
   // handler; a trailing array of handlers (`[validate, ctrl.create]`) is read
@@ -604,7 +616,7 @@ function handlerRefs(
 }
 
 /** `/api` + `/users` → `/api/users`; `/api/` + `/` → `/api`. */
-function joinPaths(prefix: string, path: string): string {
+export function joinPaths(prefix: string, path: string): string {
   const a = prefix.replace(/\/+$/, '');
   const b = path.replace(/^\/+/, '');
   const joined = b ? `${a}/${b}` : a;
