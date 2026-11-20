@@ -220,30 +220,36 @@ describe('AOSP extension: findAidlImpl', () => {
     });
   });
 
-  it('parses a Unicode .aidl declaration correctly (AIDL/Kotlin identifiers are not ASCII-only) — but a Unicode-named implementer still cannot be matched, a CodeGraph core limitation outside this extension\'s scope', async () => {
+  it.each(['한국어구현', 'UnicodeStub'])('finds a package-verified Unicode AIDL implementation named %s', async (className) => {
     write('src/I가나다.aidl', 'package com.example.test;\ninterface I가나다 {\n    void 실행();\n}\n');
-    write('src/한국어구현.kt', 'package com.example.test\n\nclass 한국어구현 : I가나다.Stub() {\n    override fun 실행() {}\n}\n');
+    write(`src/${className}.kt`, `package com.example.test\n\nclass ${className} : I가나다.Stub() {\n    override fun 실행() {}\n}\n`);
     await cg.indexAll();
 
     const result = findAidlImpl(cg, dir, 'I가나다');
-
-    // The declaration-file parser (this extension's own regex, reading
-    // .aidl text directly) now handles Unicode correctly — verified
-    // separately below. But CodeGraph's own Kotlin extractor does not
-    // record an extends/implements clause at all when either side of it is
-    // a non-ASCII identifier:
-    // `cg.getUnresolvedReferencesByName('I가나다')` returns empty even when
-    // the implementing class name is plain ASCII) — so the primary signal
-    // this whole module is built on never fires for a Unicode interface,
-    // regardless of what this file's own regexes do. Fixing that is a
-    // CodeGraph core extractor change, not something patchable from
-    // src/aosp/*.
-    expect(result.declaration).not.toBeNull();
+    // The newer Kotlin grammar reads Unicode names and their extends clause.
     expect(result.declaration?.methods).toEqual(['실행']);
-    expect(result.status).toBe('no_implementation_found');
+    expect(result.status).toBe('found');
+    expect(result.implementations).toContainEqual(expect.objectContaining({
+      kind: 'stub_subclass', name: className,
+      qualifiedName: `com.example.test::${className}`,
+      matchedPattern: 'unresolved extends -> I가나다.Stub',
+      packageVerified: 'verified',
+    }));
   });
 
-  it('parseAidlDeclarations itself handles a Unicode interface name and its Unicode method name (isolates this extension\'s own regex parsing from the CodeGraph core limitation above)', () => {
+  it.each([
+    { label: 'an unreachable package', className: '한국어구현', packageName: 'unrelated.other', base: ' : I가나다.Stub()', evidence: { kind: 'stub_subclass', packageVerified: 'mismatch' } },
+    { label: 'a matching name without inheritance', className: 'I가나다Impl', packageName: 'com.example.test', base: '', evidence: { kind: 'impl_by_name' } },
+  ])('keeps Unicode candidates from $label below found', async ({ className, packageName, base, evidence }) => {
+    write('src/I가나다.aidl', 'package com.example.test;\ninterface I가나다 { void 실행(); }\n');
+    write('src/UnicodeCandidate.kt', `package ${packageName}\n\nclass ${className}${base} { fun 실행() {} }\n`);
+    await cg.indexAll();
+    const result = findAidlImpl(cg, dir, 'I가나다');
+    expect(result.status).toBe('convention_derived_candidate');
+    expect(result.implementations).toContainEqual(expect.objectContaining({ name: className, ...evidence }));
+  });
+
+  it('parseAidlDeclarations itself handles a Unicode interface name and its Unicode method name', () => {
     write('src/I가나다.aidl', 'package com.example.test;\ninterface I가나다 {\n    void 실행();\n}\n');
 
     const declarations = parseAidlDeclarations(dir, 'I가나다');
