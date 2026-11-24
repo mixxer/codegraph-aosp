@@ -3,9 +3,13 @@
  * exposed MCP tool surface without touching the client config. Inert when unset.
  * Filtering happens in ListTools (getTools) and is enforced again on execute().
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach } from 'vitest';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 import { ToolHandler, getStaticTools } from '../src/mcp/tools';
 import { enabledAospAddendum } from '../src/mcp/session';
+import { CodeGraph } from '../src';
 
 const ENV = 'CODEGRAPH_MCP_TOOLS';
 
@@ -68,5 +72,62 @@ describe('CODEGRAPH_MCP_TOOLS allowlist', () => {
     // "disabled" message must NOT appear, proving the guard passed it through.
     const res = await new ToolHandler(null).execute('codegraph_search', { query: 'x' });
     expect(res.content[0].text).not.toMatch(/disabled via CODEGRAPH_MCP_TOOLS/);
+  });
+});
+
+describe('CODEGRAPH_MCP_TOOLS allowlist on a small indexed repo (#3462)', () => {
+  // A one-file project sits far under the small-repo threshold, so the
+  // small-repo gate in getTools() is in play.
+  let tempDir: string;
+  let cg: CodeGraph;
+  const original = process.env[ENV];
+
+  beforeEach(async () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-allowlist-'));
+    fs.writeFileSync(
+      path.join(tempDir, 'pay.ts'),
+      'export function processPayment(amount: number): boolean { return amount > 0; }\n'
+    );
+    cg = await CodeGraph.init(tempDir, { index: true });
+  });
+
+  afterEach(() => {
+    cg.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+    if (original === undefined) delete process.env[ENV];
+    else process.env[ENV] = original;
+  });
+
+  const listed = () => new ToolHandler(cg).getTools().map(t => t.name).sort();
+
+  it('lists every explicitly allowlisted tool, even ones outside the small-repo set', () => {
+    process.env[ENV] = 'search,callers,callees,impact';
+    expect(listed()).toEqual([
+      'codegraph_callees',
+      'codegraph_callers',
+      'codegraph_impact',
+      'codegraph_search',
+    ]);
+  });
+
+  it('shows only the default surface when no allowlist is set', () => {
+    delete process.env[ENV];
+    expect(listed()).toEqual(['codegraph_explore']);
+  });
+
+  it('keeps comma-separated AIDL tools listed and executable on a small index', async () => {
+    fs.writeFileSync(path.join(tempDir, 'IFoo.aidl'), 'package demo;\ninterface IFoo { void ping(); }\n');
+    fs.writeFileSync(path.join(tempDir, 'Impl.kt'), 'package demo\nclass Impl : IFoo.Stub() { override fun ping() {} }\n');
+    await cg.sync();
+    process.env[ENV] = ' , codegraph_aidl_impl , search , ';
+    expect(listed()).toEqual(['codegraph_aidl_impl', 'codegraph_search']);
+    expect(getStaticTools().map(t => t.name).sort()).toEqual(listed());
+    expect(enabledAospAddendum()).toContain('codegraph_aidl_impl');
+    const result = await new ToolHandler(cg).execute('codegraph_aidl_impl', { interfaceName: 'IFoo' });
+    expect(result.isError).not.toBe(true);
+    expect(result.content[0].text).toContain('Impl');
+    const disabled = await new ToolHandler(cg).execute('codegraph_explore', { query: 'Impl' });
+    expect(disabled.isError).toBe(true);
+    expect(disabled.content[0].text).toContain('disabled via CODEGRAPH_MCP_TOOLS');
   });
 });

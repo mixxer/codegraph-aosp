@@ -79,11 +79,11 @@ import { validateProjectPath } from '../utils';
 import { BROWSER_ENV, DEFAULT_UI_PORT } from '../ui-server/constants';
 import type { UiServerHandle } from '../ui-server';
 import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../graph/symbol-lookup';
-import { callSiteLines, formatCallSiteLines } from '../graph/call-sites';
+import { callSiteLines, formatCallSiteLines, nonTestFirst } from '../graph/call-sites';
 import { goPackageReaderFor } from '../graph/go-package';
 import { groupFilesByPackage, packageGroupTitle, packageListingTitle } from '../graph/owning-package';
 import { buildTypeHierarchy, canHaveHierarchy, MAX_DESCENDANTS, MAX_DESCENDANT_DEPTH } from '../graph/type-hierarchy';
-import { isTestCode } from '../graph/test-code';
+import { isTestCode, testCodeReading } from '../graph/test-code';
 import type { Node, Edge, Language } from '../types';
 import { isTestPath } from '../search/query-utils';
 
@@ -2667,6 +2667,10 @@ for (const direction of ['callers', 'callees'] as const) {
             : undefined;
           // Every site of each neighbour (#2909): a caller that calls the symbol on
           // two lines has both, and a symbol that calls itself is a row of its own.
+          // Callers outside tests come first, so --limit never shows tests in
+          // their place, by the same reading of a test as codegraph_callers.
+          const isTest = testCodeReading(projectPath);
+          const ordered = (nodes: Node[]) => (direction === 'callers' ? nonTestFirst(nodes, isTest) : nodes);
           const collected = groups.map((group) => {
             const nodes = new Map<string, Node>();
             const edges = new Map<string, Edge>();
@@ -2680,7 +2684,7 @@ for (const direction of ['callers', 'callees'] as const) {
                 }
               }
             }
-            return { group, nodes: [...nodes.values()], edges: [...edges.values()], recursive };
+            return { group, nodes: ordered([...nodes.values()]), edges: [...edges.values()], recursive };
           });
 
           const ownEdges = (node: Node, edges: Edge[]) =>

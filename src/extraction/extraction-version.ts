@@ -21,5 +21,5 @@
  * turns the re-index hint into noise — keep it honest (see CLAUDE.md, "Honesty
  * in the product is load-bearing").
  */
-// The fork already shipped 29 before these Dart/Kotlin grammar upgrades.
-export const EXTRACTION_VERSION = 30;
+// Fork extraction-30 indexes predate Kotlin delegation and Pascal helper coverage.
+export const EXTRACTION_VERSION = 31;
