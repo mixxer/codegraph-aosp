@@ -3113,6 +3113,7 @@ export class CodeGraph {
   getIndexHealth(): IndexHealth {
     const needsReindex: string[] = [];
     const parseErrors: string[] = [];
+    const oversize: IndexHealth['oversize'] = [];
     for (const file of this.queries.getFilesWithoutNodesOrWithErrors()) {
       const errors = file.errors ?? [];
       if (hasGrammarLoadFailure(errors)) {
@@ -3123,6 +3124,10 @@ export class CodeGraph {
         // wiped row (#1541) or a recorded failure — except file-level-only
         // languages and files over the size limit, which are empty on purpose.
         if (isFileLevelOnlyLanguage(file.language)) continue;
+        if (errors.some((e) => e.code === 'size_exceeded')) {
+          oversize.push({ path: file.path, size: file.size });
+          continue;
+        }
         if (errors.length === 0) needsReindex.push(file.path);
         else if (errors.some((e) => e.severity === 'error' || e.code === 'parse_error')) parseErrors.push(file.path);
       } else if (errors.some((e) => e.code === 'parse_error')) {
@@ -3130,7 +3135,7 @@ export class CodeGraph {
         parseErrors.push(file.path);
       }
     }
-    return { needsReindex, parseErrors };
+    return { needsReindex, parseErrors, oversize };
   }
 
   /**
